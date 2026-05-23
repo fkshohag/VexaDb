@@ -4,7 +4,12 @@ SHELL := /usr/bin/env bash
 COMPOSE       ?= docker compose
 GATEWAY_URL   ?= http://127.0.0.1:8080
 ROUTER_GRPC   ?= http://127.0.0.1:6333
+ADMIN_URL     ?= http://127.0.0.1:8090
 CARGO_FLAGS   ?=
+
+# Default target: bring up the entire stack (cluster + gateway + admin panel).
+.PHONY: all
+all: up info ## Bring up the full stack and print URLs.
 
 # ---------------------------------------------------------------------------
 # Help (default target)
@@ -66,7 +71,7 @@ ps: ## Show container status.
 logs: ## Tail logs from all services.
 	$(COMPOSE) logs -f --tail=100
 
-.PHONY: logs-router logs-gateway logs-shard-0 logs-shard-1
+.PHONY: logs-router logs-gateway logs-shard-0 logs-shard-1 logs-admin
 logs-router:   ## Tail router logs.
 	$(COMPOSE) logs -f --tail=100 router
 logs-gateway:  ## Tail gateway logs.
@@ -75,12 +80,60 @@ logs-shard-0:  ## Tail shard-0 logs.
 	$(COMPOSE) logs -f --tail=100 shard-0
 logs-shard-1:  ## Tail shard-1 logs.
 	$(COMPOSE) logs -f --tail=100 shard-1
+logs-admin:    ## Tail admin panel logs.
+	$(COMPOSE) logs -f --tail=100 admin
 
-.PHONY: sh-router sh-gateway
+.PHONY: sh-router sh-gateway sh-admin
 sh-router:     ## Exec a shell inside the router container.
 	$(COMPOSE) exec router /bin/bash
 sh-gateway:    ## Exec a shell inside the gateway container.
 	$(COMPOSE) exec gateway /bin/bash
+sh-admin:      ## Exec a shell inside the admin container.
+	$(COMPOSE) exec admin /bin/bash
+
+# ---------------------------------------------------------------------------
+# Admin panel (build / open / status)
+# ---------------------------------------------------------------------------
+
+.PHONY: admin-build
+admin-build: clean-macos ## Build only the admin panel image.
+	$(COMPOSE) build admin
+
+.PHONY: admin-up
+admin-up: clean-macos ## (Re)start just the admin panel (and its deps).
+	$(COMPOSE) up -d --build admin
+
+.PHONY: admin-down
+admin-down: ## Stop only the admin panel.
+	$(COMPOSE) stop admin
+
+.PHONY: admin-open
+admin-open: ## Open the admin panel in your browser.
+	@command -v open >/dev/null 2>&1 && open $(ADMIN_URL) || \
+		(command -v xdg-open >/dev/null 2>&1 && xdg-open $(ADMIN_URL)) || \
+		echo "Open $(ADMIN_URL) manually."
+
+.PHONY: admin-dev
+admin-dev: ## Run the admin panel in dev mode (Go + Vite, hot reload). Requires Go + Node locally.
+	cd admin && ./scripts/dev.sh
+
+.PHONY: info
+info: ## Print the URLs for everything in the stack.
+	@echo
+	@echo "  ┌──────────────────────────────────────────────────────────┐"
+	@echo "  │ VectorDB stack is up.                                    │"
+	@echo "  ├──────────────────────────────────────────────────────────┤"
+	@echo "  │ Admin panel    : $(ADMIN_URL)                  │"
+	@echo "  │ REST gateway   : $(GATEWAY_URL)                  │"
+	@echo "  │ Router gRPC    : 127.0.0.1:6333                          │"
+	@echo "  │ Shard 0 / 1    : 127.0.0.1:6334 / 6335                   │"
+	@echo "  └──────────────────────────────────────────────────────────┘"
+	@echo
+	@echo "  make logs        # tail all containers"
+	@echo "  make smoke       # end-to-end smoke test against the gateway"
+	@echo "  make admin-open  # open the admin UI"
+	@echo "  make down        # stop the stack"
+	@echo "  make nuke        # stop and DELETE data volumes"
 
 # ---------------------------------------------------------------------------
 # Smoke test against the gateway

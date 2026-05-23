@@ -2403,6 +2403,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rand 0.8.6",
+ "rayon",
  "tempfile",
  "vectordb-core",
  "vectordb-storage",

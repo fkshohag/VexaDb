@@ -1,28 +1,124 @@
-# Rust build artifacts
+# =============================================================================
+# Rust / Cargo
+# =============================================================================
 /target
 **/target
 **/*.rs.bk
 Cargo.lock.bak
-
-# Crate / cargo
 .cargo/
 .cargo-ok
 
-# Project data & runtime
+# =============================================================================
+# VectorDB runtime data
+# =============================================================================
 /data
 /snapshots
 /wal
+**/snapshots/
+**/wal/
+
+# =============================================================================
+# Logs, temp, agent / build scratch files
+# =============================================================================
 *.log
 *.pid
+*.tmp
+*.bak
+*.orig
+logs/
+tmp/
 
+# Top-level scratch files produced by ad-hoc test runs
+cargo_test*.txt
+cargo_test*.log
+m[0-9]*_tests.log
+build_m*.log
+build_m*.txt
+poll_status.txt
+
+# =============================================================================
 # Environment / secrets
+# =============================================================================
 .env
 .env.*
 !.env.example
 *.pem
 *.key
+*.crt
 
-# IDE / editor
+# =============================================================================
+# Python (SDK + admin scripts venvs)
+# =============================================================================
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+.python-version
+
+# =============================================================================
+# Node / TypeScript / Vite (admin frontend, JS SDKs)
+# =============================================================================
+**/node_modules/
+**/dist/
+**/.vite/
+**/.turbo/
+**/.next/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.yarn/
+
+# tsc -b emits these from composite tsconfig.node.json projects; the .ts
+# files are the source of truth.
+**/vite.config.js
+**/vite.config.d.ts
+
+# =============================================================================
+# Java SDK
+# =============================================================================
+sdks/java/target/
+sdks/java/.idea/
+*.class
+
+# =============================================================================
+# Go (admin backend)
+# =============================================================================
+admin/backend/vectordb-admin
+admin/backend/vectordb-admin.exe
+admin/backend/vectordb-admin-*
+*.test
+go.work
+go.work.sum
+
+# =============================================================================
+# Coverage / profiling / perf
+# =============================================================================
+*.profraw
+*.profdata
+/coverage
+tarpaulin-report.html
+cobertura.xml
+flamegraph.svg
+perf.data
+perf.data.old
+
+# =============================================================================
+# Editors / IDEs
+# =============================================================================
 .vscode/
 .idea/
 *.iml
@@ -30,7 +126,11 @@ Cargo.lock.bak
 *.swo
 *~
 .cursor/
+.zed/
 
+# =============================================================================
+# OS metadata
+# =============================================================================
 # macOS
 .DS_Store
 .AppleDouble
@@ -38,9 +138,9 @@ Cargo.lock.bak
 ._*
 .Spotlight-V100
 .Trashes
+.fseventsd
 
 # Linux
-*~
 .fuse_hidden*
 .directory
 .Trash-*
@@ -52,22 +152,8 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# Coverage / profiling
-*.profraw
-*.profdata
-/coverage
-tarpaulin-report.html
-cobertura.xml
-
-# Flamegraph / perf
-flamegraph.svg
-perf.data
-perf.data.old
-
-# Docker
+# =============================================================================
+# Docker / build caches
+# =============================================================================
 .docker/
-
-# Logs & temp
-logs/
-*.tmp
-tmp/
+.dockerignore.bak

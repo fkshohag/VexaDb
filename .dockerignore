@@ -29,3 +29,9 @@ sdks/java/target/
 # Local data
 data/
 **/snapshots/
+
+# Admin build artefacts (re-built inside the container)
+admin/frontend/node_modules/
+admin/frontend/dist/
+admin/frontend/.vite/
+admin/backend/vectordb-admin

@@ -14,4 +14,5 @@ vectordb-core.workspace = true
 vectordb-storage.workspace = true
 clap.workspace = true
 rand.workspace = true
+rayon = "1.10"
 tempfile = "3"

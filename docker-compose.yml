@@ -39,6 +39,18 @@ services:
     depends_on:
       - router
 
+  admin:
+    build:
+      context: .
+      dockerfile: admin/Dockerfile
+    environment:
+      VECTORDB_URL: http://gateway:8080
+      ADMIN_LISTEN: ":8090"
+    ports:
+      - "8090:8090"
+    depends_on:
+      - gateway
+
 volumes:
   vdb0:
   vdb1:

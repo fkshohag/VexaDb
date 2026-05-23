@@ -2,6 +2,11 @@
 
 How to measure insert throughput, search QPS, and distance-kernel cost on your machine.
 
+> **For testing with millions of vectors, the live REST gateway, or recall@K
+> measurement, see [`guides/load-testing.md`](guides/load-testing.md).** This
+> page covers the micro-benchmarks; that page covers large-scale and
+> end-to-end scenarios.
+
 ## Quick report (recommended)
 
 ```bash

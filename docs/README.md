@@ -27,6 +27,8 @@ This index links the full documentation set. Start at
 - [Security](guides/security.md) — API keys, TLS, hardening
 - [Observability](guides/observability.md) — Prometheus, health probes, logs
 - [Operations](guides/operations.md) — snapshots, WAL compaction, reindex, backup/restore
+- [Load testing & large data](guides/load-testing.md) — `vectordb-bench`, live `load_test.py`, scaling tips
+- [RAG demo: system-design corpus](guides/rag-system-design-demo.md) — runnable end-to-end RAG with real content
 - [Hybrid search](guides/hybrid-search.md) — dense + sparse + BM25 fusion
 - [RAG with VectorDB](guides/rag.md) — chunking, ingestion, retrieval recipe
 - [SDKs](guides/sdks.md) — Python, Node, Go, Java, Rust

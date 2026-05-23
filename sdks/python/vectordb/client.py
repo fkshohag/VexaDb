@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
+from urllib.parse import quote
 
 import httpx
 
@@ -180,10 +181,13 @@ class VectorDbClient:
         return int(data["deleted"])
 
     def get_point(self, collection: str, point_id: str) -> dict[str, Any] | None:
+        # Point IDs may contain `#`, `/`, etc. Encode them so they aren't
+        # interpreted as URL fragments or path separators.
+        encoded = quote(point_id, safe="")
         try:
             return self._request(
                 "GET",
-                f"/v1/collections/{collection}/points/{point_id}",
+                f"/v1/collections/{collection}/points/{encoded}",
             )
         except VectorDbError as e:
             if e.status_code == 404:
