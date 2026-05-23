@@ -1,4 +1,73 @@
+# Rust build artifacts
 /target
+**/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Crate / cargo
+.cargo/
+.cargo-ok
+
+# Project data & runtime
 /data
+/snapshots
+/wal
 *.log
+*.pid
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.cursor/
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Coverage / profiling
+*.profraw
+*.profdata
+/coverage
+tarpaulin-report.html
+cobertura.xml
+
+# Flamegraph / perf
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Docker
+.docker/
+
+# Logs & temp
+logs/
+*.tmp
+tmp/
