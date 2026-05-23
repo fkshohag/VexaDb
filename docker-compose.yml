@@ -46,6 +46,11 @@ services:
     environment:
       VECTORDB_URL: http://gateway:8080
       ADMIN_LISTEN: ":8090"
+      # LM Studio on the Mac host (not 127.0.0.1 — that is the container itself)
+      EMBED_DEFAULT_URL: http://host.docker.internal:1234/v1
+      EMBED_DEFAULT_MODEL: text-embedding-nomic-embed-text-v1.5
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8090:8090"
     depends_on:

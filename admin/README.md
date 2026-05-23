@@ -6,6 +6,24 @@ A web UI for inspecting and managing a running VectorDB cluster.
   to the VectorDB REST gateway and serves the React build.
 - **Frontend** — React 18 + TypeScript + Vite, no UI framework dependencies.
 
+## Embedding model (LM Studio / Ollama)
+
+The **Upsert** tab can call a local embedding server and fill `values` for you.
+
+**nomic-embed-text-v1.5** (LM Studio):
+
+1. Load the model in LM Studio and start the local server (default port **1234**).
+2. In the admin UI → **Upsert** → **Embedding model** → click **Settings** if needed.
+3. Preset **LM Studio — nomic-embed-text-v1.5** sets:
+   - Model: `text-embedding-nomic-embed-text-v1.5`
+   - URL: `http://127.0.0.1:1234/v1`
+4. Create a collection with dimension **768** (button **768 (nomic)** in the New collection dialog).
+5. Paste your text → **Embed with model → fill values** → **Upsert point**.
+
+If admin runs **inside Docker** but LM Studio runs on your Mac, use preset **LM Studio (admin in Docker → host)** (`host.docker.internal:1234`).
+
+The browser calls `POST /embed` on the admin backend, which proxies to LM Studio (no CORS issues).
+
 ## Features
 
 - Health pill with live latency to the gateway

@@ -5,10 +5,11 @@ import { HealthBar } from "./components/HealthBar";
 import { CollectionList } from "./components/CollectionList";
 import { CollectionDetail } from "./components/CollectionDetail";
 import { SearchPanel } from "./components/SearchPanel";
+import { UpsertPanel } from "./components/UpsertPanel";
 import { AdminPanel } from "./components/AdminPanel";
 import { CreateCollectionDialog } from "./components/CreateCollectionDialog";
 
-type Tab = "overview" | "search" | "admin";
+type Tab = "overview" | "search" | "upsert" | "admin";
 
 interface Toast {
   level: "error" | "success";
@@ -141,7 +142,7 @@ export default function App() {
             </div>
 
             <div className="tabs">
-              {(["overview", "search", "admin"] as const).map((t) => (
+              {(["overview", "search", "upsert", "admin"] as const).map((t) => (
                 <div
                   key={t}
                   className={`tab ${tab === t ? "active" : ""}`}
@@ -155,7 +156,17 @@ export default function App() {
             {tab === "overview" && <CollectionDetail info={info} />}
 
             {tab === "search" && (
-              <SearchPanel apiKey={apiKey} info={info} onError={showError} />
+              <SearchPanel apiKey={apiKey} info={info} onError={showError} onSuccess={showSuccess} />
+            )}
+
+            {tab === "upsert" && (
+              <UpsertPanel
+                apiKey={apiKey}
+                info={info}
+                onError={showError}
+                onSuccess={showSuccess}
+                onUpserted={() => setRefreshKey((k) => k + 1)}
+              />
             )}
 
             {tab === "admin" && (

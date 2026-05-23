@@ -2,6 +2,11 @@ export interface ServerConfig {
   upstream: string;
   hasApiKey: boolean;
   serverTime: string;
+  embedDefaults?: {
+    baseUrl: string;
+    model: string;
+    provider?: "openai" | "ollama";
+  };
 }
 
 export interface CollectionDescription {

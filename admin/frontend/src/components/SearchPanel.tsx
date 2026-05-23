@@ -1,11 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, ApiError, type SearchRequest } from "../api";
 import type { CollectionInfo, PointDetail, SearchHit } from "../types";
+import { embedSmart, pickEmbedStrategy } from "../embeddingStrategy";
 
 interface Props {
   apiKey: string;
   info: CollectionInfo;
   onError: (msg: string) => void;
+  onSuccess?: (msg: string) => void;
 }
 
 const MODES = [
@@ -15,7 +17,7 @@ const MODES = [
   { value: "hybrid_weighted", label: "Hybrid (weighted)" },
 ] as const;
 
-export function SearchPanel({ apiKey, info, onError }: Props) {
+export function SearchPanel({ apiKey, info, onError, onSuccess }: Props) {
   const [mode, setMode] = useState<string>(info.bm25TextField ? "hybrid_rrf" : "dense");
   const [topK, setTopK] = useState(10);
   const [textQuery, setTextQuery] = useState("");
@@ -27,6 +29,7 @@ export function SearchPanel({ apiKey, info, onError }: Props) {
   const [point, setPoint] = useState<PointDetail | null>(null);
   const [searching, setSearching] = useState(false);
   const [tookMs, setTookMs] = useState<number | null>(null);
+  const [embedBusy, setEmbedBusy] = useState(false);
 
   // When the user switches collection, reset transient state.
   useEffect(() => {
@@ -39,6 +42,35 @@ export function SearchPanel({ apiKey, info, onError }: Props) {
 
   const dim = info.dimension ?? 0;
   const needsVector = mode !== "bm25";
+  const embedPick = useMemo(() => pickEmbedStrategy(dim), [dim]);
+
+  const embedQuery = async () => {
+    const text = (textQuery || "").trim();
+    if (!text) {
+      onError("Type a text query first to embed it");
+      return;
+    }
+    if (!dim) {
+      onError("Collection dimension unknown");
+      return;
+    }
+    setEmbedBusy(true);
+    try {
+      const result = await embedSmart(text, dim, {
+        fallbackToHash: embedPick.method === "model",
+      });
+      setVectorText(JSON.stringify(result.vector));
+      const note =
+        result.method === "model"
+          ? `Semantic embed (${result.detail})`
+          : `Hash embed (${result.detail})`;
+      onSuccess?.(`${note} → ${result.dimensions} dims`);
+    } catch (e) {
+      onError((e as Error).message);
+    } finally {
+      setEmbedBusy(false);
+    }
+  };
 
   const buildVector = (): number[] => {
     const txt = vectorText.trim();
@@ -150,21 +182,47 @@ export function SearchPanel({ apiKey, info, onError }: Props) {
               />
             </div>
           )}
-          {mode !== "dense" && (
-            <div className="field-full">
-              <label>Text query</label>
+          <div className="field-full">
+            <label>
+              Text query{" "}
+              <span className="hint">
+                — used for {mode === "dense" ? "embedding" : mode === "bm25" ? "BM25" : "BM25 + embedding"}
+              </span>
+            </label>
+            <div className="row" style={{ gap: 6 }}>
               <input
                 placeholder="how does Raft elect a leader?"
                 value={textQuery}
                 onChange={(e) => setTextQuery(e.target.value)}
+                style={{ flex: 1 }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) embedQuery();
+                }}
               />
+              {needsVector && (
+                <button
+                  type="button"
+                  onClick={embedQuery}
+                  disabled={embedBusy || !textQuery.trim() || !dim}
+                  title={`Smart embed (${embedPick.label}) — fills the vector below`}
+                >
+                  {embedBusy ? "Embedding…" : `Embed query (${embedPick.label})`}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setVectorText("")}
+                disabled={!vectorText}
+              >
+                Clear vector
+              </button>
             </div>
-          )}
+          </div>
           {needsVector && (
             <div className="field-full">
               <label>
                 Vector (JSON array of {dim} numbers){" "}
-                <span className="hint">— leave empty for zero vector</span>
+                <span className="hint">— filled by Embed query, or paste your own</span>
               </label>
               <textarea
                 placeholder={`[${"0, ".repeat(Math.min(dim, 4))}…]`}

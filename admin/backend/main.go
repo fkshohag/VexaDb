@@ -74,13 +74,26 @@ func main() {
 	e.Any("/api", echo.WrapHandler(proxy))
 	e.Any("/api/*", echo.WrapHandler(proxy))
 
+	// Proxy to a local embedding server (LM Studio, Ollama, OpenAI) — avoids browser CORS.
+	e.POST("/embed", handleEmbed)
+
 	// Tiny config endpoint the frontend reads on boot.
+	embedURL := env("EMBED_DEFAULT_URL", "")
+	embedModel := env("EMBED_DEFAULT_MODEL", "text-embedding-nomic-embed-text-v1.5")
 	e.GET("/config.json", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, map[string]any{
+		cfg := map[string]any{
 			"upstream":   *upstream,
 			"hasApiKey":  *apiKey != "",
 			"serverTime": time.Now().Format(time.RFC3339),
-		})
+		}
+		if embedURL != "" {
+			cfg["embedDefaults"] = map[string]any{
+				"baseUrl": embedURL,
+				"model":   embedModel,
+				"provider": "openai",
+			}
+		}
+		return c.JSON(http.StatusOK, cfg)
 	})
 
 	// Static React build with SPA fallback. Order matters: more-specific routes

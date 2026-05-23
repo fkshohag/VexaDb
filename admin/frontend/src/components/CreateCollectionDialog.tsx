@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
+import { NOMIC_V15_DIM } from "../embeddingSettings";
 
 interface Props {
   apiKey: string;
@@ -77,14 +78,24 @@ export function CreateCollectionDialog({ apiKey, open, onClose, onCreated, onErr
           </div>
           <div>
             <label>Dimension</label>
-            <input
-              type="number"
-              min={1}
-              max={65536}
-              value={dim}
-              onChange={(e) => setDim(Number(e.target.value) || 1)}
-              required
-            />
+            <div className="row" style={{ gap: 6, marginBottom: 4 }}>
+              <input
+                type="number"
+                min={1}
+                max={65536}
+                value={dim}
+                onChange={(e) => setDim(Number(e.target.value) || 1)}
+                required
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                title="nomic-embed-text-v1.5 outputs 768-dimensional vectors"
+                onClick={() => setDim(NOMIC_V15_DIM)}
+              >
+                {NOMIC_V15_DIM} (nomic)
+              </button>
+            </div>
           </div>
           <div>
             <label>Metric</label>
