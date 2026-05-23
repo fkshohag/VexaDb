@@ -264,6 +264,21 @@ impl HnswIndex {
         Some(nodes[idx].vector.clone())
     }
 
+    /// All point IDs currently in the index.
+    pub fn point_ids(&self) -> Vec<PointId> {
+        self.id_to_idx.read().keys().cloned().collect()
+    }
+
+    /// Clone every stored id → vector pair (used for reindex / export).
+    pub fn iter_points(&self) -> Vec<(PointId, Vector)> {
+        let id_to_idx = self.id_to_idx.read();
+        let nodes = self.nodes.read();
+        id_to_idx
+            .iter()
+            .map(|(id, &idx)| (id.clone(), nodes[idx].vector.clone()))
+            .collect()
+    }
+
     fn search_layer_single(
         &self,
         nodes: &[Node],

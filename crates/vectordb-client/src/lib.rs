@@ -1,20 +1,38 @@
+mod leader;
+
 use anyhow::Context;
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::Channel;
+use tonic::{Request, Status};
+use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
-    CollectionSpec, CreateCollectionRequest, DeleteCollectionRequest, DeleteRequest,
-    DescribeCollectionRequest, DistanceMetric, GetRequest, HealthRequest, ListCollectionsRequest,
-    SearchRequest, UpsertRequest, VectorPoint,
+    BulkUpsertRequest, CollectionSpec, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
+    CreateSnapshotRequest, DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest,
+    DescribeCollectionRequest, DistanceMetric, GetRequest, HealthRequest, HealthResponse,
+    ImportChunk, ListCollectionsRequest, ListSnapshotsRequest, ReindexCollectionRequest,
+    ReindexCollectionResponse, SearchRequest, SnapshotInfo, UpsertRequest, VectorPoint,
 };
 use vectordb_proto::VectorServiceClient;
+
+pub use leader::{is_not_leader, leader_from_status};
 
 /// High-level Rust client for VectorDB gRPC API.
 #[derive(Clone)]
 pub struct VectorDbClient {
     inner: VectorServiceClient<Channel>,
+    endpoint: String,
+    api_key: Option<String>,
 }
 
 impl VectorDbClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        Self::connect_with(endpoint, None).await
+    }
+
+    pub async fn connect_with(
+        endpoint: impl Into<String>,
+        api_key: Option<String>,
+    ) -> anyhow::Result<Self> {
         let endpoint = endpoint.into();
         let channel = Channel::from_shared(endpoint.clone())
             .context("invalid endpoint")?
@@ -23,38 +41,87 @@ impl VectorDbClient {
             .context("failed to connect")?;
         Ok(Self {
             inner: VectorServiceClient::new(channel),
+            endpoint,
+            api_key,
         })
     }
 
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn authed<T>(&self, mut req: Request<T>) -> Request<T> {
+        if let Some(key) = &self.api_key {
+            if let Ok(v) = MetadataValue::<Ascii>::try_from(key.as_str()) {
+                req.metadata_mut().insert(HEADER_API_KEY, v);
+            }
+        }
+        req
+    }
+
+    async fn redirect_on_leader<F, Fut, T>(&self, op: F) -> Result<T, Status>
+    where
+        F: Fn(VectorDbClient) -> Fut,
+        Fut: std::future::Future<Output = Result<T, Status>>,
+    {
+        match op(self.clone()).await {
+            Ok(v) => Ok(v),
+            Err(status) if leader::is_not_leader(&status) => {
+                let ep = leader::leader_from_status(&status)
+                    .ok_or_else(|| status.clone())?;
+                let leader =
+                    VectorDbClient::connect_with(ep, self.api_key.clone())
+                        .await
+                        .map_err(|e| Status::unavailable(e.to_string()))?;
+                op(leader).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn health(&mut self) -> anyhow::Result<String> {
+        Ok(self.health_detail().await?.status)
+    }
+
+    pub async fn health_detail(&mut self) -> anyhow::Result<HealthResponse> {
         let resp = self
             .inner
-            .health(HealthRequest {})
+            .health(self.authed(HealthRequest {}))
             .await?
             .into_inner();
-        Ok(resp.status)
+        Ok(resp)
     }
 
     pub async fn create_collection(&mut self, spec: CollectionSpec) -> anyhow::Result<()> {
-        self.inner
-            .create_collection(CreateCollectionRequest { spec: Some(spec) })
-            .await?;
-        Ok(())
+        self.redirect_on_leader(|mut c| {
+            let spec = spec.clone();
+            async move {
+                c.inner
+                    .create_collection(c.authed(CreateCollectionRequest { spec: Some(spec) }))
+                    .await?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
     }
 
     pub async fn delete_collection(&mut self, name: &str) -> anyhow::Result<()> {
-        self.inner
-            .delete_collection(DeleteCollectionRequest {
-                name: name.into(),
-            })
-            .await?;
-        Ok(())
+        let name = name.to_string();
+        self.redirect_on_leader(|mut c| async move {
+            c.inner
+                .delete_collection(c.authed(DeleteCollectionRequest { name }))
+                .await?;
+            Ok(())
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
     }
 
     pub async fn list_collections(&mut self) -> anyhow::Result<Vec<String>> {
         Ok(self
             .inner
-            .list_collections(ListCollectionsRequest {})
+            .list_collections(self.authed(ListCollectionsRequest {}))
             .await?
             .into_inner()
             .names)
@@ -66,9 +133,9 @@ impl VectorDbClient {
     ) -> anyhow::Result<(CollectionSpec, u64)> {
         let resp = self
             .inner
-            .describe_collection(DescribeCollectionRequest {
+            .describe_collection(self.authed(DescribeCollectionRequest {
                 name: name.into(),
-            })
+            }))
             .await?
             .into_inner();
         Ok((resp.spec.context("missing spec")?, resp.vector_count))
@@ -79,15 +146,24 @@ impl VectorDbClient {
         collection: &str,
         points: Vec<VectorPoint>,
     ) -> anyhow::Result<u64> {
-        let resp = self
-            .inner
-            .upsert(UpsertRequest {
-                collection: collection.into(),
-                points,
-            })
-            .await?
-            .into_inner();
-        Ok(resp.upserted)
+        let collection = collection.to_string();
+        self.redirect_on_leader(|mut c| {
+            let collection = collection.clone();
+            let points = points.clone();
+            async move {
+                let resp = c
+                    .inner
+                    .upsert(c.authed(UpsertRequest {
+                        collection,
+                        points,
+                    }))
+                    .await?
+                    .into_inner();
+                Ok(resp.upserted)
+            }
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
     }
 
     pub async fn search(
@@ -96,29 +172,69 @@ impl VectorDbClient {
         query: Vec<f32>,
         top_k: u32,
     ) -> anyhow::Result<Vec<vectordb_proto::vectordb::v1::ScoredPoint>> {
+        self.search_with(collection, query, top_k, vec![], String::new())
+            .await
+    }
+
+    pub async fn search_with(
+        &mut self,
+        collection: &str,
+        query: Vec<f32>,
+        top_k: u32,
+        filter_ids: Vec<String>,
+        filter_json: String,
+    ) -> anyhow::Result<Vec<vectordb_proto::vectordb::v1::ScoredPoint>> {
+        self.search_hybrid(collection, query, top_k, filter_ids, filter_json, None, None, "", 0.5)
+            .await
+    }
+
+    /// Full search including sparse/BM25/hybrid modes.
+    pub async fn search_hybrid(
+        &mut self,
+        collection: &str,
+        query: Vec<f32>,
+        top_k: u32,
+        filter_ids: Vec<String>,
+        filter_json: String,
+        sparse_query: Option<vectordb_proto::vectordb::v1::SparseVector>,
+        text_query: Option<String>,
+        search_mode: &str,
+        hybrid_alpha: f32,
+    ) -> anyhow::Result<Vec<vectordb_proto::vectordb::v1::ScoredPoint>> {
         Ok(self
             .inner
-            .search(SearchRequest {
+            .search(self.authed(SearchRequest {
                 collection: collection.into(),
                 query,
                 top_k,
-                filter_ids: vec![],
-            })
+                filter_ids,
+                filter_json,
+                sparse_query: sparse_query.unwrap_or_default(),
+                text_query: text_query.unwrap_or_default(),
+                search_mode: search_mode.into(),
+                hybrid_alpha,
+            }))
             .await?
             .into_inner()
             .hits)
     }
 
     pub async fn delete(&mut self, collection: &str, ids: Vec<String>) -> anyhow::Result<u64> {
-        let resp = self
-            .inner
-            .delete(DeleteRequest {
-                collection: collection.into(),
-                ids,
-            })
-            .await?
-            .into_inner();
-        Ok(resp.deleted)
+        let collection = collection.to_string();
+        self.redirect_on_leader(|mut c| {
+            let collection = collection.clone();
+            let ids = ids.clone();
+            async move {
+                let resp = c
+                    .inner
+                    .delete(c.authed(DeleteRequest { collection, ids }))
+                    .await?
+                    .into_inner();
+                Ok(resp.deleted)
+            }
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
     }
 
     pub async fn get(
@@ -128,13 +244,116 @@ impl VectorDbClient {
     ) -> anyhow::Result<Option<VectorPoint>> {
         let resp = self
             .inner
-            .get(GetRequest {
+            .get(self.authed(GetRequest {
                 collection: collection.into(),
                 id: id.into(),
-            })
+            }))
             .await?
             .into_inner();
         Ok(if resp.found { resp.point } else { None })
+    }
+
+    pub async fn create_snapshot(&mut self) -> anyhow::Result<SnapshotInfo> {
+        let resp = self
+            .inner
+            .create_snapshot(self.authed(CreateSnapshotRequest {}))
+            .await?
+            .into_inner();
+        resp.snapshot.context("missing snapshot")
+    }
+
+    pub async fn list_snapshots(&mut self) -> anyhow::Result<Vec<SnapshotInfo>> {
+        Ok(self
+            .inner
+            .list_snapshots(self.authed(ListSnapshotsRequest {}))
+            .await?
+            .into_inner()
+            .snapshots)
+    }
+
+    pub async fn delete_snapshot(&mut self, id: &str) -> anyhow::Result<()> {
+        self.inner
+            .delete_snapshot(self.authed(DeleteSnapshotRequest { id: id.into() }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn bulk_upsert(
+        &mut self,
+        collection: &str,
+        points: Vec<VectorPoint>,
+        chunk_size: u32,
+    ) -> anyhow::Result<u64> {
+        let collection = collection.to_string();
+        self.redirect_on_leader(|mut c| {
+            let collection = collection.clone();
+            let points = points.clone();
+            async move {
+                let resp = c
+                    .inner
+                    .bulk_upsert(c.authed(BulkUpsertRequest {
+                        collection,
+                        points,
+                        chunk_size,
+                    }))
+                    .await?
+                    .into_inner();
+                Ok(resp.upserted)
+            }
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
+    }
+
+    pub async fn import_stream(
+        &mut self,
+        chunks: Vec<ImportChunk>,
+    ) -> anyhow::Result<u64> {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            for chunk in chunks {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        self.redirect_on_leader(|mut c| async move {
+            let resp = c
+                .inner
+                .import_stream(c.authed(Request::new(stream)))
+                .await?
+                .into_inner();
+            Ok(resp.upserted)
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
+    }
+
+    pub async fn compact_wal(&mut self, snapshot_first: bool) -> anyhow::Result<CompactWalResponse> {
+        self.redirect_on_leader(|mut c| async move {
+            Ok(c.inner
+                .compact_wal(c.authed(CompactWalRequest { snapshot_first }))
+                .await?
+                .into_inner())
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
+    }
+
+    pub async fn reindex_collection(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<ReindexCollectionResponse> {
+        let collection = collection.to_string();
+        self.redirect_on_leader(|mut c| async move {
+            Ok(c.inner
+                .reindex_collection(c.authed(ReindexCollectionRequest { collection }))
+                .await?
+                .into_inner())
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("{s}"))
     }
 }
 
@@ -146,5 +365,6 @@ pub fn cosine_collection(name: &str, dimension: u32) -> CollectionSpec {
         m: 16,
         ef_construction: 200,
         ef_search: 64,
+        payload_indexes: Vec::new(),
     }
 }

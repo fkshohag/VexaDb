@@ -2,8 +2,12 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use vectordb_auth::AuthConfig;
 use vectordb_cluster::{ClusterConfig, NodeRole, NodeState};
+use vectordb_replication::RaftConfig;
 use vectordb_storage::EngineConfig;
+
+use crate::tls::TlsConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -11,10 +15,31 @@ pub struct ServerConfig {
     #[serde(default)]
     pub storage: EngineConfig,
     pub cluster: ClusterSection,
+    #[serde(default)]
+    pub raft: Option<RaftConfig>,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub metrics: Option<MetricsSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSection {
+    pub listen: String,
+    /// When replication is enabled, `/ready` semantics require leadership for writes.
+    #[serde(default = "default_true")]
+    pub readiness_requires_leader: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSection {
+    /// Prometheus scrape listen address, e.g. `0.0.0.0:9090`.
     pub listen: String,
 }
 
@@ -46,6 +71,7 @@ impl ServerConfig {
         Self {
             server: ServerSection {
                 listen: "0.0.0.0:6334".into(),
+                readiness_requires_leader: true,
             },
             storage: EngineConfig::new("./data"),
             cluster: ClusterSection {
@@ -56,11 +82,26 @@ impl ServerConfig {
                 peers: vec![],
                 nodes: vec![],
             },
+            raft: None,
+            auth: AuthConfig::default(),
+            tls: None,
+            metrics: None,
         }
+    }
+
+    pub fn raft_enabled(&self) -> bool {
+        self.raft.is_some()
     }
 
     pub fn is_router(&self) -> bool {
         matches!(self.cluster.role, NodeRole::Router)
+    }
+
+    pub fn vector_endpoint(&self) -> String {
+        if let Some(ep) = self.raft.as_ref().and_then(|r| r.vector_endpoint.clone()) {
+            return normalize_endpoint(&ep);
+        }
+        normalize_endpoint(&self.server.listen)
     }
 
     pub fn cluster_config(&self) -> ClusterConfig {
@@ -101,8 +142,22 @@ impl ServerConfig {
     }
 }
 
+pub fn normalize_endpoint(addr: &str) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
 pub fn load_config(path: &Path) -> anyhow::Result<ServerConfig> {
     let raw = fs::read_to_string(path)?;
-    let cfg: ServerConfig = toml::from_str(&raw)?;
+    let mut cfg: ServerConfig = toml::from_str(&raw)?;
+    // Default vector_endpoint on raft config from server listen.
+    if let Some(raft) = cfg.raft.as_mut() {
+        if raft.vector_endpoint.is_none() {
+            raft.vector_endpoint = Some(cfg.vector_endpoint());
+        }
+    }
     Ok(cfg)
 }

@@ -14,4 +14,5 @@ vectordb-client.workspace = true
 vectordb-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 tokio.workspace = true

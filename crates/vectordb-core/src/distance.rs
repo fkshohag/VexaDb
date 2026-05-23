@@ -1,4 +1,5 @@
 use crate::collection::DistanceMetric;
+use crate::simd::{dot_f32, l2_squared_f32};
 
 /// Distance / similarity helpers. Lower distance = more similar for L2;
 /// higher score = more similar for cosine/dot (returned as negated distance where needed).
@@ -6,17 +7,19 @@ pub struct Distance;
 
 impl Distance {
     pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| {
-                let d = x - y;
-                d * d
-            })
-            .sum()
+        if a.len() == b.len() && !a.is_empty() {
+            l2_squared_f32(a, b)
+        } else {
+            0.0
+        }
     }
 
     pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+        if a.len() == b.len() && !a.is_empty() {
+            dot_f32(a, b)
+        } else {
+            0.0
+        }
     }
 
     pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {

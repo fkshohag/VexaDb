@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vectordb_core::types::Vector;
+use vectordb_core::{SparseVector, Vector};
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -18,17 +18,44 @@ pub type Result<T> = std::result::Result<T, WalError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalEntry {
+    CreateCollection {
+        config: vectordb_core::CollectionConfig,
+    },
+    DeleteCollection {
+        name: String,
+    },
     Upsert {
         collection: String,
         id: String,
         vector: Vector,
         #[serde(default)]
         payload: Option<Vec<u8>>,
+        #[serde(default)]
+        sparse: Option<SparseVector>,
     },
     Delete {
         collection: String,
         id: String,
     },
+    /// Batch upsert for bulk import (single WAL record).
+    BulkUpsert {
+        collection: String,
+        points: Vec<BulkPoint>,
+    },
+    /// Marker written after snapshot + compaction.
+    Checkpoint {
+        snapshot_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkPoint {
+    pub id: String,
+    pub vector: Vector,
+    #[serde(default)]
+    pub payload: Option<Vec<u8>>,
+    #[serde(default)]
+    pub sparse: Option<SparseVector>,
 }
 
 /// Append-only write-ahead log for crash recovery.
@@ -84,5 +111,30 @@ impl WriteAheadLog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Replace the WAL file with a compacted sequence of entries.
+    pub fn rewrite(&mut self, entries: &[WalEntry]) -> Result<()> {
+        let path = self.path.clone();
+        drop(std::mem::replace(
+            &mut self.writer,
+            BufWriter::new(
+                OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .create(true)
+                    .open(&path)?,
+            ),
+        ));
+        for entry in entries {
+            self.append(entry)?;
+        }
+        Ok(())
+    }
+
+    pub fn append_checkpoint(&mut self, snapshot_id: impl Into<String>) -> Result<()> {
+        self.append(&WalEntry::Checkpoint {
+            snapshot_id: snapshot_id.into(),
+        })
     }
 }

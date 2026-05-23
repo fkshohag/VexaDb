@@ -22,6 +22,26 @@ impl DistanceMetric {
     }
 }
 
+/// Index kind for a payload field. Determines how filter conditions on this
+/// field can be accelerated by the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadIndexKind {
+    /// String / boolean / array-of-string equality lookups.
+    Keyword,
+    /// Numeric `eq` and `range` lookups (BTree).
+    Numeric,
+    /// Boolean lookups.
+    Bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PayloadFieldIndex {
+    /// Dotted JSON path (`"price"`, `"meta.author"`).
+    pub field: String,
+    pub kind: PayloadIndexKind,
+}
+
 /// Configuration for a logical vector collection (namespace).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionConfig {
@@ -34,6 +54,52 @@ pub struct CollectionConfig {
     pub ef_construction: usize,
     /// Query-time search width.
     pub ef_search: usize,
+    /// Optional payload fields to index for filter acceleration.
+    #[serde(default)]
+    pub payload_indexes: Vec<PayloadFieldIndex>,
+    /// Enable sparse vector inverted index (dot-product retrieval).
+    #[serde(default)]
+    pub sparse_enabled: bool,
+    /// BM25 over this JSON payload field (e.g. `"text"`). Enables lexical hybrid search.
+    #[serde(default)]
+    pub bm25_text_field: Option<String>,
+    /// Optional scalar quantization for stored vectors (search still uses f32 in HNSW).
+    #[serde(default)]
+    pub quantization: Option<QuantizationConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    Dense,
+    Sparse,
+    Bm25,
+    HybridRrf,
+    HybridWeighted,
+}
+
+impl Default for SearchMode {
+    fn default() -> Self {
+        Self::Dense
+    }
+}
+
+impl SearchMode {
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "sparse" => Self::Sparse,
+            "bm25" | "lexical" => Self::Bm25,
+            "hybrid_rrf" | "hybrid" => Self::HybridRrf,
+            "hybrid_weighted" | "weighted" => Self::HybridWeighted,
+            _ => Self::Dense,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantizationConfig {
+    #[serde(default)]
+    pub scalar: bool,
 }
 
 impl CollectionConfig {
@@ -45,7 +111,19 @@ impl CollectionConfig {
             m: 16,
             ef_construction: 200,
             ef_search: 64,
+            payload_indexes: Vec::new(),
+            sparse_enabled: false,
+            bm25_text_field: None,
+            quantization: None,
         }
+    }
+
+    pub fn with_index(mut self, field: impl Into<String>, kind: PayloadIndexKind) -> Self {
+        self.payload_indexes.push(PayloadFieldIndex {
+            field: field.into(),
+            kind,
+        });
+        self
     }
 
     pub fn validate(&self) -> Result<()> {

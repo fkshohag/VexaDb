@@ -1,13 +1,27 @@
 //! Core primitives for VectorDB: vectors, distance metrics, and HNSW indexing.
 
+pub mod bm25;
 pub mod collection;
 pub mod distance;
 pub mod error;
+pub mod filter;
+pub mod fusion;
 pub mod hnsw;
+pub mod quantize;
+pub mod simd;
+pub mod sparse;
 pub mod types;
 
-pub use collection::{CollectionConfig, DistanceMetric};
+pub use bm25::{tokenize, Bm25Index};
+pub use collection::{
+    CollectionConfig, DistanceMetric, PayloadFieldIndex, PayloadIndexKind, QuantizationConfig,
+    SearchMode,
+};
 pub use distance::Distance;
 pub use error::{Error, Result};
+pub use filter::{Condition, FieldCondition, FieldOp, Filter};
+pub use fusion::{rrf_fusion, weighted_fusion};
 pub use hnsw::{HnswConfig, HnswIndex};
+pub use quantize::ScalarQuantizer;
+pub use sparse::{SparseInvertedIndex, SparseVector};
 pub use types::{PointId, ScoredPoint, Vector};

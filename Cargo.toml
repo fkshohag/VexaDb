@@ -6,10 +6,12 @@ members = [
     "crates/vectordb-cluster",
     "crates/vectordb-proto",
     "crates/vectordb-router",
+    "crates/vectordb-replication",
     "crates/vectordb-server",
     "crates/vectordb-client",
     "crates/vectordb-cli",
     "crates/vectordb-gateway",
+    "crates/vectordb-auth",
 ]
 
 [workspace.package]
@@ -26,6 +28,8 @@ vectordb-cluster = { path = "crates/vectordb-cluster" }
 vectordb-proto = { path = "crates/vectordb-proto" }
 vectordb-client = { path = "crates/vectordb-client" }
 vectordb-router = { path = "crates/vectordb-router" }
+vectordb-replication = { path = "crates/vectordb-replication" }
+vectordb-auth = { path = "crates/vectordb-auth" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -55,6 +59,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 axum = "0.7"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+prometheus = "0.13"
+lazy_static = "1"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+http = "1"
 
 [profile.release]
 lto = "thin"

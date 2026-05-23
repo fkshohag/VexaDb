@@ -1,0 +1,47 @@
+# Example: data node with API keys, metrics, and Raft leader discovery.
+
+[server]
+listen = "0.0.0.0:6334"
+readiness_requires_leader = true
+
+[storage]
+data_dir = "./data/secure-node"
+sync_wal = true
+
+[cluster]
+node_id = "secure-1"
+role = "data"
+shard_count = 1
+shard_id = 0
+
+[auth]
+required = true
+keys = ["dev-secret-key-change-me"]
+
+[metrics]
+listen = "0.0.0.0:9090"
+
+# TLS for gRPC (uncomment and provide PEM files).
+# [tls]
+# cert_file = "./certs/server.crt"
+# key_file = "./certs/server.key"
+
+[raft]
+node_id = 1
+listen = "0.0.0.0:7334"
+vector_endpoint = "http://127.0.0.1:6334"
+
+[[raft.peers]]
+id = 1
+addr = "127.0.0.1:7334"
+grpc = "http://127.0.0.1:6334"
+
+[[raft.peers]]
+id = 2
+addr = "127.0.0.1:7335"
+grpc = "http://127.0.0.1:6335"
+
+[[raft.peers]]
+id = 3
+addr = "127.0.0.1:7336"
+grpc = "http://127.0.0.1:6336"

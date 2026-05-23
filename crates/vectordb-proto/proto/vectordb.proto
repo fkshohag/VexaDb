@@ -14,6 +14,14 @@ service VectorService {
   rpc Search(SearchRequest) returns (SearchResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc Get(GetRequest) returns (GetResponse);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+  // M4: bulk import, WAL compaction, online reindex.
+  rpc BulkUpsert(BulkUpsertRequest) returns (BulkUpsertResponse);
+  rpc ImportStream(stream ImportChunk) returns (ImportStreamResponse);
+  rpc CompactWal(CompactWalRequest) returns (CompactWalResponse);
+  rpc ReindexCollection(ReindexCollectionRequest) returns (ReindexCollectionResponse);
 }
 
 enum DistanceMetric {
@@ -23,12 +31,31 @@ enum DistanceMetric {
   DOT_PRODUCT = 3;
 }
 
+enum PayloadIndexKind {
+  PAYLOAD_INDEX_KIND_UNSPECIFIED = 0;
+  PAYLOAD_INDEX_KIND_KEYWORD = 1;
+  PAYLOAD_INDEX_KIND_NUMERIC = 2;
+  PAYLOAD_INDEX_KIND_BOOL = 3;
+}
+
+message PayloadFieldIndex {
+  string field = 1;
+  PayloadIndexKind kind = 2;
+}
+
 message HealthRequest {}
 
 message HealthResponse {
   string status = 1;
   string node_id = 2;
   uint32 shard_count = 3;
+  // Raft / replication (empty when replication is disabled).
+  bool is_leader = 4;
+  string raft_role = 5;
+  // gRPC endpoint clients should use for writes (http://host:port).
+  string leader_endpoint = 6;
+  // False when replication is enabled but this node is not the leader (writes fail).
+  bool ready = 7;
 }
 
 message CollectionSpec {
@@ -38,6 +65,15 @@ message CollectionSpec {
   uint32 m = 4;
   uint32 ef_construction = 5;
   uint32 ef_search = 6;
+  repeated PayloadFieldIndex payload_indexes = 7;
+  bool sparse_enabled = 8;
+  string bm25_text_field = 9;
+  bool scalar_quantization = 10;
+}
+
+message SparseVector {
+  repeated uint32 indices = 1;
+  repeated float values = 2;
 }
 
 message CreateCollectionRequest {
@@ -71,6 +107,7 @@ message VectorPoint {
   string id = 1;
   repeated float values = 2;
   bytes payload = 3;
+  SparseVector sparse = 4;
 }
 
 message UpsertRequest {
@@ -86,7 +123,16 @@ message SearchRequest {
   string collection = 1;
   repeated float query = 2;
   uint32 top_k = 3;
+  // Restrict results to these specific IDs (post-filter).
   repeated string filter_ids = 4;
+  // Filter expression encoded as JSON. See `Filter` DSL in vectordb-core.
+  string filter_json = 5;
+  SparseVector sparse_query = 6;
+  // Lexical query for BM25 (when collection has bm25_text_field).
+  string text_query = 7;
+  // dense | sparse | bm25 | hybrid_rrf | hybrid_weighted
+  string search_mode = 8;
+  float hybrid_alpha = 9;
 }
 
 message ScoredPoint {
@@ -115,4 +161,68 @@ message GetRequest {
 message GetResponse {
   VectorPoint point = 1;
   bool found = 2;
+}
+
+message CreateSnapshotRequest {}
+
+message SnapshotInfo {
+  string id = 1;
+  uint64 created_at_ms = 2;
+  string path = 3;
+}
+
+message CreateSnapshotResponse {
+  SnapshotInfo snapshot = 1;
+}
+
+message ListSnapshotsRequest {}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message DeleteSnapshotRequest {
+  string id = 1;
+}
+
+message DeleteSnapshotResponse {}
+
+message BulkUpsertRequest {
+  string collection = 1;
+  repeated VectorPoint points = 2;
+  // Max points per WAL record (default 500).
+  uint32 chunk_size = 3;
+}
+
+message BulkUpsertResponse {
+  uint64 upserted = 1;
+}
+
+message ImportChunk {
+  string collection = 1;
+  repeated VectorPoint points = 2;
+  bool finalize = 3;
+}
+
+message ImportStreamResponse {
+  uint64 upserted = 1;
+}
+
+message CompactWalRequest {
+  // When true, create a filesystem snapshot before compacting the WAL.
+  bool snapshot_first = 1;
+}
+
+message CompactWalResponse {
+  uint64 entries_before = 1;
+  uint64 entries_after = 2;
+  SnapshotInfo snapshot = 3;
+}
+
+message ReindexCollectionRequest {
+  string collection = 1;
+}
+
+message ReindexCollectionResponse {
+  uint64 vectors_reindexed = 1;
 }

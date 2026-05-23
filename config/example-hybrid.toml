@@ -1,0 +1,20 @@
+[server]
+listen = "0.0.0.0:6334"
+
+[storage]
+data_dir = "./data/hybrid"
+sync_wal = true
+
+[cluster]
+node_id = "hybrid-1"
+role = "all_in_one"
+shard_count = 1
+shard_id = 0
+
+# Collection flags (also set per-collection via API):
+# - sparse_enabled: inverted index for sparse vector dot-product
+# - bm25_text_field: JSON payload field for lexical BM25
+# - scalar_quantization: store 8-bit codes alongside f32 HNSW
+
+[metrics]
+listen = "0.0.0.0:9090"

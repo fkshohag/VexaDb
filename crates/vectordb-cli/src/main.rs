@@ -25,6 +25,9 @@ enum Commands {
         id: String,
         /// Comma-separated floats
         vector: String,
+        /// Optional JSON payload, e.g. '{"category":"books","price":29.5}'
+        #[arg(long)]
+        payload: Option<String>,
     },
     Search {
         collection: String,
@@ -32,6 +35,13 @@ enum Commands {
         vector: String,
         #[arg(long, default_value_t = 10)]
         top_k: u32,
+        /// Optional JSON filter (Filter DSL)
+        #[arg(long)]
+        filter: Option<String>,
+    },
+    Snapshots {
+        #[command(subcommand)]
+        action: SnapshotAction,
     },
 }
 
@@ -43,8 +53,19 @@ enum CollectionAction {
         #[arg(long)]
         dim: u32,
     },
-    Describe { name: String },
-    Delete { name: String },
+    Describe {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotAction {
+    Create,
+    List,
+    Delete { id: String },
 }
 
 #[tokio::main]
@@ -82,15 +103,24 @@ async fn main() -> anyhow::Result<()> {
             collection,
             id,
             vector,
+            payload,
         } => {
             let values = parse_vector(&vector)?;
+            let payload_bytes = match payload {
+                Some(p) => {
+                    serde_json::from_str::<serde_json::Value>(&p)
+                        .context("invalid JSON payload")?;
+                    p.into_bytes()
+                }
+                None => vec![],
+            };
             let n = client
                 .upsert(
                     &collection,
                     vec![VectorPoint {
                         id,
                         values,
-                        payload: vec![],
+                        payload: payload_bytes,
                     }],
                 )
                 .await?;
@@ -100,13 +130,38 @@ async fn main() -> anyhow::Result<()> {
             collection,
             vector,
             top_k,
+            filter,
         } => {
             let query = parse_vector(&vector)?;
-            let hits = client.search(&collection, query, top_k).await?;
+            let filter_json = match filter {
+                Some(f) => {
+                    serde_json::from_str::<serde_json::Value>(&f).context("invalid filter JSON")?;
+                    f
+                }
+                None => String::new(),
+            };
+            let hits = client
+                .search_with(&collection, query, top_k, vec![], filter_json)
+                .await?;
             for hit in hits {
                 println!("{}  score={:.6}", hit.id, hit.score);
             }
         }
+        Commands::Snapshots { action } => match action {
+            SnapshotAction::Create => {
+                let snap = client.create_snapshot().await?;
+                println!("{}\t{}", snap.id, snap.path);
+            }
+            SnapshotAction::List => {
+                for snap in client.list_snapshots().await? {
+                    println!("{}\t{}\t{}", snap.id, snap.created_at_ms, snap.path);
+                }
+            }
+            SnapshotAction::Delete { id } => {
+                client.delete_snapshot(&id).await?;
+                println!("deleted {id}");
+            }
+        },
     }
 
     Ok(())

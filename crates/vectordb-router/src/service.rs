@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 
 use futures::future::join_all;
-use tonic::{Request, Response, Status};
 use vectordb_cluster::{merge_top_k, ClusterConfig, ShardRouter};
+use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, CollectionSpec, CreateCollectionRequest,
-    CreateCollectionResponse, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
-    DeleteResponse, DescribeCollectionRequest, DescribeCollectionResponse, GetRequest,
-    GetResponse, HealthRequest, HealthResponse, ListCollectionsRequest, ListCollectionsResponse,
-    SearchRequest, SearchResponse, UpsertRequest, UpsertResponse, VectorPoint,
+    vector_service_server::VectorService, BulkUpsertRequest, BulkUpsertResponse, CollectionSpec,
+    CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
+    CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse,
+    DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
+    DescribeCollectionRequest, DescribeCollectionResponse, GetRequest, GetResponse, HealthRequest,
+    HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
+    ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse, ReindexCollectionRequest,
+    ReindexCollectionResponse, SearchRequest, SearchResponse, UpsertRequest, UpsertResponse,
+    VectorPoint,
 };
 
 use crate::pool::ClientPool;
@@ -73,6 +77,10 @@ impl VectorService for RouterService {
             status: "ok".into(),
             node_id: self.node_id.clone(),
             shard_count: self.router.shard_count(),
+            is_leader: true,
+            raft_role: String::new(),
+            leader_endpoint: String::new(),
+            ready: true,
         }))
     }
 
@@ -185,6 +193,11 @@ impl VectorService for RouterService {
         let query = req.query.clone();
         let filter_ids = req.filter_ids.clone();
 
+        let filter_json = req.filter_json.clone();
+        let sparse_query = req.sparse_query.clone();
+        let text_query = req.text_query.clone();
+        let search_mode = req.search_mode.clone();
+        let hybrid_alpha = req.hybrid_alpha;
         let futures: Vec<_> = self
             .clients_for_all_shards()
             .await?
@@ -193,10 +206,29 @@ impl VectorService for RouterService {
                 let collection = collection.clone();
                 let query = query.clone();
                 let filter_ids = filter_ids.clone();
+                let filter_json = filter_json.clone();
+                let sparse_query = sparse_query.clone();
+                let text_query = text_query.clone();
+                let search_mode = search_mode.clone();
                 async move {
-                    // Search more per shard for better merged recall
                     let per_shard_k = (top_k * 2).max(top_k) as u32;
-                    client.search(&collection, query, per_shard_k).await
+                    client
+                        .search_hybrid(
+                            &collection,
+                            query,
+                            per_shard_k,
+                            filter_ids,
+                            filter_json,
+                            Some(sparse_query),
+                            if text_query.is_empty() {
+                                None
+                            } else {
+                                Some(text_query)
+                            },
+                            &search_mode,
+                            hybrid_alpha,
+                        )
+                        .await
                 }
             })
             .collect();
@@ -260,6 +292,172 @@ impl VectorService for RouterService {
         Ok(Response::new(GetResponse {
             found: point.is_some(),
             point,
+        }))
+    }
+
+    async fn create_snapshot(
+        &self,
+        _request: Request<CreateSnapshotRequest>,
+    ) -> Result<Response<CreateSnapshotResponse>, Status> {
+        // Take snapshot on first shard; production: fan out and aggregate.
+        let mut clients = self.clients_for_all_shards().await?;
+        let (_, mut first) = clients.remove(0);
+        let snap = first
+            .create_snapshot()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(CreateSnapshotResponse {
+            snapshot: Some(snap),
+        }))
+    }
+
+    async fn list_snapshots(
+        &self,
+        _request: Request<ListSnapshotsRequest>,
+    ) -> Result<Response<ListSnapshotsResponse>, Status> {
+        let mut all = Vec::new();
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            let mut s = client
+                .list_snapshots()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            all.append(&mut s);
+        }
+        Ok(Response::new(ListSnapshotsResponse { snapshots: all }))
+    }
+
+    async fn delete_snapshot(
+        &self,
+        request: Request<DeleteSnapshotRequest>,
+    ) -> Result<Response<DeleteSnapshotResponse>, Status> {
+        let id = request.into_inner().id;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            let _ = client.delete_snapshot(&id).await;
+        }
+        Ok(Response::new(DeleteSnapshotResponse {}))
+    }
+
+    async fn bulk_upsert(
+        &self,
+        request: Request<BulkUpsertRequest>,
+    ) -> Result<Response<BulkUpsertResponse>, Status> {
+        let req = request.into_inner();
+        let mut by_endpoint: HashMap<String, Vec<VectorPoint>> = HashMap::new();
+        for point in req.points {
+            let ep = self
+                .router
+                .endpoint_for_point(&point.id)
+                .ok_or_else(|| Status::not_found(format!("no shard for {}", point.id)))?
+                .to_string();
+            by_endpoint.entry(ep).or_default().push(point);
+        }
+        let chunk_size = req.chunk_size;
+        let mut upserted = 0u64;
+        for (ep, points) in by_endpoint {
+            let mut client = self
+                .pool
+                .get(&ep)
+                .await
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+            upserted += client
+                .bulk_upsert(&req.collection, points, chunk_size)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(BulkUpsertResponse { upserted }))
+    }
+
+    async fn import_stream(
+        &self,
+        request: Request<Streaming<ImportChunk>>,
+    ) -> Result<Response<ImportStreamResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut collection = String::new();
+        let mut by_endpoint: HashMap<String, Vec<VectorPoint>> = HashMap::new();
+        let mut total = 0u64;
+
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
+            if !chunk.collection.is_empty() {
+                collection = chunk.collection.clone();
+            }
+            for point in chunk.points {
+                let ep = self
+                    .router
+                    .endpoint_for_point(&point.id)
+                    .ok_or_else(|| Status::not_found(format!("no shard for {}", point.id)))?
+                    .to_string();
+                by_endpoint.entry(ep).or_default().push(point);
+            }
+            if chunk.finalize {
+                for (ep, points) in by_endpoint.drain() {
+                    let mut client = self
+                        .pool
+                        .get(&ep)
+                        .await
+                        .map_err(|e| Status::unavailable(e.to_string()))?;
+                    total += client
+                        .bulk_upsert(&collection, points, 500)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+            }
+        }
+        for (ep, points) in by_endpoint {
+            let mut client = self
+                .pool
+                .get(&ep)
+                .await
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+            total += client
+                .bulk_upsert(&collection, points, 500)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(ImportStreamResponse { upserted: total }))
+    }
+
+    async fn compact_wal(
+        &self,
+        request: Request<CompactWalRequest>,
+    ) -> Result<Response<CompactWalResponse>, Status> {
+        let snapshot_first = request.into_inner().snapshot_first;
+        let mut clients = self.clients_for_all_shards().await?;
+        let (_, mut first) = clients
+            .remove(0)
+            .ok_or_else(|| Status::failed_precondition("no shards"))?;
+        let resp = first
+            .compact_wal(snapshot_first)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        for (_, mut client) in clients {
+            let _ = client.compact_wal(snapshot_first).await;
+        }
+        Ok(Response::new(CompactWalResponse {
+            entries_before: resp.entries_before,
+            entries_after: resp.entries_after,
+            snapshot: resp.snapshot,
+        }))
+    }
+
+    async fn reindex_collection(
+        &self,
+        request: Request<ReindexCollectionRequest>,
+    ) -> Result<Response<ReindexCollectionResponse>, Status> {
+        let name = request.into_inner().collection;
+        let mut total = 0u64;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            let resp = client
+                .reindex_collection(&name)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            total += resp.vectors_reindexed;
+        }
+        Ok(Response::new(ReindexCollectionResponse {
+            vectors_reindexed: total,
         }))
     }
 }

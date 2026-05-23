@@ -1,0 +1,10 @@
+[package]
+name = "vectordb-auth"
+description = "API key authentication helpers for VectorDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true

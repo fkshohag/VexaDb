@@ -1,0 +1,34 @@
+[server]
+listen = "0.0.0.0:6335"
+
+[storage]
+data_dir = "./data/replica-2"
+sync_wal = true
+
+[cluster]
+node_id = "replica-2"
+role = "data"
+shard_count = 1
+shard_id = 0
+
+[raft]
+node_id = 2
+listen = "0.0.0.0:7335"
+vector_endpoint = "http://127.0.0.1:6335"
+election_timeout_ms = 750
+heartbeat_interval_ms = 150
+
+[[raft.peers]]
+id = 1
+addr = "127.0.0.1:7334"
+grpc = "http://127.0.0.1:6334"
+
+[[raft.peers]]
+id = 2
+addr = "127.0.0.1:7335"
+grpc = "http://127.0.0.1:6335"
+
+[[raft.peers]]
+id = 3
+addr = "127.0.0.1:7336"
+grpc = "http://127.0.0.1:6336"
