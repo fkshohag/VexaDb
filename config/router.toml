@@ -1,0 +1,17 @@
+[server]
+listen = "0.0.0.0:6333"
+
+[cluster]
+node_id = "router-1"
+role = "router"
+shard_count = 2
+
+[[cluster.nodes]]
+id = "shard-0"
+grpc = "http://127.0.0.1:6334"
+shard_ids = [0]
+
+[[cluster.nodes]]
+id = "shard-1"
+grpc = "http://127.0.0.1:6335"
+shard_ids = [1]

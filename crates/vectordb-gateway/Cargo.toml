@@ -1,26 +1,24 @@
 [package]
-name = "vectordb-server"
-description = "VectorDB data/router node server"
+name = "vectordb-gateway"
+description = "HTTP/JSON REST gateway for VectorDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "vectordb-server"
+name = "vectordb-gateway"
 path = "src/main.rs"
 
 [dependencies]
-vectordb-core.workspace = true
-vectordb-storage.workspace = true
-vectordb-cluster.workspace = true
+vectordb-client.workspace = true
 vectordb-proto.workspace = true
-vectordb-router.workspace = true
 
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
-toml.workspace = true
-tonic.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

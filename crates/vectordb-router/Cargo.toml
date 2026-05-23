@@ -1,0 +1,20 @@
+[package]
+name = "vectordb-router"
+description = "Query router: fan-out to shards and merge results"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vectordb-cluster.workspace = true
+vectordb-proto.workspace = true
+vectordb-client.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true

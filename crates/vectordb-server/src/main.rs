@@ -6,6 +6,7 @@ use clap::Parser;
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 use vectordb_proto::VectorServiceServer;
+use vectordb_router::RouterService;
 
 use crate::config::{load_config, ServerConfig};
 use crate::service::VectorServiceImpl;
@@ -13,19 +14,15 @@ use crate::service::VectorServiceImpl;
 #[derive(Parser, Debug)]
 #[command(name = "vectordb-server", about = "Production vector database node")]
 struct Cli {
-    /// Path to TOML config file
     #[arg(short, long, env = "VECTORDB_CONFIG")]
     config: Option<std::path::PathBuf>,
 
-    /// gRPC listen address (overrides config)
     #[arg(long, env = "VECTORDB_LISTEN")]
     listen: Option<String>,
 
-    /// Data directory (overrides config)
     #[arg(long, env = "VECTORDB_DATA_DIR")]
     data_dir: Option<std::path::PathBuf>,
 
-    /// Node ID (overrides config)
     #[arg(long, env = "VECTORDB_NODE_ID")]
     node_id: Option<String>,
 }
@@ -54,15 +51,38 @@ async fn main() -> anyhow::Result<()> {
         cfg.cluster.node_id = node_id;
     }
 
+    let addr = cfg.server.listen.parse()?;
+    let cluster = cfg.cluster_config();
+
+    if cfg.is_router() {
+        tracing::info!(
+            node_id = %cfg.cluster.node_id,
+            listen = %cfg.server.listen,
+            shards = cfg.cluster.shard_count,
+            role = "router",
+            "starting VectorDB router"
+        );
+        let router = RouterService::new(
+            cfg.cluster.node_id.clone(),
+            &cluster,
+            cfg.cluster.shard_count,
+        );
+        Server::builder()
+            .add_service(VectorServiceServer::new(router))
+            .serve(addr)
+            .await?;
+        return Ok(());
+    }
+
     let svc = VectorServiceImpl::new(cfg.clone())
         .context("failed to initialize VectorDB engine")?;
 
-    let addr = cfg.server.listen.parse()?;
     tracing::info!(
         node_id = %cfg.cluster.node_id,
         listen = %cfg.server.listen,
         shards = cfg.cluster.shard_count,
-        "starting VectorDB server"
+        role = ?cfg.cluster.role,
+        "starting VectorDB data node"
     );
 
     Server::builder()

@@ -1,0 +1,12 @@
+[server]
+listen = "0.0.0.0:6334"
+
+[storage]
+data_dir = "./data/shard-0"
+sync_wal = true
+
+[cluster]
+node_id = "shard-0"
+role = "data"
+shard_count = 2
+shard_id = 0

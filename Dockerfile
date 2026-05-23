@@ -1,11 +1,12 @@
 FROM rust:1.87-bookworm AS builder
 WORKDIR /app
 COPY . .
-RUN cargo build --release -p vectordb-server
+RUN cargo build --release -p vectordb-server -p vectordb-gateway
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/vectordb-server /usr/local/bin/
+COPY --from=builder /app/target/release/vectordb-gateway /usr/local/bin/
 VOLUME ["/data"]
 EXPOSE 6334
 ENV VECTORDB_DATA_DIR=/data

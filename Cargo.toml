@@ -5,9 +5,11 @@ members = [
     "crates/vectordb-storage",
     "crates/vectordb-cluster",
     "crates/vectordb-proto",
+    "crates/vectordb-router",
     "crates/vectordb-server",
     "crates/vectordb-client",
     "crates/vectordb-cli",
+    "crates/vectordb-gateway",
 ]
 
 [workspace.package]
@@ -23,6 +25,7 @@ vectordb-storage = { path = "crates/vectordb-storage" }
 vectordb-cluster = { path = "crates/vectordb-cluster" }
 vectordb-proto = { path = "crates/vectordb-proto" }
 vectordb-client = { path = "crates/vectordb-client" }
+vectordb-router = { path = "crates/vectordb-router" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -50,6 +53,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 [profile.release]
 lto = "thin"

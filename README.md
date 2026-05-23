@@ -30,7 +30,9 @@ Production-oriented, horizontally scalable vector database written in Rust — i
 | `vectordb-storage` | WAL, mmap segments, collection engine |
 | `vectordb-cluster` | Consistent hash ring, shard router, membership |
 | `vectordb-proto` | Protobuf / gRPC definitions |
-| `vectordb-server` | Node binary |
+| `vectordb-router` | Query router (fan-out + merge) |
+| `vectordb-server` | Data or router node binary |
+| `vectordb-gateway` | HTTP/JSON REST gateway |
 | `vectordb-client` | Rust SDK |
 | `vectordb-cli` | Admin CLI |
 
@@ -49,10 +51,40 @@ cargo run -p vectordb-cli -- upsert embeddings doc-1 "0.1,0.2,0.3"
 cargo run -p vectordb-cli -- search embeddings "0.1,0.2,0.3" --top-k 5
 ```
 
-### Docker
+### Docker (2 shards + router + REST)
 
 ```bash
 docker compose up --build
+# gRPC router: localhost:6333
+# REST gateway: http://localhost:8080
+```
+
+### Cluster (router + 2 data nodes)
+
+```bash
+# Terminal 1–2: data shards
+cargo run -p vectordb-server -- --config config/node-0.toml
+cargo run -p vectordb-server -- --config config/node-1.toml
+
+# Terminal 3: router (single client endpoint)
+cargo run -p vectordb-server -- --config config/router.toml
+
+# Terminal 4: REST gateway → router
+VECTORDB_GRPC=http://127.0.0.1:6333 cargo run -p vectordb-gateway
+```
+
+```bash
+# REST example
+curl -s http://127.0.0.1:8080/health
+curl -s -X POST http://127.0.0.1:8080/v1/collections \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"docs","dimension":3}'
+curl -s -X POST http://127.0.0.1:8080/v1/collections/docs/upsert \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[{"id":"a","values":[1,0,0]}]}'
+curl -s -X POST http://127.0.0.1:8080/v1/collections/docs/search \
+  -H 'Content-Type: application/json' \
+  -d '{"vector":[1,0,0],"top_k":5}'
 ```
 
 ## Configuration
@@ -68,15 +100,15 @@ See [`config/example.toml`](config/example.toml). Or use flags / env:
 
 ## Horizontal scaling
 
-1. Run multiple `vectordb-server` instances with distinct `shard_id` and shared `shard_count`.
-2. Point clients at the node that owns a point's shard (consistent hash on point ID), or add a router layer (roadmap).
-3. Increase `virtual_nodes_per_shard` in cluster config for even distribution.
+1. Run data nodes with distinct `shard_id` and shared `shard_count` (`config/node-0.toml`, `node-1.toml`, …).
+2. Run a **router** (`role = "router"`) with `[[cluster.nodes]]` listing each shard's gRPC address (`config/router.toml`).
+3. Point clients at the router (`:6333`) or **gateway** (`:8080`).
 
-**Roadmap** (contributions welcome):
+**Roadmap**:
 
-- [ ] Query router / proxy with fan-out merge
+- [x] Query router with fan-out merge
+- [x] HTTP/JSON REST gateway
 - [ ] Raft replication (`openraft`) per shard
-- [ ] HTTP/JSON REST gateway
 - [ ] Metadata filtering (JSON payload indexes)
 - [ ] Quantization (PQ / scalar)
 

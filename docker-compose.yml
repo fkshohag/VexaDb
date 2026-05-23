@@ -1,32 +1,58 @@
 services:
-  vectordb-1:
+  shard-0:
     build: .
-    ports:
-      - "6334:6334"
-    environment:
-      VECTORDB_NODE_ID: node-1
-      RUST_LOG: info
-    volumes:
-      - vdb1:/data
-
-  vectordb-2:
-    build: .
-    ports:
-      - "6335:6334"
-    environment:
-      VECTORDB_NODE_ID: node-2
-      VECTORDB_LISTEN: 0.0.0.0:6334
     command:
       [
         "vectordb-server",
+        "--config",
+        "/etc/vectordb/node-0.toml",
         "--data-dir",
         "/data",
-        "--node-id",
-        "node-2",
       ]
     volumes:
-      - vdb2:/data
+      - ./config/node-0.toml:/etc/vectordb/node-0.toml:ro
+      - vdb0:/data
+    ports:
+      - "6334:6334"
+
+  shard-1:
+    build: .
+    command:
+      [
+        "vectordb-server",
+        "--config",
+        "/etc/vectordb/node-1.toml",
+        "--data-dir",
+        "/data",
+      ]
+    volumes:
+      - ./config/node-1.toml:/etc/vectordb/node-1.toml:ro
+      - vdb1:/data
+    ports:
+      - "6335:6335"
+
+  router:
+    build: .
+    command: ["vectordb-server", "--config", "/etc/vectordb/router.toml"]
+    volumes:
+      - ./config/router.toml:/etc/vectordb/router.toml:ro
+    ports:
+      - "6333:6333"
+    depends_on:
+      - shard-0
+      - shard-1
+
+  gateway:
+    build: .
+    command: ["vectordb-gateway"]
+    environment:
+      VECTORDB_GRPC: http://router:6333
+      VECTORDB_HTTP: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - router
 
 volumes:
+  vdb0:
   vdb1:
-  vdb2:

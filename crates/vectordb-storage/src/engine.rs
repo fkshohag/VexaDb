@@ -36,6 +36,12 @@ pub struct EngineConfig {
     pub sync_wal: bool,
 }
 
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self::new("./data")
+    }
+}
+
 impl EngineConfig {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
