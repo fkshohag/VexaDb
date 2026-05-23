@@ -112,6 +112,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to initialize VectorDB engine")?;
 
+    if cfg.snapshot.interval_secs > 0 {
+        spawn_snapshot_loop(svc.engine_handle(), cfg.snapshot.clone());
+    }
+
     tracing::info!(
         node_id = %cfg.cluster.node_id,
         listen = %cfg.server.listen,
@@ -119,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
         role = ?cfg.cluster.role,
         auth = cfg.auth.is_enabled(),
         raft = cfg.raft_enabled(),
+        snapshot_interval_secs = cfg.snapshot.interval_secs,
         "starting VectorDB data node"
     );
 
@@ -129,4 +134,54 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn spawn_snapshot_loop(
+    engine: std::sync::Arc<vectordb_storage::CollectionEngine>,
+    cfg: crate::config::SnapshotSection,
+) {
+    let interval = std::time::Duration::from_secs(cfg.interval_secs);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        // Skip the immediate fire on startup — we just replayed WAL.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let cfg = cfg.clone();
+            let engine = engine.clone();
+            // Snapshot is sync + heavy; run on blocking pool.
+            let result = tokio::task::spawn_blocking(move || {
+                // Skip if WAL is small — avoids churn on idle nodes.
+                let entry_count = engine
+                    .replay_wal_count()
+                    .unwrap_or(usize::MAX);
+                if entry_count < cfg.min_wal_entries {
+                    return Ok::<_, vectordb_storage::EngineError>(None);
+                }
+                if cfg.compact_wal {
+                    let (snap, stats) = engine.snapshot_and_compact_wal()?;
+                    Ok(Some((snap.id, Some(stats))))
+                } else {
+                    let snap = engine.snapshot_manager().create()?;
+                    Ok(Some((snap.id, None)))
+                }
+            })
+            .await;
+            match result {
+                Ok(Ok(Some((id, Some(stats))))) => tracing::info!(
+                    snapshot_id = %id,
+                    wal_before = stats.before,
+                    wal_after = stats.after,
+                    "auto-snapshot complete (WAL compacted)"
+                ),
+                Ok(Ok(Some((id, None)))) => tracing::info!(
+                    snapshot_id = %id,
+                    "auto-snapshot complete"
+                ),
+                Ok(Ok(None)) => tracing::debug!("auto-snapshot skipped (WAL below threshold)"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "auto-snapshot failed"),
+                Err(e) => tracing::warn!(error = %e, "auto-snapshot task panicked"),
+            }
+        }
+    });
 }

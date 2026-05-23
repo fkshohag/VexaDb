@@ -17,8 +17,8 @@ use vectordb_proto::vectordb::v1::{
     HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
     ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind,
-    ReindexCollectionRequest, ReindexCollectionResponse, SearchRequest, SearchResponse,
-    SnapshotInfo, UpsertRequest, UpsertResponse, VectorPoint,
+    ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest, ScrollResponse,
+    SearchRequest, SearchResponse, SnapshotInfo, UpsertRequest, UpsertResponse, VectorPoint,
 };
 use vectordb_replication::RaftNode;
 use vectordb_storage::{CollectionEngine, EngineError};
@@ -72,6 +72,12 @@ impl VectorServiceImpl {
 
     fn raft_ref(&self) -> Option<&RaftNode> {
         self.replicated.as_ref().map(|r| r.raft.as_ref())
+    }
+
+    /// Shared handle to the underlying engine — for background tasks
+    /// (auto-snapshot, rebalance, etc.).
+    pub fn engine_handle(&self) -> Arc<CollectionEngine> {
+        self.engine.clone()
     }
 
     fn owns_point(&self, point_id: &str) -> bool {
@@ -525,6 +531,33 @@ impl VectorService for VectorServiceImpl {
             .map_err(map_engine_err)?;
         Ok(Response::new(ReindexCollectionResponse {
             vectors_reindexed: n,
+        }))
+    }
+
+    async fn scroll(
+        &self,
+        request: Request<ScrollRequest>,
+    ) -> Result<Response<ScrollResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 { 256 } else { req.limit as usize };
+        let (rows, next_cursor) = self
+            .engine
+            .scroll(&req.collection, &req.cursor, limit)
+            .map_err(map_engine_err)?;
+        let points = rows
+            .into_iter()
+            .map(|(id, vector, payload)| VectorPoint {
+                id,
+                values: vector.values,
+                payload: payload
+                    .map(|v| serde_json::to_vec(&v).unwrap_or_default())
+                    .unwrap_or_default(),
+                sparse: None,
+            })
+            .collect();
+        Ok(Response::new(ScrollResponse {
+            points,
+            next_cursor,
         }))
     }
 }

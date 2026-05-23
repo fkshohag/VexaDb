@@ -91,7 +91,7 @@ impl CollectionEngine {
             .map_err(|e| EngineError::Rocks(e.to_string()))?;
 
         let wal_path = config.data_dir.join("wal.log");
-        let wal = WriteAheadLog::open(wal_path)?;
+        let wal = WriteAheadLog::open_with(wal_path, config.sync_wal)?;
 
         let engine = Self {
             config,
@@ -297,6 +297,11 @@ impl CollectionEngine {
         Ok(total)
     }
 
+    /// Number of WAL entries currently on disk (cheap probe for auto-snapshot loops).
+    pub fn replay_wal_count(&self) -> Result<usize> {
+        Ok(self.wal.read().replay()?.len())
+    }
+
     /// Rewrite WAL from current in-memory state (drops historical deletes/updates).
     pub fn compact_wal(&self) -> Result<WalCompactionStats> {
         self.ensure_all_collections_loaded()?;
@@ -421,6 +426,45 @@ impl CollectionEngine {
         let vector = state.index.get_vector(id);
         let payload = state.payloads.get(id).cloned();
         Ok(vector.map(|v| (v, payload)))
+    }
+
+    /// Paged enumeration of every point in a collection (used by rebalance).
+    /// `cursor` is opaque; pass an empty string to start. Returns up to `limit`
+    /// `(id, vector, payload)` triples plus a `next_cursor` (empty when done).
+    pub fn scroll(
+        &self,
+        collection: &str,
+        cursor: &str,
+        limit: usize,
+    ) -> Result<(Vec<(String, Vector, Option<Value>)>, String)> {
+        self.ensure_collection_loaded(collection)?;
+        let collections = self.collections.read();
+        let state = collections
+            .get(collection)
+            .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
+        let mut all = state.index.iter_points();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        let start = if cursor.is_empty() {
+            0
+        } else {
+            all.binary_search_by(|(id, _)| id.as_str().cmp(cursor))
+                .map(|i| i + 1)
+                .unwrap_or_else(|i| i)
+        };
+        let end = (start + limit.max(1)).min(all.len());
+        let chunk: Vec<(String, Vector, Option<Value>)> = all[start..end]
+            .iter()
+            .map(|(id, vec)| {
+                let payload = state.payloads.get(id).cloned();
+                (id.clone(), vec.clone(), payload)
+            })
+            .collect();
+        let next = if end < all.len() {
+            chunk.last().map(|(id, _, _)| id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok((chunk, next))
     }
 
     pub fn stats(&self, collection: &str) -> Result<CollectionStats> {
@@ -656,6 +700,45 @@ mod m4_tests {
         let stats = engine.compact_wal().unwrap();
         assert!(stats.before > stats.after);
         assert_eq!(engine.stats("docs").unwrap().vector_count, 1200);
+    }
+
+    #[test]
+    fn scroll_paginates_all_points() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config("scroll-c")).unwrap();
+
+        // Insert 100 points.
+        for i in 0..100 {
+            engine
+                .upsert(
+                    "scroll-c",
+                    format!("p{i:03}"),
+                    Vector::new(vec![i as f32, 0.0, 0.0, 0.0]),
+                    Some(format!(r#"{{"i":{i}}}"#).into_bytes()),
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Walk pages of 33 to exercise the pagination boundary.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = String::new();
+        let mut iterations = 0;
+        loop {
+            iterations += 1;
+            assert!(iterations < 20, "scroll did not terminate");
+            let (rows, next) = engine.scroll("scroll-c", &cursor, 33).unwrap();
+            for (id, _, payload) in &rows {
+                assert!(payload.is_some(), "payload should round-trip");
+                assert!(seen.insert(id.clone()), "duplicate id {id} returned");
+            }
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 100);
     }
 
     #[test]

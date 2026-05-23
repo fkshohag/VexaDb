@@ -2418,6 +2418,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "vectordb-client",
+ "vectordb-cluster",
  "vectordb-proto",
 ]
 

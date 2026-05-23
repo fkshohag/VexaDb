@@ -282,6 +282,27 @@ impl VectorDbClient {
         Ok(())
     }
 
+    /// Page through every point on this *one* node's local shard.
+    /// `cursor` is opaque; pass an empty string to start. The returned cursor
+    /// is empty when the iteration is complete.
+    pub async fn scroll(
+        &mut self,
+        collection: &str,
+        cursor: &str,
+        limit: u32,
+    ) -> anyhow::Result<(Vec<VectorPoint>, String)> {
+        let resp = self
+            .inner
+            .scroll(self.authed(vectordb_proto::vectordb::v1::ScrollRequest {
+                collection: collection.into(),
+                cursor: cursor.into(),
+                limit,
+            }))
+            .await?
+            .into_inner();
+        Ok((resp.points, resp.next_cursor))
+    }
+
     pub async fn bulk_upsert(
         &mut self,
         collection: &str,

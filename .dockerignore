@@ -35,3 +35,4 @@ admin/frontend/node_modules/
 admin/frontend/dist/
 admin/frontend/.vite/
 admin/backend/vectordb-admin
+/graphify-out/

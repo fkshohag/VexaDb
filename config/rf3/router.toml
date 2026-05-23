@@ -1,0 +1,42 @@
+# Router for the RF=3 cluster: 2 shards × 3 replicas.
+# Each shard exposes its current Raft leader as the routable endpoint.
+# The router talks to one replica per shard; client library follows leader
+# redirects automatically when writes land on a follower.
+
+[server]
+listen = "0.0.0.0:6333"
+
+[cluster]
+node_id = "router-rf3"
+role = "router"
+shard_count = 2
+
+[[cluster.nodes]]
+id = "shard-0-r1"
+grpc = "http://shard-0-r1:6334"
+shard_ids = [0]
+
+[[cluster.nodes]]
+id = "shard-0-r2"
+grpc = "http://shard-0-r2:6334"
+shard_ids = [0]
+
+[[cluster.nodes]]
+id = "shard-0-r3"
+grpc = "http://shard-0-r3:6334"
+shard_ids = [0]
+
+[[cluster.nodes]]
+id = "shard-1-r1"
+grpc = "http://shard-1-r1:6334"
+shard_ids = [1]
+
+[[cluster.nodes]]
+id = "shard-1-r2"
+grpc = "http://shard-1-r2:6334"
+shard_ids = [1]
+
+[[cluster.nodes]]
+id = "shard-1-r3"
+grpc = "http://shard-1-r3:6334"
+shard_ids = [1]

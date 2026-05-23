@@ -11,8 +11,8 @@ use vectordb_proto::vectordb::v1::{
     DescribeCollectionRequest, DescribeCollectionResponse, GetRequest, GetResponse, HealthRequest,
     HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
     ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse, ReindexCollectionRequest,
-    ReindexCollectionResponse, SearchRequest, SearchResponse, UpsertRequest, UpsertResponse,
-    VectorPoint,
+    ReindexCollectionResponse, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
+    UpsertRequest, UpsertResponse, VectorPoint,
 };
 
 use crate::pool::ClientPool;
@@ -233,13 +233,41 @@ impl VectorService for RouterService {
             })
             .collect();
 
+        // Fan out and tolerate per-shard failures: return whatever shards
+        // came back, log the rest. A single dead shard no longer black-holes
+        // the entire query.
         let results = join_all(futures).await;
+        let total = results.len();
         let mut all_hits = Vec::new();
+        let mut failures = 0usize;
+        let mut last_err: Option<String> = None;
         for res in results {
-            let hits = res.map_err(|e| Status::internal(e.to_string()))?;
-            for h in hits {
-                all_hits.push((h.id, h.score));
+            match res {
+                Ok(hits) => {
+                    for h in hits {
+                        all_hits.push((h.id, h.score));
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    last_err = Some(e.to_string());
+                    tracing::warn!(error = %e, "shard search failed (returning partial results)");
+                }
             }
+        }
+        if failures == total {
+            // All shards failed → there's no useful answer to return.
+            return Err(Status::internal(format!(
+                "all {total} shards failed; last error: {}",
+                last_err.unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        if failures > 0 {
+            tracing::warn!(
+                ok = total - failures,
+                failed = failures,
+                "search returned partial results"
+            );
         }
         let merged = merge_top_k(all_hits, top_k);
         Ok(Response::new(SearchResponse {
@@ -460,5 +488,18 @@ impl VectorService for RouterService {
         Ok(Response::new(ReindexCollectionResponse {
             vectors_reindexed: total,
         }))
+    }
+
+    async fn scroll(
+        &self,
+        _request: Request<ScrollRequest>,
+    ) -> Result<Response<ScrollResponse>, Status> {
+        // Scroll is a *per-shard* operation — call shards directly via the
+        // rebalance tooling, not through the router. Returning an error
+        // keeps the router from accidentally aggregating across shards
+        // and breaking cursor semantics.
+        Err(Status::failed_precondition(
+            "Scroll is per-shard; rebalance tools should connect to shard nodes directly",
+        ))
     }
 }

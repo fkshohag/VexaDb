@@ -22,6 +22,8 @@ service VectorService {
   rpc ImportStream(stream ImportChunk) returns (ImportStreamResponse);
   rpc CompactWal(CompactWalRequest) returns (CompactWalResponse);
   rpc ReindexCollection(ReindexCollectionRequest) returns (ReindexCollectionResponse);
+  // M5: rebalance / cluster admin.
+  rpc Scroll(ScrollRequest) returns (ScrollResponse);
 }
 
 enum DistanceMetric {
@@ -206,6 +208,21 @@ message ImportChunk {
 
 message ImportStreamResponse {
   uint64 upserted = 1;
+}
+
+// Scroll — paginate through every point on the *local* shard for a collection.
+// Used by rebalance / migration tools. Cursor is opaque; pass the value
+// returned in `next_cursor` to fetch the next page. Empty `next_cursor` means
+// the iteration is complete.
+message ScrollRequest {
+  string collection = 1;
+  string cursor = 2;
+  uint32 limit = 3;
+}
+
+message ScrollResponse {
+  repeated VectorPoint points = 1;
+  string next_cursor = 2;
 }
 
 message CompactWalRequest {

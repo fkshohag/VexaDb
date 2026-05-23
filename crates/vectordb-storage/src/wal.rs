@@ -59,13 +59,22 @@ pub struct BulkPoint {
 }
 
 /// Append-only write-ahead log for crash recovery.
+///
+/// `fsync_on_append=true` makes every committed write survive an uncontrolled
+/// OS / VM crash at the cost of throughput. With `fsync_on_append=false` we
+/// only flush to the kernel page cache; data can be lost on hard reboot.
 pub struct WriteAheadLog {
     path: PathBuf,
     writer: BufWriter<File>,
+    fsync_on_append: bool,
 }
 
 impl WriteAheadLog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    pub fn open_with(path: impl AsRef<Path>, fsync_on_append: bool) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -78,6 +87,7 @@ impl WriteAheadLog {
         Ok(Self {
             path,
             writer: BufWriter::new(file),
+            fsync_on_append,
         })
     }
 
@@ -87,7 +97,16 @@ impl WriteAheadLog {
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&bytes)?;
         self.writer.flush()?;
+        if self.fsync_on_append {
+            // sync_data() fsyncs file contents but skips metadata updates that
+            // don't affect durability — cheaper than sync_all() on most filesystems.
+            self.writer.get_ref().sync_data()?;
+        }
         Ok(())
+    }
+
+    pub fn fsync_on_append(&self) -> bool {
+        self.fsync_on_append
     }
 
     pub fn replay(&self) -> Result<Vec<WalEntry>> {
@@ -129,6 +148,9 @@ impl WriteAheadLog {
         for entry in entries {
             self.append(entry)?;
         }
+        // After a full rewrite, fsync regardless of mode — the truncate+rewrite
+        // would otherwise leave a torn file across a crash window.
+        self.writer.get_ref().sync_data()?;
         Ok(())
     }
 
@@ -136,5 +158,51 @@ impl WriteAheadLog {
         self.append(&WalEntry::Checkpoint {
             snapshot_id: snapshot_id.into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod fsync_tests {
+    use super::*;
+    use tempfile::tempdir;
+    use vectordb_core::Vector;
+
+    #[test]
+    fn append_with_fsync_is_replayable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut wal = WriteAheadLog::open_with(&path, true).unwrap();
+        assert!(wal.fsync_on_append());
+        for i in 0..5 {
+            wal.append(&WalEntry::Upsert {
+                collection: "c".into(),
+                id: format!("p{i}"),
+                vector: Vector::new(vec![i as f32]),
+                payload: None,
+                sparse: None,
+            })
+            .unwrap();
+        }
+        // Drop without explicit shutdown — durable writes survive.
+        drop(wal);
+        let reopened = WriteAheadLog::open_with(&path, true).unwrap();
+        let entries = reopened.replay().unwrap();
+        assert_eq!(entries.len(), 5);
+    }
+
+    #[test]
+    fn fsync_disabled_still_works() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut wal = WriteAheadLog::open_with(&path, false).unwrap();
+        assert!(!wal.fsync_on_append());
+        wal.append(&WalEntry::DeleteCollection { name: "x".into() })
+            .unwrap();
+        drop(wal);
+        let entries = WriteAheadLog::open_with(&path, false)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }

@@ -43,6 +43,25 @@ enum Commands {
         #[command(subcommand)]
         action: SnapshotAction,
     },
+    /// Re-shard a collection across the current cluster topology.
+    ///
+    /// For every point on every shard, recompute the target shard via the
+    /// consistent-hash ring and migrate orphaned points to their new owner.
+    /// Safe to run repeatedly — already-correct points are no-ops.
+    Rebalance {
+        collection: String,
+        /// Comma-separated list of shard gRPC endpoints, e.g.
+        /// `http://node-a:6334,http://node-b:6334`. Direct shard endpoints,
+        /// not the gateway.
+        #[arg(long, value_delimiter = ',')]
+        shards: Vec<String>,
+        /// Page size when scrolling each shard.
+        #[arg(long, default_value_t = 256)]
+        page: u32,
+        /// Plan only — print what would move without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -148,6 +167,14 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}  score={:.6}", hit.id, hit.score);
             }
         }
+        Commands::Rebalance {
+            collection,
+            shards,
+            page,
+            dry_run,
+        } => {
+            rebalance(&collection, &shards, page, dry_run).await?;
+        }
         Commands::Snapshots { action } => match action {
             SnapshotAction::Create => {
                 let snap = client.create_snapshot().await?;
@@ -172,4 +199,98 @@ fn parse_vector(s: &str) -> anyhow::Result<Vec<f32>> {
     s.split(',')
         .map(|p| p.trim().parse::<f32>().context("invalid float"))
         .collect()
+}
+
+/// Rebalance a single collection across `shards`. For each shard we scroll
+/// every local point, recompute its target shard via the same xxh64 hash
+/// the router uses, and if the target differs we upsert into the new owner
+/// and delete from the source. Idempotent — safe to retry on failure.
+async fn rebalance(
+    collection: &str,
+    shards: &[String],
+    page: u32,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use vectordb_cluster::shard_for_point;
+    if shards.len() < 2 {
+        anyhow::bail!("rebalance needs at least 2 shard endpoints");
+    }
+    let shard_count = shards.len() as u32;
+    let mut clients: Vec<VectorDbClient> = Vec::with_capacity(shards.len());
+    for ep in shards {
+        clients.push(
+            VectorDbClient::connect(ep.clone())
+                .await
+                .with_context(|| format!("connect shard {ep}"))?,
+        );
+    }
+
+    let mut total_moved = 0u64;
+    let mut total_kept = 0u64;
+    let mut total_failed = 0u64;
+    for (src_idx, ep) in shards.iter().enumerate() {
+        let mut cursor = String::new();
+        loop {
+            let (points, next) = clients[src_idx]
+                .scroll(collection, &cursor, page)
+                .await
+                .with_context(|| format!("scroll {ep}"))?;
+            if points.is_empty() && next.is_empty() {
+                break;
+            }
+            for p in points {
+                let target = shard_for_point(&p.id, shard_count);
+                if target as usize == src_idx {
+                    total_kept += 1;
+                    continue;
+                }
+                if dry_run {
+                    println!(
+                        "would move id={} shard={} -> shard={}",
+                        p.id, src_idx, target
+                    );
+                    total_moved += 1;
+                    continue;
+                }
+                let id = p.id.clone();
+                match clients[target as usize]
+                    .upsert(collection, vec![p])
+                    .await
+                {
+                    Ok(_) => {
+                        if let Err(e) = clients[src_idx]
+                            .delete(collection, vec![id.clone()])
+                            .await
+                        {
+                            // Upserted at target but couldn't delete source —
+                            // a re-run will reconcile. Don't lose data.
+                            eprintln!(
+                                "warning: id={id} upserted to shard {target} but delete on shard {src_idx} failed: {e}"
+                            );
+                            total_failed += 1;
+                        } else {
+                            total_moved += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: id={id} upsert to shard {target} failed: {e}");
+                        total_failed += 1;
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+    }
+
+    println!(
+        "rebalance done: moved={} kept={} failed={} (dry_run={})",
+        total_moved, total_kept, total_failed, dry_run
+    );
+    if total_failed > 0 {
+        anyhow::bail!("{total_failed} migrations failed; re-run to retry");
+    }
+    Ok(())
 }
