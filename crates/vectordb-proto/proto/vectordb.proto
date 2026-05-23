@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package vectordb.v1;
+
+// VectorDB — production-oriented vector database API (Pinecone-inspired).
+
+service VectorService {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+  rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse);
+  rpc ListCollections(ListCollectionsRequest) returns (ListCollectionsResponse);
+  rpc DescribeCollection(DescribeCollectionRequest) returns (DescribeCollectionResponse);
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+}
+
+enum DistanceMetric {
+  DISTANCE_METRIC_UNSPECIFIED = 0;
+  COSINE = 1;
+  EUCLIDEAN = 2;
+  DOT_PRODUCT = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  string node_id = 2;
+  uint32 shard_count = 3;
+}
+
+message CollectionSpec {
+  string name = 1;
+  uint32 dimension = 2;
+  DistanceMetric metric = 3;
+  uint32 m = 4;
+  uint32 ef_construction = 5;
+  uint32 ef_search = 6;
+}
+
+message CreateCollectionRequest {
+  CollectionSpec spec = 1;
+}
+
+message CreateCollectionResponse {}
+
+message DeleteCollectionRequest {
+  string name = 1;
+}
+
+message DeleteCollectionResponse {}
+
+message ListCollectionsRequest {}
+
+message ListCollectionsResponse {
+  repeated string names = 1;
+}
+
+message DescribeCollectionRequest {
+  string name = 1;
+}
+
+message DescribeCollectionResponse {
+  CollectionSpec spec = 1;
+  uint64 vector_count = 2;
+}
+
+message VectorPoint {
+  string id = 1;
+  repeated float values = 2;
+  bytes payload = 3;
+}
+
+message UpsertRequest {
+  string collection = 1;
+  repeated VectorPoint points = 2;
+}
+
+message UpsertResponse {
+  uint64 upserted = 1;
+}
+
+message SearchRequest {
+  string collection = 1;
+  repeated float query = 2;
+  uint32 top_k = 3;
+  repeated string filter_ids = 4;
+}
+
+message ScoredPoint {
+  string id = 1;
+  float score = 2;
+}
+
+message SearchResponse {
+  repeated ScoredPoint hits = 1;
+}
+
+message DeleteRequest {
+  string collection = 1;
+  repeated string ids = 2;
+}
+
+message DeleteResponse {
+  uint64 deleted = 1;
+}
+
+message GetRequest {
+  string collection = 1;
+  string id = 2;
+}
+
+message GetResponse {
+  VectorPoint point = 1;
+  bool found = 2;
+}

@@ -1,0 +1,17 @@
+[package]
+name = "vectordb-cli"
+description = "CLI for VectorDB administration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vectordb"
+path = "src/main.rs"
+
+[dependencies]
+vectordb-client.workspace = true
+vectordb-proto.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true

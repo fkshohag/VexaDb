@@ -1,0 +1,32 @@
+services:
+  vectordb-1:
+    build: .
+    ports:
+      - "6334:6334"
+    environment:
+      VECTORDB_NODE_ID: node-1
+      RUST_LOG: info
+    volumes:
+      - vdb1:/data
+
+  vectordb-2:
+    build: .
+    ports:
+      - "6335:6334"
+    environment:
+      VECTORDB_NODE_ID: node-2
+      VECTORDB_LISTEN: 0.0.0.0:6334
+    command:
+      [
+        "vectordb-server",
+        "--data-dir",
+        "/data",
+        "--node-id",
+        "node-2",
+      ]
+    volumes:
+      - vdb2:/data
+
+volumes:
+  vdb1:
+  vdb2:

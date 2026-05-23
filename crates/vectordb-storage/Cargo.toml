@@ -1,0 +1,23 @@
+[package]
+name = "vectordb-storage"
+description = "Durable storage engine with WAL and segments for VectorDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vectordb-core.workspace = true
+anyhow.workspace = true
+bincode.workspace = true
+memmap2.workspace = true
+parking_lot.workspace = true
+rocksdb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "sync"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

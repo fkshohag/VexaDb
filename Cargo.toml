@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vectordb-core",
+    "crates/vectordb-storage",
+    "crates/vectordb-cluster",
+    "crates/vectordb-proto",
+    "crates/vectordb-server",
+    "crates/vectordb-client",
+    "crates/vectordb-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/vectordb/vectordb"
+authors = ["VectorDB Contributors"]
+
+[workspace.dependencies]
+vectordb-core = { path = "crates/vectordb-core" }
+vectordb-storage = { path = "crates/vectordb-storage" }
+vectordb-cluster = { path = "crates/vectordb-cluster" }
+vectordb-proto = { path = "crates/vectordb-proto" }
+vectordb-client = { path = "crates/vectordb-client" }
+
+anyhow = "1"
+async-trait = "0.1"
+bincode = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
+futures = "0.3"
+hex = "0.4"
+memmap2 = "0.9"
+parking_lot = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+rand = "0.8"
+rocksdb = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tonic = "0.12"
+tonic-build = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
