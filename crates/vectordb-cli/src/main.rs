@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
                         id,
                         values,
                         payload: payload_bytes,
+                        sparse: None,
                     }],
                 )
                 .await?;

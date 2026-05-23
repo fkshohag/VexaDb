@@ -12,6 +12,7 @@ members = [
     "crates/vectordb-cli",
     "crates/vectordb-gateway",
     "crates/vectordb-auth",
+    "crates/vectordb-bench",
 ]
 
 [workspace.package]

@@ -154,9 +154,10 @@ pub fn load_config(path: &Path) -> anyhow::Result<ServerConfig> {
     let raw = fs::read_to_string(path)?;
     let mut cfg: ServerConfig = toml::from_str(&raw)?;
     // Default vector_endpoint on raft config from server listen.
+    let endpoint = cfg.vector_endpoint();
     if let Some(raft) = cfg.raft.as_mut() {
         if raft.vector_endpoint.is_none() {
-            raft.vector_endpoint = Some(cfg.vector_endpoint());
+            raft.vector_endpoint = Some(endpoint);
         }
     }
     Ok(cfg)

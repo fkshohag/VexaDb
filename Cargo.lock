@@ -1715,7 +1715,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -2163,8 +2165,10 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
@@ -2394,6 +2398,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vectordb-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rand 0.8.6",
+ "tempfile",
+ "vectordb-core",
+ "vectordb-storage",
+]
+
+[[package]]
 name = "vectordb-cli"
 version = "0.1.0"
 dependencies = [
@@ -2543,8 +2558,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "criterion",
  "memmap2",
  "parking_lot",
+ "rand 0.8.6",
  "rocksdb",
  "serde",
  "serde_json",

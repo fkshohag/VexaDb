@@ -416,8 +416,7 @@ fn points_from_body(points: Vec<PointBody>) -> Vec<VectorPoint> {
                 .map(|s| vectordb_proto::vectordb::v1::SparseVector {
                     indices: s.indices,
                     values: s.values,
-                })
-                .unwrap_or_default();
+                });
             VectorPoint {
                 id: p.id,
                 values: p.values,

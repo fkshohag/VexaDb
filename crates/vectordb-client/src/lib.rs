@@ -50,7 +50,8 @@ impl VectorDbClient {
         &self.endpoint
     }
 
-    fn authed<T>(&self, mut req: Request<T>) -> Request<T> {
+    fn authed<T>(&self, payload: T) -> Request<T> {
+        let mut req = Request::new(payload);
         if let Some(key) = &self.api_key {
             if let Ok(v) = MetadataValue::<Ascii>::try_from(key.as_str()) {
                 req.metadata_mut().insert(HEADER_API_KEY, v);
@@ -108,11 +109,14 @@ impl VectorDbClient {
 
     pub async fn delete_collection(&mut self, name: &str) -> anyhow::Result<()> {
         let name = name.to_string();
-        self.redirect_on_leader(|mut c| async move {
-            c.inner
-                .delete_collection(c.authed(DeleteCollectionRequest { name }))
-                .await?;
-            Ok(())
+        self.redirect_on_leader(|mut c| {
+            let name = name.clone();
+            async move {
+                c.inner
+                    .delete_collection(c.authed(DeleteCollectionRequest { name }))
+                    .await?;
+                Ok(())
+            }
         })
         .await
         .map_err(|s| anyhow::anyhow!("{s}"))
@@ -209,7 +213,7 @@ impl VectorDbClient {
                 top_k,
                 filter_ids,
                 filter_json,
-                sparse_query: sparse_query.unwrap_or_default(),
+                sparse_query,
                 text_query: text_query.unwrap_or_default(),
                 search_mode: search_mode.into(),
                 hybrid_alpha,
@@ -305,6 +309,11 @@ impl VectorDbClient {
         .map_err(|s| anyhow::anyhow!("{s}"))
     }
 
+    /// Stream-imports chunks to the connected node.
+    ///
+    /// Note: streaming RPCs are not transparently redirected to the leader
+    /// because the request stream can only be consumed once. Connect directly
+    /// to the leader endpoint when calling this.
     pub async fn import_stream(
         &mut self,
         chunks: Vec<ImportChunk>,
@@ -318,16 +327,12 @@ impl VectorDbClient {
             }
         });
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        self.redirect_on_leader(|mut c| async move {
-            let resp = c
-                .inner
-                .import_stream(c.authed(Request::new(stream)))
-                .await?
-                .into_inner();
-            Ok(resp.upserted)
-        })
-        .await
-        .map_err(|s| anyhow::anyhow!("{s}"))
+        let resp = self
+            .inner
+            .import_stream(self.authed(stream))
+            .await?
+            .into_inner();
+        Ok(resp.upserted)
     }
 
     pub async fn compact_wal(&mut self, snapshot_first: bool) -> anyhow::Result<CompactWalResponse> {
@@ -346,11 +351,14 @@ impl VectorDbClient {
         collection: &str,
     ) -> anyhow::Result<ReindexCollectionResponse> {
         let collection = collection.to_string();
-        self.redirect_on_leader(|mut c| async move {
-            Ok(c.inner
-                .reindex_collection(c.authed(ReindexCollectionRequest { collection }))
-                .await?
-                .into_inner())
+        self.redirect_on_leader(|mut c| {
+            let collection = collection.clone();
+            async move {
+                Ok(c.inner
+                    .reindex_collection(c.authed(ReindexCollectionRequest { collection }))
+                    .await?
+                    .into_inner())
+            }
         })
         .await
         .map_err(|s| anyhow::anyhow!("{s}"))
@@ -366,5 +374,8 @@ pub fn cosine_collection(name: &str, dimension: u32) -> CollectionSpec {
         ef_construction: 200,
         ef_search: 64,
         payload_indexes: Vec::new(),
+        sparse_enabled: false,
+        bm25_text_field: String::new(),
+        scalar_quantization: false,
     }
 }

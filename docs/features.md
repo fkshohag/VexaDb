@@ -78,7 +78,7 @@ roadmap section for the upcoming milestones (M2…M5).
 - [x] Distributed indexing
 - [x] Distributed query execution *(router fan-out + merge top-k)*
 - [ ] Auto scaling *(operator/control-plane track, [L])*
-- [~] High QPS support *(no benchmarks yet; will follow M3 SIMD)*
+- [x] High QPS support *(benchmark harness + `docs/benchmarks.md`)*
 - [~] Billion-scale vector support *(architecture supports it; needs M3 quant + segment paging)*
 
 ## Availability Features
@@ -114,7 +114,7 @@ roadmap section for the upcoming milestones (M2…M5).
 
 ## AI & RAG Features
 
-- [~] RAG optimization *(works as a vector store today; M5 will add helpers)*
+- [x] RAG optimization *(M5 — `RagPipeline` in Python/Node SDKs)*
 - [x] LLM retrieval support *(via REST/gRPC)*
 - [x] AI memory storage
 - [x] Conversational memory *(use a collection)*
@@ -155,10 +155,10 @@ roadmap section for the upcoming milestones (M2…M5).
 
 - [x] REST API
 - [x] gRPC API
-- [ ] Python SDK *(M5)*
-- [ ] Node.js SDK *(M5)*
-- [ ] Java SDK *(M5)*
-- [ ] Go SDK *(M5)*
+- [x] Python SDK *(M5)*
+- [x] Node.js SDK *(M5)*
+- [x] Java SDK *(M5+)*
+- [x] Go SDK *(M5+)*
 - [x] CLI tooling
 
 ## Monitoring & Observability
@@ -182,12 +182,12 @@ roadmap section for the upcoming milestones (M2…M5).
 
 ## Advanced Retrieval Features
 
-- [ ] Hybrid retrieval *(M3)*
-- [ ] Sparse + dense fusion *(M3)*
+- [x] Hybrid retrieval *(M3)*
+- [x] Sparse + dense fusion *(M3)*
 - [ ] Adaptive ANN tuning *(M3)*
-- [ ] Query expansion *(M5 RAG helpers)*
-- [ ] Semantic ranking *(M3)*
-- [ ] Exact re-ranking *(M3)*
+- [x] Query expansion *(M5 — `expand_query` / multi-query retrieve)*
+- [~] Semantic ranking *(server hybrid search; client overlap rerank in M5)*
+- [x] Exact re-ranking *(M5 — `rerank_by_overlap` post-retrieval)*
 - [~] Candidate pruning *(payload-index brute-force path landed in M1)*
 
 ## Operational Features
@@ -226,8 +226,17 @@ roadmap section for the upcoming milestones (M2…M5).
 | **M2** | Auth (API keys + TLS) · Prometheus metrics · leader discovery | **DONE** |
 | **M3** | Sparse vectors + hybrid search · quantization · SIMD | **DONE** |
 | **M4** | Bulk import · WAL compaction · online reindexing · replica mgmt | **DONE** *(replica mgmt deferred)* |
-| **M5** | Python / Node SDKs · RAG helpers | planned |
+| **M5** | Python / Node SDKs · RAG helpers | **DONE** |
 | **L** | Cloud control plane · multi-region · GPU · compliance | future track |
+
+## What landed in M5
+
+- **`sdks/python`** — `vectordb` package: `VectorDbClient` (REST) + `RagPipeline`, `chunk_text`, `expand_query`, `rerank_by_overlap`
+- **`sdks/nodejs`** — `@vectordb/client`: TypeScript client + matching RAG helpers (Node 18+ `fetch`)
+- **`sdks/go`** — `vectordb` module: REST client + `RagPipeline` (Go 1.22+)
+- **`sdks/java`** — `dev.vectordb:vectordb-client`: Maven library + RAG (Java 17+)
+- Pluggable **`embed(text)`** hook for OpenAI, sentence-transformers, or any model
+- Examples: `sdks/python/examples/rag_demo.py`, `sdks/nodejs/examples/rag-demo.mjs`, `sdks/go/examples/rag_demo`, `sdks/java` `RagDemo`
 
 ## What landed in M4
 

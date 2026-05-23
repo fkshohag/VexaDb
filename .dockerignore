@@ -1,0 +1,31 @@
+# macOS metadata (breaks Docker build on external volumes)
+._*
+**/._*
+.DS_Store
+**/.DS_Store
+
+# Build artifacts
+target/
+**/target/
+
+# VCS & IDE
+.git/
+.gitignore
+.cursor/
+.idea/
+.vscode/
+
+# Docs / knowledge graph (not needed in image)
+graphify-out/
+agent-transcripts/
+
+# SDK dev trees
+sdks/python/**/__pycache__/
+sdks/python/**/*.egg-info/
+sdks/nodejs/node_modules/
+sdks/nodejs/dist/
+sdks/java/target/
+
+# Local data
+data/
+**/snapshots/

@@ -3,7 +3,10 @@ use vectordb_auth::METADATA_LEADER;
 use vectordb_replication::RaftNode;
 
 /// Attach leader endpoint metadata to a `failed_precondition` status when known.
-pub fn map_raft_err(e: anyhow::Error, raft: Option<&RaftNode>) -> Status {
+///
+/// Accepts any displayable error so that callers passing `anyhow::Error`,
+/// `String`, or any other `Display` type can convert without extra adapters.
+pub fn map_raft_err<E: std::fmt::Display>(e: E, raft: Option<&RaftNode>) -> Status {
     let msg = e.to_string();
     if msg.contains("not leader") {
         let mut status = Status::failed_precondition(msg);

@@ -219,7 +219,7 @@ impl VectorService for RouterService {
                             per_shard_k,
                             filter_ids,
                             filter_json,
-                            Some(sparse_query),
+                            sparse_query,
                             if text_query.is_empty() {
                                 None
                             } else {
@@ -426,9 +426,10 @@ impl VectorService for RouterService {
     ) -> Result<Response<CompactWalResponse>, Status> {
         let snapshot_first = request.into_inner().snapshot_first;
         let mut clients = self.clients_for_all_shards().await?;
-        let (_, mut first) = clients
-            .remove(0)
-            .ok_or_else(|| Status::failed_precondition("no shards"))?;
+        if clients.is_empty() {
+            return Err(Status::failed_precondition("no shards"));
+        }
+        let (_, mut first) = clients.remove(0);
         let resp = first
             .compact_wal(snapshot_first)
             .await

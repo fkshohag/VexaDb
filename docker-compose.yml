@@ -1,14 +1,7 @@
 services:
   shard-0:
     build: .
-    command:
-      [
-        "vectordb-server",
-        "--config",
-        "/etc/vectordb/node-0.toml",
-        "--data-dir",
-        "/data",
-      ]
+    command: ["vectordb-server", "--config", "/etc/vectordb/node-0.toml"]
     volumes:
       - ./config/node-0.toml:/etc/vectordb/node-0.toml:ro
       - vdb0:/data
@@ -17,14 +10,7 @@ services:
 
   shard-1:
     build: .
-    command:
-      [
-        "vectordb-server",
-        "--config",
-        "/etc/vectordb/node-1.toml",
-        "--data-dir",
-        "/data",
-      ]
+    command: ["vectordb-server", "--config", "/etc/vectordb/node-1.toml"]
     volumes:
       - ./config/node-1.toml:/etc/vectordb/node-1.toml:ro
       - vdb1:/data

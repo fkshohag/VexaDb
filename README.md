@@ -18,6 +18,7 @@ Production-oriented, horizontally scalable vector database written in Rust — i
 - **Hybrid search (M3)**: sparse vectors, BM25, RRF/weighted fusion, scalar quantization, SIMD distances
 - **Bulk & ops (M4)**: bulk upsert, streaming import (gRPC), WAL compaction, online HNSW reindex
 - **Rust SDK** (`vectordb-client`) and **CLI** (`vectordb`)
+- **Language SDKs** (M5): Python, Node, Go, Java REST clients + RAG pipelines — see [`sdks/`](sdks/)
 
 ## Architecture
 
@@ -62,10 +63,15 @@ cargo run -p vectordb-cli -- search embeddings "0.1,0.2,0.3" --top-k 5
 ### Docker (2 shards + router + REST)
 
 ```bash
+# On macOS (especially external drives): strip AppleDouble files first
+./scripts/clean-macos-artifacts.sh
+
 docker compose up --build
 # gRPC router: localhost:6333
 # REST gateway: http://localhost:8080
 ```
+
+If build fails with `failed to xattr .../._Cargo.lock`, run the clean script above (or `find . -name '._*' -delete`) and rebuild. `.dockerignore` excludes these files from the build context.
 
 ### Cluster (router + 2 data nodes)
 
@@ -235,6 +241,35 @@ curl -s -X POST http://127.0.0.1:8080/v1/collections/embeddings/reindex
 
 gRPC: `BulkUpsert`, `ImportStream` (client streaming), `CompactWal`, `ReindexCollection`.
 
+### Language SDKs (M5)
+
+REST clients target the gateway (`:8080`). Each includes a **RAG pipeline** (chunk → embed → upsert → search).
+
+```bash
+# Python
+pip install -e sdks/python && python sdks/python/examples/rag_demo.py
+
+# Node
+cd sdks/nodejs && npm install && npm run build && node examples/rag-demo.mjs
+
+# Go
+cd sdks/go && go run ./examples/rag_demo
+
+# Java
+cd sdks/java && mvn -q exec:java -Dexec.mainClass=dev.vectordb.RagDemo
+```
+
+```python
+from vectordb import VectorDbClient, RagPipeline
+
+client = VectorDbClient("http://127.0.0.1:8080", api_key="...")
+rag = RagPipeline(client, "kb", dimension=1536, embed=my_embed_fn)
+rag.ingest([{"id": "1", "text": "Your document text..."}])
+print(rag.query("your question", top_k=5, rerank=True))
+```
+
+See [`sdks/README.md`](sdks/README.md) for full API coverage.
+
 ### Auth, metrics, and probes (M2)
 
 ```bash
@@ -268,14 +303,18 @@ curl -s -H 'x-api-key: dev-secret-key-change-me' http://127.0.0.1:8080/v1/collec
 - [x] Sparse vectors + hybrid (BM25 + RRF) search
 - [x] Scalar quantization + SIMD distance kernels
 - [x] Bulk import + WAL compaction + online reindex
-- [ ] Python / Node SDKs (M5)
+- [x] Python / Node SDKs + RAG helpers (M5)
 
 ## Development
 
 ```bash
 cargo test --workspace
+./scripts/benchmark.sh
 cargo bench -p vectordb-core
+cargo bench -p vectordb-storage
 ```
+
+See [`docs/benchmarks.md`](docs/benchmarks.md) for the full benchmark guide.
 
 ## License
 

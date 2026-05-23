@@ -1,0 +1,17 @@
+[package]
+name = "vectordb-bench"
+description = "VectorDB performance harness (human-readable report)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vectordb-bench"
+path = "src/main.rs"
+
+[dependencies]
+vectordb-core.workspace = true
+vectordb-storage.workspace = true
+clap.workspace = true
+rand.workspace = true
+tempfile = "3"

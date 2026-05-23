@@ -25,9 +25,13 @@ impl tonic::service::Interceptor for ApiKeyInterceptor {
         }
 
         if self.exempt_health {
-            let path = request.uri().path();
-            if path.ends_with("/Health") {
-                return Ok(request);
+            // tonic injects a `GrpcMethod` extension on requests entering the
+            // service (when registered via `Server::with_interceptor`). The
+            // legacy `.uri()` API isn't available on interceptor `Request<()>`.
+            if let Some(m) = request.extensions().get::<tonic::GrpcMethod<'_>>() {
+                if m.method() == "Health" {
+                    return Ok(request);
+                }
             }
         }
 

@@ -59,14 +59,14 @@ impl EngineConfig {
 }
 
 pub(crate) struct CollectionState {
-    config: CollectionConfig,
-    index: HnswIndex,
-    payloads: HashMap<PointId, Value>,
-    payload_indexes: PayloadIndexes,
-    sparse_index: Option<SparseInvertedIndex>,
-    bm25_index: Option<Bm25Index>,
-    quantizer: Option<ScalarQuantizer>,
-    quantized: HashMap<PointId, Vec<u8>>,
+    pub(crate) config: CollectionConfig,
+    pub(crate) index: HnswIndex,
+    pub(crate) payloads: HashMap<PointId, Value>,
+    pub(crate) payload_indexes: PayloadIndexes,
+    pub(crate) sparse_index: Option<SparseInvertedIndex>,
+    pub(crate) bm25_index: Option<Bm25Index>,
+    pub(crate) quantizer: Option<ScalarQuantizer>,
+    pub(crate) quantized: HashMap<PointId, Vec<u8>>,
 }
 
 /// Single-node collection engine: HNSW in memory + RocksDB metadata + WAL durability.
@@ -77,9 +77,9 @@ pub struct CollectionEngine {
     wal: RwLock<WriteAheadLog>,
 }
 
-const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
-const FILTER_OVERSEARCH_FACTOR: usize = 16;
-const FILTER_OVERSEARCH_CAP: usize = 1024;
+pub(crate) const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
+pub(crate) const FILTER_OVERSEARCH_FACTOR: usize = 16;
+pub(crate) const FILTER_OVERSEARCH_CAP: usize = 1024;
 
 impl CollectionEngine {
     pub fn open(config: EngineConfig) -> Result<Self> {

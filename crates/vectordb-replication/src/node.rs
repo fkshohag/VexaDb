@@ -49,6 +49,7 @@ impl Default for RaftConfig {
         Self {
             node_id: 1,
             listen: "0.0.0.0:7334".into(),
+            vector_endpoint: None,
             peers: vec![],
             election_timeout_ms: default_election_ms(),
             heartbeat_interval_ms: default_heartbeat_ms(),

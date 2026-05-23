@@ -253,7 +253,7 @@ impl VectorService for VectorServiceImpl {
                     .map_err(|e| Status::invalid_argument(format!("invalid filter: {e}")))?,
             )
         };
-        let sparse_query = proto_sparse_to_core(Some(req.sparse_query));
+        let sparse_query = proto_sparse_to_core(req.sparse_query);
         let text_query = if req.text_query.trim().is_empty() {
             None
         } else {
@@ -356,6 +356,7 @@ impl VectorService for VectorServiceImpl {
                         id: req.id,
                         values: vector.values,
                         payload: payload_bytes,
+                        sparse: None,
                     }),
                 }))
             }
@@ -489,9 +490,11 @@ impl VectorService for VectorServiceImpl {
         }
         let snapshot_first = request.into_inner().snapshot_first;
         let (snapshot, stats) = if snapshot_first {
-            self.engine
+            let (snap, stats) = self
+                .engine
                 .snapshot_and_compact_wal()
-                .map_err(map_engine_err)?
+                .map_err(map_engine_err)?;
+            (Some(snap), stats)
         } else {
             let stats = self.engine.compact_wal().map_err(map_engine_err)?;
             (None, stats)
