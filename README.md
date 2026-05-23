@@ -2,6 +2,10 @@
 
 Production-oriented, horizontally scalable vector database written in Rust — inspired by [Pinecone](https://www.pinecone.io/), designed for real workloads: embeddings search, RAG, recommendations, and similarity APIs.
 
+> **Documentation:** start at **[`docs/`](docs/)** — index, getting-started, full architecture diagrams, REST/gRPC reference, and operations guides.
+>
+> Quick links: [Architecture & diagrams](docs/architecture.md) · [REST API](docs/api/rest.md) · [Filter DSL](docs/api/filter-dsl.md) · [Configuration](docs/guides/configuration.md) · [Clustering & Raft](docs/guides/clustering.md) · [RAG guide](docs/guides/rag.md) · [SDKs](docs/guides/sdks.md) · [Benchmarks](docs/benchmarks.md)
+
 ## Features
 
 - **Approximate nearest neighbor (ANN)** via HNSW with configurable `M`, `ef_construction`, `ef_search`
@@ -22,15 +26,19 @@ Production-oriented, horizontally scalable vector database written in Rust — i
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    A[SDKs · curl] -- HTTP/JSON --> GW[vectordb-gateway :8080]
+    A2[Rust SDK / CLI] -- gRPC --> RT[router :6333]
+    GW -- gRPC --> RT
+    RT --> S0[shard 0 :6334]
+    RT --> S1[shard 1 :6335]
+    S0 --- F0[(Raft followers · optional)]
+    S0 -. Prometheus .-> P[(:9090 /metrics)]
 ```
-┌─────────────┐     gRPC      ┌──────────────────┐
-│   Client    │ ────────────► │  vectordb-server │
-│  (any lang) │               │  ┌────────────┐  │
-└─────────────┘               │  │ HNSW index │  │
-                              │  │ WAL + meta │  │
-                              │  │ Shard gate │  │
-                              └──────────────────┘
-```
+
+Full design diagrams (write/read paths, Raft replication, sharding, hybrid
+search) live in **[`docs/architecture.md`](docs/architecture.md)**.
 
 | Crate | Role |
 |-------|------|
@@ -71,7 +79,11 @@ docker compose up --build
 # REST gateway: http://localhost:8080
 ```
 
+Compose mounts `config/router-docker.toml`, which points shards at `http://shard-0:6334` and `http://shard-1:6335` (Docker DNS). Local bare-metal cluster dev uses `config/router.toml` with `127.0.0.1` instead.
+
 If build fails with `failed to xattr .../._Cargo.lock`, run the clean script above (or `find . -name '._*' -delete`) and rebuild. `.dockerignore` excludes these files from the build context.
+
+After `docker compose up`, run the REST examples below in order: **`/health` → create collection → upsert → search** (upsert requires the collection to exist).
 
 ### Cluster (router + 2 data nodes)
 

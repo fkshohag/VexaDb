@@ -19,9 +19,9 @@ services:
 
   router:
     build: .
-    command: ["vectordb-server", "--config", "/etc/vectordb/router.toml"]
+    command: ["vectordb-server", "--config", "/etc/vectordb/router-docker.toml"]
     volumes:
-      - ./config/router.toml:/etc/vectordb/router.toml:ro
+      - ./config/router-docker.toml:/etc/vectordb/router-docker.toml:ro
     ports:
       - "6333:6333"
     depends_on:
