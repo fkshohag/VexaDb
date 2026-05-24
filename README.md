@@ -68,22 +68,41 @@ cargo run -p vectordb-cli -- upsert embeddings doc-1 "0.1,0.2,0.3"
 cargo run -p vectordb-cli -- search embeddings "0.1,0.2,0.3" --top-k 5
 ```
 
-### Docker (2 shards + router + REST)
+### Docker — one command to rule them all
 
 ```bash
-# On macOS (especially external drives): strip AppleDouble files first
-./scripts/clean-macos-artifacts.sh
+# 1 shard, RF=1 (default — fast smoke / dev)
+make up
 
-docker compose up --build
-# gRPC router: localhost:6333
-# REST gateway: http://localhost:8080
+# 2 shards × 3 replicas = 6 data nodes (production-like)
+make up RF=3 SHARDS=2
+
+# Bump replication factor on an already-running cluster
+make scale-rf RF=5
+
+# Add capacity (router auto-rebalance moves ~1/N of points)
+make add-shard
+
+# Stop (volumes preserved) / nuke (drops data)
+make down
+make nuke
 ```
 
-Compose mounts `config/router-docker.toml`, which points shards at `http://shard-0:6334` and `http://shard-1:6335` (Docker DNS). Local bare-metal cluster dev uses `config/router.toml` with `127.0.0.1` instead.
+`docker-compose.yml` and every per-replica TOML under `config/cluster/` are
+**generated** by `scripts/cluster.py` from the persisted `.cluster.state.json`
+— never hand-edit them. New replicas auto-pull historical data via Raft
+`InstallSnapshot` (or Scroll bootstrap as a fallback).
 
-If build fails with `failed to xattr .../._Cargo.lock`, run the clean script above (or `find . -name '._*' -delete`) and rebuild. `.dockerignore` excludes these files from the build context.
+Endpoints once the cluster is up:
 
-After `docker compose up`, run the REST examples below in order: **`/health` → create collection → upsert → search** (upsert requires the collection to exist).
+- gRPC router: `localhost:6333`
+- REST gateway: `http://localhost:8080`
+- Admin UI: `http://localhost:8090`
+
+If a Docker build fails with `failed to xattr .../._Cargo.lock`, run
+`make clean-macos` and rebuild. `.dockerignore` already excludes these.
+
+After `make up`, run the REST examples below in order: **`/health` → create collection → upsert → search**.
 
 ### Cluster (router + 2 data nodes)
 

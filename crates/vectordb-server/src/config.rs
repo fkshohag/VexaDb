@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 use vectordb_auth::AuthConfig;
 use vectordb_cluster::{ClusterConfig, NodeRole, NodeState};
 use vectordb_replication::RaftConfig;
+use vectordb_router::{RebalanceConfig, TopologyConfig};
 use vectordb_storage::EngineConfig;
 
 use crate::tls::TlsConfig;
+
+pub use crate::replica_bootstrap::BootstrapConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -25,6 +28,16 @@ pub struct ServerConfig {
     pub metrics: Option<MetricsSection>,
     #[serde(default)]
     pub snapshot: SnapshotSection,
+    /// Auto-rebalance settings (router-only).
+    #[serde(default)]
+    pub rebalance: RebalanceConfig,
+    /// Dynamic topology / health probing (router-only).
+    #[serde(default)]
+    pub topology: TopologyConfig,
+    /// Replica bootstrap (data-node only). When enabled, an empty replica
+    /// will pull historical data from a sibling on first start. Default off.
+    #[serde(default)]
+    pub bootstrap: BootstrapConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +103,9 @@ pub struct ClusterSection {
     /// Remote data nodes (required for router role).
     #[serde(default)]
     pub nodes: Vec<RemoteNodeConfig>,
+    /// Router gRPC URL for data nodes to self-register (e.g. `http://router:6333`).
+    #[serde(default)]
+    pub router_grpc: Option<String>,
 }
 
 fn default_rf() -> u32 {
@@ -121,12 +137,16 @@ impl ServerConfig {
                 replication_factor: 1,
                 peers: vec![],
                 nodes: vec![],
+                router_grpc: None,
             },
             raft: None,
             auth: AuthConfig::default(),
             tls: None,
             metrics: None,
             snapshot: SnapshotSection::default(),
+            rebalance: RebalanceConfig::default(),
+            topology: TopologyConfig::default(),
+            bootstrap: BootstrapConfig::default(),
         }
     }
 

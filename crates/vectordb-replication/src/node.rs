@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use vectordb_proto::raft::v1::{
     raft_service_server::RaftServiceServer, AppendEntriesRequest, AppendEntriesResponse,
-    LogRecord, RequestVoteRequest, RequestVoteResponse,
+    InstallSnapshotChunk, InstallSnapshotResponse, LogRecord, RequestVoteRequest,
+    RequestVoteResponse,
 };
 use vectordb_storage::{CollectionEngine, WalEntry};
 
+use crate::install_snapshot::{
+    create_snapshot_dir, stream_snapshot_to_peer, SnapshotReceiveState, SnapshotReceiver,
+};
 use crate::rpc::RaftServiceImpl;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +92,7 @@ pub struct RaftNode {
     state: Arc<RwLock<RaftState>>,
     engine: Arc<CollectionEngine>,
     election_notify: Arc<Notify>,
+    snapshot_receiver: SnapshotReceiver,
 }
 
 impl RaftNode {
@@ -109,11 +114,15 @@ impl RaftNode {
 
         let election_notify = Arc::new(Notify::new());
 
+        let snapshot_receiver =
+            SnapshotReceiver::new(engine.data_dir().to_path_buf());
+
         let node = Arc::new(Self {
             config: config.clone(),
             state: state.clone(),
             engine,
             election_notify: election_notify.clone(),
+            snapshot_receiver,
         });
 
         let service = RaftServiceImpl::new(node.clone());
@@ -132,6 +141,10 @@ impl RaftNode {
         });
 
         Ok(node)
+    }
+
+    pub fn current_term(&self) -> u64 {
+        self.state.read().current_term
     }
 
     pub fn is_leader(&self) -> bool {
@@ -297,7 +310,113 @@ impl RaftNode {
             state: self.state.clone(),
             engine: self.engine.clone(),
             election_notify: self.election_notify.clone(),
+            snapshot_receiver: SnapshotReceiver::new(self.engine.data_dir().to_path_buf()),
         })
+    }
+
+    /// Follower: apply one InstallSnapshot chunk (streaming RPC).
+    pub fn handle_install_snapshot_chunk(
+        &self,
+        chunk: InstallSnapshotChunk,
+    ) -> Result<InstallSnapshotResponse, tonic::Status> {
+        let chunk_term = chunk.term;
+        let term_before = self.state.read().current_term;
+        if chunk.term < term_before {
+            return Ok(InstallSnapshotResponse {
+                term: term_before,
+                success: false,
+            });
+        }
+
+        match self
+            .snapshot_receiver
+            .apply_chunk(&self.engine, chunk)
+        {
+            Ok(Some(meta)) => {
+                self.on_snapshot_installed(meta);
+                let term = self.state.read().current_term;
+                Ok(InstallSnapshotResponse {
+                    term,
+                    success: true,
+                })
+            }
+            Ok(None) => {
+                let term = self.state.read().current_term.max(chunk_term);
+                Ok(InstallSnapshotResponse {
+                    term,
+                    success: true,
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn on_snapshot_installed(&self, meta: SnapshotReceiveState) {
+        let mut s = self.state.write();
+        if meta.term >= s.current_term {
+            s.current_term = meta.term;
+        }
+        s.role = Role::Follower;
+        s.leader_id = Some(meta.leader_id);
+        s.voted_for = Some(meta.leader_id);
+        // In-memory log is superseded by the snapshot payload; leader will
+        // stream any newer entries via AppendEntries with prev_log_index =
+        // last_included_index.
+        s.log.clear();
+        s.commit_index = meta.last_included_index as usize;
+        s.last_applied = meta.last_included_index as usize;
+        tracing::info!(
+            leader_id = meta.leader_id,
+            last_included_index = meta.last_included_index,
+            last_included_term = meta.last_included_term,
+            "InstallSnapshot applied"
+        );
+    }
+
+    /// Leader: push a filesystem snapshot to a lagging peer.
+    async fn install_snapshot_to_peer(
+        &self,
+        peer: &RaftPeer,
+        term: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> anyhow::Result<u64> {
+        let engine = self.engine.clone();
+        let snap_dir = tokio::task::spawn_blocking(move || create_snapshot_dir(engine))
+            .await??;
+
+        let stream = stream_snapshot_to_peer(
+            snap_dir,
+            term,
+            self.config.node_id,
+            last_included_index,
+            last_included_term,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let mut client = raft_client(&peer.addr).await?;
+        let resp = client
+            .install_snapshot(stream)
+            .await?
+            .into_inner();
+
+        if resp.term > term {
+            let mut s = self.state.write();
+            s.current_term = resp.term;
+            s.role = Role::Follower;
+            return Ok(0);
+        }
+        if !resp.success {
+            anyhow::bail!("follower rejected InstallSnapshot");
+        }
+
+        tracing::info!(
+            peer_id = peer.id,
+            last_included_index = last_included_index,
+            "InstallSnapshot succeeded"
+        );
+        Ok(last_included_index)
     }
 
     async fn apply_through(&self, commit: usize) -> anyhow::Result<()> {
@@ -508,6 +627,44 @@ impl RaftNode {
                     if replicated >= quorum && s.log[i - 1].term == s.current_term {
                         s.commit_index = i;
                         commit = i as u64;
+                    }
+                }
+            } else {
+                // Follower is too far behind (empty replica or log mismatch).
+                // Stream a filesystem snapshot instead of AppendEntries.
+                let (last_index, last_term) = {
+                    let s = self.state.read();
+                    (
+                        s.log.len() as u64,
+                        s.log.last().map(|e| e.term).unwrap_or(s.current_term),
+                    )
+                };
+                let should_snapshot = inner.match_index == 0 || next <= 1;
+                if should_snapshot {
+                    match self
+                        .install_snapshot_to_peer(
+                            &peer,
+                            term,
+                            last_index,
+                            last_term,
+                        )
+                        .await
+                    {
+                        Ok(idx) if idx > 0 => {
+                            let mut s = self.state.write();
+                            let idx_usize = idx as usize;
+                            s.match_index.insert(peer.id, idx_usize);
+                            s.next_index.insert(peer.id, idx_usize + 1);
+                            acks += 1;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                peer_id = peer.id,
+                                error = %e,
+                                "InstallSnapshot failed"
+                            );
+                        }
                     }
                 }
             }

@@ -1,3 +1,4 @@
+pub mod install_snapshot;
 mod node;
 mod rpc;
 

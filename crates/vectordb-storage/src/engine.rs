@@ -73,7 +73,8 @@ pub(crate) struct CollectionState {
 pub struct CollectionEngine {
     config: EngineConfig,
     collections: RwLock<HashMap<String, CollectionState>>,
-    meta_db: DB,
+    /// Wrapped so we can reopen RocksDB after a Raft InstallSnapshot.
+    meta_db: RwLock<DB>,
     wal: RwLock<WriteAheadLog>,
 }
 
@@ -96,7 +97,7 @@ impl CollectionEngine {
         let engine = Self {
             config,
             collections: RwLock::new(HashMap::new()),
-            meta_db,
+            meta_db: RwLock::new(meta_db),
             wal: RwLock::new(wal),
         };
 
@@ -113,16 +114,128 @@ impl CollectionEngine {
         SnapshotManager::new(&self.config.data_dir)
     }
 
+    /// Replace on-disk state from a snapshot payload directory (as produced by
+    /// `SnapshotManager::create`) and reload in-memory indexes. Used by Raft
+    /// `InstallSnapshot` on followers — much faster than replaying via Scroll.
+    pub fn restore_from_snapshot(&self, payload_root: &std::path::Path) -> Result<()> {
+        let meta_path = self.config.data_dir.join("meta");
+        let placeholder_path = self.config.data_dir.join(".meta_swap_placeholder");
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(true);
+
+        // Close RocksDB before replacing `meta/` on disk (required on macOS/Windows).
+        {
+            let mut guard = self.meta_db.write();
+            let tmp = DB::open(&db_opts, &placeholder_path)
+                .map_err(|e| EngineError::Rocks(e.to_string()))?;
+            let old = std::mem::replace(&mut *guard, tmp);
+            drop(old);
+        }
+
+        crate::snapshot::install_payload_into_data_dir(payload_root, &self.config.data_dir)?;
+
+        let new_db = DB::open(&db_opts, &meta_path).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        *self.meta_db.write() = new_db;
+        let _ = std::fs::remove_dir_all(&placeholder_path);
+
+        let wal_path = self.config.data_dir.join("wal.log");
+        *self.wal.write() =
+            WriteAheadLog::open_with(wal_path, self.config.sync_wal)?;
+
+        self.collections.write().clear();
+        self.replay_wal()?;
+        self.load_collections_from_meta()?;
+        Ok(())
+    }
+
     fn replay_wal(&self) -> Result<()> {
+        // WAL replay is the slowest part of cold start (rebuilds HNSW indexes
+        // for every Upsert). Emit progress so operators can see startup
+        // progress in `docker logs` instead of staring at a silent 100% CPU.
+        let wal_path = self.wal.read().path().to_path_buf();
+        let wal_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+
+        let started = std::time::Instant::now();
         let entries = self.wal.read().replay()?;
-        for entry in entries {
-            self.apply_entry(&entry)?;
+        let total = entries.len();
+        let read_elapsed = started.elapsed();
+        if total > 0 {
+            tracing::info!(
+                wal_path = %wal_path.display(),
+                wal_bytes = wal_bytes,
+                entries = total,
+                read_secs = read_elapsed.as_secs_f64(),
+                "WAL replay: starting apply"
+            );
+        }
+
+        let apply_started = std::time::Instant::now();
+        // Log progress at most every ~5s and every ~10% milestone, whichever
+        // comes first; cheap modulo + monotonic clock check.
+        let step = (total / 20).max(1).min(50_000);
+        let mut last_log = std::time::Instant::now();
+        // Tolerate poisoned entries: data-mutation entries (Upsert/Delete/
+        // BulkUpsert) referencing a collection that doesn't exist locally
+        // would otherwise crash the process forever in a restart loop.
+        // This happens when:
+        //   - a Raft follower gets an Upsert before/without the matching
+        //     CreateCollection (out-of-order delivery, pre-bootstrap),
+        //   - rebalance/migration sent points to a destination that never
+        //     received the schema,
+        //   - the meta DB was lost while the WAL survived.
+        // The data is unrecoverable without the schema anyway, so we log
+        // and skip — startup proceeds, and a follow-up snapshot/compaction
+        // drops the bad records permanently.
+        let mut skipped_unknown_collection: usize = 0;
+        let mut first_skipped: Option<String> = None;
+        for (i, entry) in entries.iter().enumerate() {
+            match self.apply_entry(entry) {
+                Ok(()) => {}
+                Err(EngineError::CollectionNotFound(name)) => {
+                    skipped_unknown_collection += 1;
+                    if first_skipped.is_none() {
+                        first_skipped = Some(name.clone());
+                    }
+                    if skipped_unknown_collection <= 3 || skipped_unknown_collection % 1000 == 0 {
+                        tracing::warn!(
+                            collection = %name,
+                            entry_index = i + 1,
+                            skipped_total = skipped_unknown_collection,
+                            "WAL replay: skipping entry for unknown collection (will be dropped on next compact_wal)"
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+            if total > 1000
+                && (i % step == 0 || last_log.elapsed() >= std::time::Duration::from_secs(5))
+            {
+                tracing::info!(
+                    applied = i + 1,
+                    total = total,
+                    pct = (i + 1) as f64 * 100.0 / total as f64,
+                    elapsed_secs = apply_started.elapsed().as_secs_f64(),
+                    skipped_unknown_collection = skipped_unknown_collection,
+                    "WAL replay progress"
+                );
+                last_log = std::time::Instant::now();
+            }
+        }
+        if total > 0 {
+            tracing::info!(
+                entries = total,
+                total_secs = started.elapsed().as_secs_f64(),
+                skipped_unknown_collection = skipped_unknown_collection,
+                first_skipped = first_skipped.as_deref(),
+                "WAL replay: complete"
+            );
         }
         Ok(())
     }
 
     fn load_collections_from_meta(&self) -> Result<()> {
-        let iter = self.meta_db.iterator(rocksdb::IteratorMode::Start);
+        let meta = self.meta_db.read();
+        let iter = meta.iterator(rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, value) = item.map_err(|e| EngineError::Rocks(e.to_string()))?;
             let key_str = String::from_utf8_lossy(&key);
@@ -141,6 +254,7 @@ impl CollectionEngine {
         let key = format!("collection:{}", config.name);
         if self
             .meta_db
+            .read()
             .get(&key)
             .map_err(|e| EngineError::Rocks(e.to_string()))?
             .is_some()
@@ -217,6 +331,7 @@ impl CollectionEngine {
         let key = format!("collection:{}", config.name);
         let json = serde_json::to_vec(&config).map_err(|e| EngineError::Rocks(e.to_string()))?;
         self.meta_db
+            .read()
             .put(key, json)
             .map_err(|e| EngineError::Rocks(e.to_string()))?;
         let name = config.name.clone();
@@ -227,6 +342,7 @@ impl CollectionEngine {
     fn apply_delete_collection(&self, name: &str) -> Result<()> {
         let key = format!("collection:{name}");
         self.meta_db
+            .read()
             .delete(key)
             .map_err(|e| EngineError::Rocks(e.to_string()))?;
         self.collections.write().remove(name);
@@ -482,7 +598,8 @@ impl CollectionEngine {
     }
 
     fn ensure_all_collections_loaded(&self) -> Result<()> {
-        let iter = self.meta_db.iterator(rocksdb::IteratorMode::Start);
+        let meta = self.meta_db.read();
+        let iter = meta.iterator(rocksdb::IteratorMode::Start);
         for item in iter {
             let (key, _) = item.map_err(|e| EngineError::Rocks(e.to_string()))?;
             let key_str = String::from_utf8_lossy(&key);
@@ -500,6 +617,7 @@ impl CollectionEngine {
         let key = format!("collection:{name}");
         let raw = self
             .meta_db
+            .read()
             .get(key)
             .map_err(|e| EngineError::Rocks(e.to_string()))?
             .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))?;

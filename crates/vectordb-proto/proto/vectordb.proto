@@ -24,6 +24,10 @@ service VectorService {
   rpc ReindexCollection(ReindexCollectionRequest) returns (ReindexCollectionResponse);
   // M5: rebalance / cluster admin.
   rpc Scroll(ScrollRequest) returns (ScrollResponse);
+  rpc Rebalance(RebalanceRequest) returns (RebalanceResponse);
+  rpc RebalanceStatus(RebalanceStatusRequest) returns (RebalanceStatusResponse);
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
 }
 
 enum DistanceMetric {
@@ -223,6 +227,80 @@ message ScrollRequest {
 message ScrollResponse {
   repeated VectorPoint points = 1;
   string next_cursor = 2;
+}
+
+// Trigger a single rebalance sweep. Only meaningful when sent to the
+// router — data nodes return FailedPrecondition. dry_run logs intended
+// migrations without writing.
+message RebalanceRequest {
+  bool dry_run = 1;
+}
+
+message RebalanceCollectionReport {
+  string collection = 1;
+  uint64 moved = 2;
+  uint64 kept = 3;
+  uint64 failed = 4;
+}
+
+message RebalanceResponse {
+  uint64 moved = 1;
+  uint64 kept = 2;
+  uint64 failed = 3;
+  uint64 duration_ms = 4;
+  repeated RebalanceCollectionReport per_collection = 5;
+}
+
+message RebalanceStatusRequest {}
+
+message RebalanceStatusResponse {
+  bool running = 1;
+  bool enabled = 2;
+  uint64 interval_secs = 3;
+  uint64 last_started_unix_ms = 4;
+  uint64 last_finished_unix_ms = 5;
+  uint64 last_duration_ms = 6;
+  uint64 last_moved = 7;
+  uint64 last_kept = 8;
+  uint64 last_failed = 9;
+  string last_error = 10;
+  uint64 total_moves = 11;
+  uint64 total_sweeps = 12;
+}
+
+// Data nodes call this on startup and periodically (heartbeat). The router
+// merges registrations with static config and runs health probes.
+message RegisterNodeRequest {
+  string node_id = 1;
+  string grpc = 2;
+  repeated uint32 shard_ids = 3;
+  uint32 shard_count = 4;
+}
+
+message RegisterNodeResponse {
+  bool accepted = 1;
+  uint32 shard_count = 2;
+}
+
+message ClusterStatusRequest {}
+
+message ClusterNodeStatus {
+  string id = 1;
+  string grpc = 2;
+  repeated uint32 shard_ids = 3;
+  bool healthy = 4;
+  bool ready = 5;
+  bool is_leader = 6;
+  string source = 7;
+  repeated uint32 primary_for_shards = 8;
+}
+
+message ClusterStatusResponse {
+  uint32 shard_count = 1;
+  uint64 replication_factor = 2;
+  repeated ClusterNodeStatus nodes = 3;
+  uint64 last_health_unix_ms = 4;
+  uint64 last_config_reload_unix_ms = 5;
 }
 
 message CompactWalRequest {

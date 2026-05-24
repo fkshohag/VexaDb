@@ -36,9 +36,7 @@ impl tonic::service::Interceptor for ApiKeyInterceptor {
         }
 
         let md = request.metadata();
-        let authorization = md
-            .get(HEADER_AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
+        let authorization = md.get(HEADER_AUTHORIZATION).and_then(|v| v.to_str().ok());
         let api_key = md.get(HEADER_API_KEY).and_then(|v| v.to_str().ok());
 
         self.auth

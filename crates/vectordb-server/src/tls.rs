@@ -23,5 +23,4 @@ impl TlsConfig {
         }
         Ok(cfg)
     }
-
 }

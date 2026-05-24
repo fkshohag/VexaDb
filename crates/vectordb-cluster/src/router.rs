@@ -8,6 +8,8 @@ pub type ShardId = u32;
 pub struct ShardRouter {
     ring: HashRing,
     shard_to_nodes: Vec<Vec<String>>,
+    /// All replica endpoints per shard (RF > 1).
+    shard_replicas: Vec<Vec<String>>,
     shard_endpoints: Vec<String>,
 }
 
@@ -35,13 +37,35 @@ impl ShardRouter {
             }
         }
 
-        let mut shard_endpoints = vec![String::new(); shard_count as usize];
-        for node in config.data_nodes() {
+        let mut shard_replicas = vec![Vec::new(); shard_count as usize];
+        for node in config.nodes.iter().filter(|n| {
+            matches!(n.role, crate::membership::NodeRole::Data | crate::membership::NodeRole::AllInOne)
+        }) {
             let endpoint = normalize_grpc_endpoint(&node.advertise_addr);
             for &shard in &node.shard_ids {
-                if (shard as usize) < shard_endpoints.len() {
-                    shard_endpoints[shard as usize] = endpoint.clone();
+                if (shard as usize) < shard_replicas.len() {
+                    shard_replicas[shard as usize].push(endpoint.clone());
                 }
+            }
+        }
+        // Nodes with empty shard_ids participate in every shard (RF replica set).
+        for node in config.nodes.iter().filter(|n| {
+            n.shard_ids.is_empty()
+                && matches!(
+                    n.role,
+                    crate::membership::NodeRole::Data | crate::membership::NodeRole::AllInOne
+                )
+        }) {
+            let endpoint = normalize_grpc_endpoint(&node.advertise_addr);
+            for replicas in shard_replicas.iter_mut() {
+                replicas.push(endpoint.clone());
+            }
+        }
+
+        let mut shard_endpoints = vec![String::new(); shard_count as usize];
+        for shard in 0..shard_count {
+            if let Some(ep) = shard_replicas[shard as usize].first() {
+                shard_endpoints[shard as usize] = ep.clone();
             }
         }
         for shard in 0..shard_count {
@@ -58,8 +82,25 @@ impl ShardRouter {
         Self {
             ring,
             shard_to_nodes,
+            shard_replicas,
             shard_endpoints,
         }
+    }
+
+    /// Replace the routable primary endpoint for a shard (after health probing).
+    pub fn set_shard_primary(&mut self, shard: ShardId, endpoint: impl Into<String>) {
+        let ep = endpoint.into();
+        if (shard as usize) < self.shard_endpoints.len() {
+            self.shard_endpoints[shard as usize] = ep;
+        }
+    }
+
+    /// All configured replica gRPC URLs for a shard.
+    pub fn replicas_for_shard(&self, shard: ShardId) -> &[String] {
+        self.shard_replicas
+            .get(shard as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Unique gRPC endpoints for all shards (one per shard primary).
