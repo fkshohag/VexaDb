@@ -19,8 +19,8 @@ services:
     depends_on:
       - admin
     environment:
-      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME=db.example.com}
-      ACME_EMAIL:      ${ACME_EMAIL:?set ACME_EMAIL=you@example.com}
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME=vexadb.shohag.dev}
+      ACME_EMAIL:      ${ACME_EMAIL:?set ACME_EMAIL=shohag.fks@gmmail.dev}
     ports:
       - "80:80"
       - "443:443"
