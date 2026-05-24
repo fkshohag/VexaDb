@@ -1,0 +1,34 @@
+# Optional overlay: put Caddy in front of the admin panel with auto Let's Encrypt.
+#
+#   PUBLIC_HOSTNAME=db.example.com ACME_EMAIL=you@example.com \
+#     docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+#
+# When this overlay is in use, the admin panel no longer publishes on the
+# host directly — only Caddy (80/443) is reachable from the outside.
+
+name: vectordb
+
+services:
+  admin:
+    ports: !reset []          # admin becomes loopback-only inside the network
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vectordb-caddy
+    restart: unless-stopped
+    depends_on:
+      - admin
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME=db.example.com}
+      ACME_EMAIL:      ${ACME_EMAIL:?set ACME_EMAIL=you@example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
