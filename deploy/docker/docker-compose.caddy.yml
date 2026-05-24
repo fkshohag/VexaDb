@@ -1,7 +1,7 @@
 # Optional overlay: put Caddy in front of the admin panel with auto Let's Encrypt.
 #
-#   PUBLIC_HOSTNAME=db.example.com ACME_EMAIL=you@example.com \
-#     docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+#   PUBLIC_HOSTNAME=vexadb.shohag.dev ACME_EMAIL=shohag.fks@gmmail.dev \
+#     docker compose -f docker-compose.yml -f docker compose.caddy.yml up -d
 #
 # When this overlay is in use, the admin panel no longer publishes on the
 # host directly — only Caddy (80/443) is reachable from the outside.

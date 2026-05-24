@@ -46,6 +46,8 @@ services:
   # HTTP/JSON gateway — INTERNAL ONLY. Not published to the host. The admin
   # panel reaches it over the docker network at http://gateway:8080.
   gateway:
+    build:
+      context: ../..       # same image as `server`; Compose builds it once
     image: vectordb:single-node
     container_name: vectordb-gateway
     restart: unless-stopped
