@@ -9,7 +9,7 @@ listen = "0.0.0.0:6333"
 node_id = "router"
 role = "router"
 shard_count = 5
-replication_factor = 2
+replication_factor = 3
 
 [[cluster.nodes]]
 id = "shard-0-r1"
@@ -19,6 +19,11 @@ shard_ids = [0]
 [[cluster.nodes]]
 id = "shard-0-r2"
 grpc = "http://shard-0-r2:6334"
+shard_ids = [0]
+
+[[cluster.nodes]]
+id = "shard-0-r3"
+grpc = "http://shard-0-r3:6334"
 shard_ids = [0]
 
 [[cluster.nodes]]
@@ -32,6 +37,11 @@ grpc = "http://shard-1-r2:6334"
 shard_ids = [1]
 
 [[cluster.nodes]]
+id = "shard-1-r3"
+grpc = "http://shard-1-r3:6334"
+shard_ids = [1]
+
+[[cluster.nodes]]
 id = "shard-2-r1"
 grpc = "http://shard-2-r1:6334"
 shard_ids = [2]
@@ -39,6 +49,11 @@ shard_ids = [2]
 [[cluster.nodes]]
 id = "shard-2-r2"
 grpc = "http://shard-2-r2:6334"
+shard_ids = [2]
+
+[[cluster.nodes]]
+id = "shard-2-r3"
+grpc = "http://shard-2-r3:6334"
 shard_ids = [2]
 
 [[cluster.nodes]]
@@ -52,6 +67,11 @@ grpc = "http://shard-3-r2:6334"
 shard_ids = [3]
 
 [[cluster.nodes]]
+id = "shard-3-r3"
+grpc = "http://shard-3-r3:6334"
+shard_ids = [3]
+
+[[cluster.nodes]]
 id = "shard-4-r1"
 grpc = "http://shard-4-r1:6334"
 shard_ids = [4]
@@ -59,6 +79,11 @@ shard_ids = [4]
 [[cluster.nodes]]
 id = "shard-4-r2"
 grpc = "http://shard-4-r2:6334"
+shard_ids = [4]
+
+[[cluster.nodes]]
+id = "shard-4-r3"
+grpc = "http://shard-4-r3:6334"
 shard_ids = [4]
 
 # Auto-rebalance: moves orphan points when shard_count changes

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::Response,
@@ -176,6 +176,12 @@ async fn main() -> anyhow::Result<()> {
         auth: Arc::new(auth),
     };
 
+    // axum's default body limit is 2MB which is too small for real bulk
+    // ingest at modern dimensions (768-dim vectors are ~6KB each in JSON,
+    // so even a few hundred points exceed 2MB). Lift the cap on write paths
+    // so /bulk and /upsert can accept fat batches; reads stay on the default.
+    const WRITE_BODY_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/live", get(live))
@@ -186,8 +192,14 @@ async fn main() -> anyhow::Result<()> {
             "/v1/collections/:name",
             get(describe_collection).delete(delete_collection),
         )
-        .route("/v1/collections/:name/upsert", post(upsert))
-        .route("/v1/collections/:name/bulk", post(bulk_upsert))
+        .route(
+            "/v1/collections/:name/upsert",
+            post(upsert).layer(DefaultBodyLimit::max(WRITE_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/collections/:name/bulk",
+            post(bulk_upsert).layer(DefaultBodyLimit::max(WRITE_BODY_LIMIT)),
+        )
         .route("/v1/collections/:name/reindex", post(reindex_collection))
         .route("/v1/collections/:name/search", post(search))
         .route("/v1/admin/compact-wal", post(compact_wal))

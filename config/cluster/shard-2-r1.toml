@@ -14,7 +14,7 @@ node_id = "shard-2-r1"
 role = "data"
 shard_count = 5
 shard_id = 2
-replication_factor = 2
+replication_factor = 3
 router_grpc = "http://router:6333"
 
 # Auto-snapshot every 5 minutes (compacts WAL, speeds future cold starts)
@@ -39,6 +39,11 @@ grpc = "http://shard-2-r1:6334"
 id = 202
 addr = "shard-2-r2:7334"
 grpc = "http://shard-2-r2:6334"
+
+[[raft.peers]]
+id = 203
+addr = "shard-2-r3:7334"
+grpc = "http://shard-2-r3:6334"
 
 # Replica bootstrap: empty replica pulls historical state via Scroll RPC.
 # Raft InstallSnapshot supersedes this once peers are up — both are safe.

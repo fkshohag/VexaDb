@@ -326,6 +326,9 @@ impl VectorService for RouterService {
         request: Request<UpsertRequest>,
     ) -> Result<Response<UpsertResponse>, Status> {
         let req = request.into_inner();
+        let collection = req.collection;
+
+        // Bucket points by destination endpoint via consistent-hash ring.
         let mut by_endpoint: HashMap<String, Vec<VectorPoint>> = HashMap::new();
         for point in req.points {
             let ep = self
@@ -337,19 +340,107 @@ impl VectorService for RouterService {
                 .to_string();
             by_endpoint.entry(ep).or_default().push(point);
         }
-        let mut upserted = 0u64;
-        for (ep, points) in by_endpoint {
-            let mut client = self
-                .pool
-                .get(&ep)
-                .await
-                .map_err(|e| Status::unavailable(e.to_string()))?;
-            upserted += client
-                .upsert(&req.collection, points)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        if by_endpoint.is_empty() {
+            return Ok(Response::new(UpsertResponse { upserted: 0 }));
         }
-        Ok(Response::new(UpsertResponse { upserted }))
+
+        // Fan out concurrently so a slow shard doesn't serialize the whole
+        // request, AND so a failure on shard N still attempts shards M, P
+        // (matches the search path's resilience model). Errors per shard are
+        // logged, then aggregated into a single status if any shard failed —
+        // the caller can retry the whole call (upsert is idempotent on point
+        // id) without worrying about which shards were already written.
+        let fan_out: Vec<_> = by_endpoint
+            .into_iter()
+            .map(|(ep, points)| {
+                let collection = collection.clone();
+                let pool = self.pool.clone();
+                let count = points.len();
+                async move {
+                    let mut client = match pool.get(&ep).await {
+                        Ok(c) => c,
+                        Err(e) => return (ep, count, Err(format!("connect: {e}"))),
+                    };
+                    // Retry on transient leader-election windows. A shard
+                    // that just lost its leader will return either
+                    // "not leader; current leader=None" (no redirect target)
+                    // or Unavailable while a new election runs. Elections
+                    // typically settle within ~1s on a healthy cluster, so
+                    // 4 attempts with 100/300/700ms backoff (≈1.1s) is
+                    // enough to mask the transient and still bail fast on
+                    // a real outage.
+                    let mut last: Option<String> = None;
+                    for (attempt, delay_ms) in [(1u32, 0u64), (2, 100), (3, 300), (4, 700)] {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                        match client.upsert(&collection, points.clone()).await {
+                            Ok(n) => return (ep, count, Ok(n)),
+                            Err(e) => {
+                                let msg = e.to_string();
+                                let transient = msg.contains("not leader")
+                                    || msg.contains("FailedPrecondition")
+                                    || msg.contains("Unavailable")
+                                    || msg.contains("failed to reach quorum");
+                                last = Some(msg);
+                                if !transient {
+                                    break;
+                                }
+                                tracing::debug!(
+                                    endpoint = %ep,
+                                    collection = %collection,
+                                    attempt,
+                                    error = %last.as_deref().unwrap_or(""),
+                                    "upsert transient error, will retry"
+                                );
+                            }
+                        }
+                    }
+                    (ep, count, Err(last.unwrap_or_else(|| "unknown".into())))
+                }
+            })
+            .collect();
+
+        let results = join_all(fan_out).await;
+        let mut upserted = 0u64;
+        let mut failures: Vec<String> = Vec::new();
+        let mut failed_shards = 0usize;
+        let total_shards = results.len();
+        for (ep, count, res) in results {
+            match res {
+                Ok(n) => upserted += n,
+                Err(msg) => {
+                    failed_shards += 1;
+                    tracing::warn!(
+                        endpoint = %ep,
+                        collection = %collection,
+                        points = count,
+                        error = %msg,
+                        "upsert failed on shard"
+                    );
+                    failures.push(format!("{ep}: {msg}"));
+                }
+            }
+        }
+
+        if failed_shards == 0 {
+            return Ok(Response::new(UpsertResponse { upserted }));
+        }
+        // Partial or total failure. Surface every failing shard's error so
+        // the caller doesn't have to grep router logs to figure out who
+        // rejected the write.
+        let summary = format!(
+            "upsert failed on {failed_shards}/{total_shards} shards (partial upserted={upserted}); errors: {}",
+            failures.join("; ")
+        );
+        tracing::error!(
+            collection = %collection,
+            failed_shards,
+            total_shards,
+            partial_upserted = upserted,
+            "upsert returning failure"
+        );
+        Err(Status::internal(summary))
     }
 
     async fn search(

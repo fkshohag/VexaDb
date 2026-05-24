@@ -207,6 +207,26 @@ class VectorDbClient:
         data = self._request("POST", f"/v1/collections/{collection}/reindex")
         return int(data["vectors_reindexed"])
 
+    def rebalance(self, *, dry_run: bool = False) -> dict[str, Any]:
+        """Trigger a manual rebalance sweep across shards.
+
+        Set ``dry_run=True`` to preview moves without actually migrating data.
+        Raises VectorDbError(409) if a sweep is already running.
+        """
+        return self._request(
+            "POST",
+            "/v1/admin/rebalance",
+            json={"dry_run": dry_run},
+        )
+
+    def rebalance_status(self) -> dict[str, Any]:
+        """Return rebalance coordinator state and last-sweep stats."""
+        return self._request("GET", "/v1/admin/rebalance")
+
+    def cluster_status(self) -> dict[str, Any]:
+        """Return cluster topology: shard_count, replication_factor, nodes."""
+        return self._request("GET", "/v1/admin/cluster")
+
     # --- snapshots ---
 
     def create_snapshot(self) -> dict[str, Any]:

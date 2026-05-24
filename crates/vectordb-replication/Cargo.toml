@@ -11,6 +11,8 @@ vectordb-storage.workspace = true
 
 anyhow.workspace = true
 bincode.workspace = true
+fastrand = "2"
+futures = "0.3"
 parking_lot.workspace = true
 serde.workspace = true
 thiserror.workspace = true

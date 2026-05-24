@@ -10,7 +10,7 @@ data_dir = "/data"
 sync_wal = true
 
 [cluster]
-node_id = "shard-1-r2"
+node_id = "shard-1-r3"
 role = "data"
 shard_count = 5
 shard_id = 1
@@ -24,9 +24,9 @@ compact_wal = true
 min_wal_entries = 100
 
 [raft]
-node_id = 102
+node_id = 103
 listen = "0.0.0.0:7334"
-vector_endpoint = "http://shard-1-r2:6334"
+vector_endpoint = "http://shard-1-r3:6334"
 election_timeout_ms = 750
 heartbeat_interval_ms = 150
 

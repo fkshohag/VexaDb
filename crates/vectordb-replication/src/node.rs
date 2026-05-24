@@ -444,19 +444,34 @@ impl RaftNode {
 
     async fn run_background(self: Arc<Self>) {
         loop {
-            let timeout = Duration::from_millis(self.config.election_timeout_ms);
+            if self.is_leader() {
+                // Leader path: heartbeat every `heartbeat_interval_ms`. We
+                // must NOT include the long election-timeout sleep here —
+                // doing so used to delay the first heartbeat by ~900-1500ms
+                // and made followers time out and start elections, causing
+                // constant leader churn.
+                let _ = self.send_heartbeats().await;
+                tokio::time::sleep(Duration::from_millis(self.config.heartbeat_interval_ms)).await;
+                continue;
+            }
+
+            // Follower / candidate path: wait for either a heartbeat
+            // (election_notify) or election timeout, whichever comes first.
+            // Randomized [base, 2*base) prevents the split-vote scenario
+            // where all replicas time out at the same instant after a
+            // leader death.
+            let base = self.config.election_timeout_ms.max(50);
+            let jitter = fastrand::u64(0..base);
+            let timeout = Duration::from_millis(base + jitter);
             tokio::select! {
                 _ = tokio::time::sleep(timeout) => {
                     if self.state.read().role != Role::Leader {
-                        let _ = self.start_election().await;
+                        if let Err(e) = self.start_election().await {
+                            tracing::warn!(error = %e, "election attempt failed");
+                        }
                     }
                 }
                 _ = self.election_notify.notified() => {}
-            }
-
-            if self.is_leader() {
-                let _ = self.send_heartbeats().await;
-                tokio::time::sleep(Duration::from_millis(self.config.heartbeat_interval_ms)).await;
             }
         }
     }
@@ -475,15 +490,34 @@ impl RaftNode {
 
         let mut votes = 1usize;
         let quorum = self.quorum();
+        tracing::info!(
+            node_id = self.config.node_id,
+            term,
+            quorum,
+            peers = self.config.peers.len(),
+            "starting election"
+        );
 
         for peer in &self.config.peers {
             if peer.id == self.config.node_id {
                 continue;
             }
-            let Ok(mut client) = raft_client(&peer.addr).await else {
-                continue;
+            // Bound dials so a slow/restarting peer can't burn the whole
+            // election window. Without this a single TCP-up but gRPC-down
+            // peer makes us hang for ~30s and miss the quorum entirely.
+            let mut client = match raft_client(&peer.addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        peer_id = peer.id,
+                        peer_addr = %peer.addr,
+                        error = %e,
+                        "RequestVote: connect failed"
+                    );
+                    continue;
+                }
             };
-            let Ok(resp) = client
+            let resp = match client
                 .request_vote(RequestVoteRequest {
                     term,
                     candidate_id: self.config.node_id,
@@ -491,8 +525,17 @@ impl RaftNode {
                     last_log_term: last_term,
                 })
                 .await
-            else {
-                continue;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        peer_id = peer.id,
+                        peer_addr = %peer.addr,
+                        error = %e,
+                        "RequestVote: rpc failed"
+                    );
+                    continue;
+                }
             };
             let resp = resp.into_inner();
 
@@ -500,6 +543,11 @@ impl RaftNode {
                 let mut s = self.state.write();
                 s.current_term = resp.term;
                 s.role = Role::Follower;
+                tracing::info!(
+                    node_id = self.config.node_id,
+                    new_term = resp.term,
+                    "election aborted: discovered higher term, stepping down to follower"
+                );
                 return Ok(());
             }
             if resp.vote_granted {
@@ -508,9 +556,23 @@ impl RaftNode {
         }
 
         if votes >= quorum {
+            tracing::info!(
+                node_id = self.config.node_id,
+                term,
+                votes,
+                quorum,
+                "election won, becoming leader"
+            );
             self.become_leader().await?;
         } else {
             self.state.write().role = Role::Follower;
+            tracing::warn!(
+                node_id = self.config.node_id,
+                term,
+                votes,
+                quorum,
+                "election lost (split vote or unreachable peers), reverting to follower"
+            );
         }
         Ok(())
     }
@@ -542,9 +604,8 @@ impl RaftNode {
             return Ok(());
         }
 
-        let mut acks = 1usize;
         let quorum = self.quorum();
-        let (term, leader_id, mut commit, log_len) = {
+        let (term, leader_id, commit_in, log_len) = {
             let s = self.state.read();
             (
                 s.current_term,
@@ -554,17 +615,27 @@ impl RaftNode {
             )
         };
 
-        for peer in self.config.peers.clone() {
-            if peer.id == self.config.node_id {
-                continue;
-            }
-            let next = {
-                let s = self.state.read();
-                *s.next_index.get(&peer.id).unwrap_or(&1)
-            };
-
-            let (prev_index, prev_term, entries) = {
-                let s = self.state.read();
+        // Snapshot per-peer state and entries OUTSIDE the parallel section,
+        // then fan out concurrently. Sequential per-peer dialing was the
+        // root cause of leader flapping: a single slow peer (3 retries x
+        // ~7s timeout) blocked heartbeats to all other peers for ~20s,
+        // way past the 750ms election timeout, so followers timed out and
+        // started elections, the leader stepped down, and the cycle repeated.
+        struct PeerCall {
+            peer: RaftPeer,
+            next: usize,
+            prev_index: u64,
+            prev_term: u64,
+            entries: Vec<LogRecord>,
+        }
+        let mut calls: Vec<PeerCall> = Vec::new();
+        {
+            let s = self.state.read();
+            for peer in self.config.peers.iter() {
+                if peer.id == self.config.node_id {
+                    continue;
+                }
+                let next = *s.next_index.get(&peer.id).unwrap_or(&1);
                 let prev_index = next.saturating_sub(1);
                 let prev_term = if prev_index == 0 {
                     0
@@ -581,97 +652,160 @@ impl RaftNode {
                         payload: bincode::serialize(&e.command).unwrap_or_default(),
                     })
                     .collect();
-                (prev_index as u64, prev_term, entries)
-            };
-
-            let Ok(mut client) = raft_client(&peer.addr).await else {
-                continue;
-            };
-
-            let Ok(resp) = client
-                .append_entries(AppendEntriesRequest {
-                    term,
-                    leader_id,
-                    prev_log_index: prev_index,
-                    prev_log_term: prev_term,
+                calls.push(PeerCall {
+                    peer: peer.clone(),
+                    next,
+                    prev_index: prev_index as u64,
+                    prev_term,
                     entries,
-                    leader_commit: commit,
-                })
-                .await
-            else {
-                continue;
-            };
-
-            let inner = resp.into_inner();
-            if inner.term > term {
-                let mut s = self.state.write();
-                s.current_term = inner.term;
-                s.role = Role::Follower;
-                return Ok(());
+                });
             }
-            if inner.success {
-                let mut s = self.state.write();
-                s.match_index.insert(peer.id, inner.match_index as usize);
-                if let Some(ni) = s.next_index.get_mut(&peer.id) {
-                    *ni = inner.match_index as usize + 1;
-                }
-                acks += 1;
+        }
 
-                for i in (s.commit_index + 1)..=log_len {
-                    let replicated = s
-                        .match_index
-                        .values()
-                        .filter(|&&m| m >= i)
-                        .count()
-                        + 1;
-                    if replicated >= quorum && s.log[i - 1].term == s.current_term {
-                        s.commit_index = i;
-                        commit = i as u64;
+        // Per-peer outcome we'll fold back into shared state afterwards.
+        enum PeerOutcome {
+            HigherTerm(u64),
+            Success { peer_id: u64, match_index: u64 },
+            NeedSnapshot { peer: RaftPeer, next: usize },
+            Failed,
+        }
+
+        let futures = calls.into_iter().map(|c| {
+            async move {
+                let entry_count = c.entries.len();
+                let mut client = match raft_client(&c.peer.addr).await {
+                    Ok(client) => client,
+                    Err(e) => {
+                        tracing::warn!(
+                            peer_id = c.peer.id,
+                            peer_addr = %c.peer.addr,
+                            error = %e,
+                            "AppendEntries: connect failed (peer counted as no-ack this round)"
+                        );
+                        return PeerOutcome::Failed;
+                    }
+                };
+                let resp = match client
+                    .append_entries(AppendEntriesRequest {
+                        term,
+                        leader_id,
+                        prev_log_index: c.prev_index,
+                        prev_log_term: c.prev_term,
+                        entries: c.entries,
+                        leader_commit: commit_in,
+                    })
+                    .await
+                {
+                    Ok(r) => r.into_inner(),
+                    Err(e) => {
+                        tracing::warn!(
+                            peer_id = c.peer.id,
+                            peer_addr = %c.peer.addr,
+                            entries = entry_count,
+                            error = %e,
+                            "AppendEntries: rpc failed (peer counted as no-ack this round)"
+                        );
+                        return PeerOutcome::Failed;
+                    }
+                };
+                if resp.term > term {
+                    return PeerOutcome::HigherTerm(resp.term);
+                }
+                if resp.success {
+                    PeerOutcome::Success {
+                        peer_id: c.peer.id,
+                        match_index: resp.match_index,
+                    }
+                } else if resp.match_index == 0 || c.next <= 1 {
+                    PeerOutcome::NeedSnapshot {
+                        peer: c.peer,
+                        next: c.next,
+                    }
+                } else {
+                    // Log mismatch but follower has some history; we'll
+                    // back off next_index naturally on the next round.
+                    PeerOutcome::Failed
+                }
+            }
+        });
+        let outcomes: Vec<PeerOutcome> = futures::future::join_all(futures).await;
+
+        // Fold results.
+        let mut acks = 1usize; // self
+        let mut snapshot_targets: Vec<(RaftPeer, usize)> = Vec::new();
+        for o in outcomes {
+            match o {
+                PeerOutcome::HigherTerm(t) => {
+                    let mut s = self.state.write();
+                    s.current_term = t;
+                    s.role = Role::Follower;
+                    return Ok(());
+                }
+                PeerOutcome::Success { peer_id, match_index } => {
+                    let mut s = self.state.write();
+                    s.match_index.insert(peer_id, match_index as usize);
+                    if let Some(ni) = s.next_index.get_mut(&peer_id) {
+                        *ni = match_index as usize + 1;
+                    }
+                    acks += 1;
+                }
+                PeerOutcome::NeedSnapshot { peer, next } => {
+                    snapshot_targets.push((peer, next));
+                }
+                PeerOutcome::Failed => {}
+            }
+        }
+
+        // Stream snapshots to the laggers in parallel too. These are
+        // expensive (full disk scan) so they shouldn't run on every
+        // heartbeat — but when they do, parallelizing is still correct.
+        if !snapshot_targets.is_empty() {
+            let (last_index, last_term) = {
+                let s = self.state.read();
+                (
+                    s.log.len() as u64,
+                    s.log.last().map(|e| e.term).unwrap_or(s.current_term),
+                )
+            };
+            let snap_futs = snapshot_targets.into_iter().map(|(peer, _next)| async move {
+                match self
+                    .install_snapshot_to_peer(&peer, term, last_index, last_term)
+                    .await
+                {
+                    Ok(idx) if idx > 0 => Some((peer.id, idx as usize)),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            peer_id = peer.id,
+                            error = %e,
+                            "InstallSnapshot failed"
+                        );
+                        None
                     }
                 }
-            } else {
-                // Follower is too far behind (empty replica or log mismatch).
-                // Stream a filesystem snapshot instead of AppendEntries.
-                let (last_index, last_term) = {
-                    let s = self.state.read();
-                    (
-                        s.log.len() as u64,
-                        s.log.last().map(|e| e.term).unwrap_or(s.current_term),
-                    )
-                };
-                let should_snapshot = inner.match_index == 0 || next <= 1;
-                if should_snapshot {
-                    match self
-                        .install_snapshot_to_peer(
-                            &peer,
-                            term,
-                            last_index,
-                            last_term,
-                        )
-                        .await
-                    {
-                        Ok(idx) if idx > 0 => {
-                            let mut s = self.state.write();
-                            let idx_usize = idx as usize;
-                            s.match_index.insert(peer.id, idx_usize);
-                            s.next_index.insert(peer.id, idx_usize + 1);
-                            acks += 1;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                peer_id = peer.id,
-                                error = %e,
-                                "InstallSnapshot failed"
-                            );
-                        }
-                    }
+            });
+            for snap_res in futures::future::join_all(snap_futs).await {
+                if let Some((pid, idx)) = snap_res {
+                    let mut s = self.state.write();
+                    s.match_index.insert(pid, idx);
+                    s.next_index.insert(pid, idx + 1);
+                    acks += 1;
                 }
             }
         }
 
-        let commit_usize = self.state.read().commit_index;
-        self.apply_through(commit_usize).await?;
+        // Advance commit_index based on updated match_index values.
+        let new_commit = {
+            let mut s = self.state.write();
+            for i in (s.commit_index + 1)..=log_len {
+                let replicated = s.match_index.values().filter(|&&m| m >= i).count() + 1;
+                if replicated >= quorum && s.log[i - 1].term == s.current_term {
+                    s.commit_index = i;
+                }
+            }
+            s.commit_index
+        };
+        self.apply_through(new_commit).await?;
 
         if acks >= quorum {
             Ok(())
@@ -694,5 +828,11 @@ async fn raft_client(
     } else {
         format!("http://{addr}")
     };
-    Ok(vectordb_proto::RaftServiceClient::connect(url).await?)
+    // Bound the dial: without this, a peer that's restarting (TCP socket up,
+    // gRPC server not yet listening) makes the leader hang for ~30s per
+    // heartbeat and stall every write through that shard.
+    let endpoint = tonic::transport::Endpoint::new(url)?
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5));
+    Ok(vectordb_proto::RaftServiceClient::new(endpoint.connect().await?))
 }
