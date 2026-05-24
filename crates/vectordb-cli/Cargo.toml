@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 vectordb-client.workspace = true
+vectordb-cluster.workspace = true
 vectordb-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true

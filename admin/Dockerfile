@@ -24,10 +24,12 @@ RUN npm run build
 ############################
 # Stage 2 — backend (Go)
 ############################
-FROM golang:1.22-bookworm AS backend
+FROM golang:1.24-bookworm AS backend
 WORKDIR /src/admin/backend
 
-COPY admin/backend/go.mod ./
+# Bring in go.sum if present so `go mod download` is reproducible. Both files
+# describe pure-Go deps (Echo, ledongthuc/pdf, etc.) — no CGO required.
+COPY admin/backend/go.mod admin/backend/go.sum* ./
 RUN go mod download
 
 COPY admin/backend/ ./

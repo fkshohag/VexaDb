@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::Response,
@@ -176,6 +176,12 @@ async fn main() -> anyhow::Result<()> {
         auth: Arc::new(auth),
     };
 
+    // axum's default body limit is 2MB which is too small for real bulk
+    // ingest at modern dimensions (768-dim vectors are ~6KB each in JSON,
+    // so even a few hundred points exceed 2MB). Lift the cap on write paths
+    // so /bulk and /upsert can accept fat batches; reads stay on the default.
+    const WRITE_BODY_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/live", get(live))
@@ -186,11 +192,19 @@ async fn main() -> anyhow::Result<()> {
             "/v1/collections/:name",
             get(describe_collection).delete(delete_collection),
         )
-        .route("/v1/collections/:name/upsert", post(upsert))
-        .route("/v1/collections/:name/bulk", post(bulk_upsert))
+        .route(
+            "/v1/collections/:name/upsert",
+            post(upsert).layer(DefaultBodyLimit::max(WRITE_BODY_LIMIT)),
+        )
+        .route(
+            "/v1/collections/:name/bulk",
+            post(bulk_upsert).layer(DefaultBodyLimit::max(WRITE_BODY_LIMIT)),
+        )
         .route("/v1/collections/:name/reindex", post(reindex_collection))
         .route("/v1/collections/:name/search", post(search))
         .route("/v1/admin/compact-wal", post(compact_wal))
+        .route("/v1/admin/rebalance", post(trigger_rebalance).get(rebalance_status))
+        .route("/v1/admin/cluster", get(cluster_status))
         .route("/v1/collections/:name/points", delete(delete_points))
         .route("/v1/collections/:name/points/:id", get(get_point))
         .route("/v1/snapshots", get(list_snapshots).post(create_snapshot))
@@ -457,6 +471,92 @@ async fn reindex_collection(
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(Json(serde_json::json!({
         "vectors_reindexed": resp.vectors_reindexed,
+    })))
+}
+
+#[derive(Deserialize, Default)]
+struct RebalanceBody {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn trigger_rebalance(
+    State(state): State<AppState>,
+    body: Option<Json<RebalanceBody>>,
+) -> Result<Json<Value>, StatusCode> {
+    let dry_run = body.map(|b| b.0.dry_run).unwrap_or(false);
+    let mut client = state.client.lock().await;
+    let resp = client.rebalance(dry_run).await.map_err(|e| {
+        // 409 when a sweep is already running, so callers can retry.
+        let msg = e.to_string();
+        if msg.contains("already in progress") {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    })?;
+    Ok(Json(serde_json::json!({
+        "moved": resp.moved,
+        "kept": resp.kept,
+        "failed": resp.failed,
+        "duration_ms": resp.duration_ms,
+        "per_collection": resp.per_collection.into_iter().map(|c| serde_json::json!({
+            "collection": c.collection,
+            "moved": c.moved,
+            "kept": c.kept,
+            "failed": c.failed,
+        })).collect::<Vec<_>>(),
+        "dry_run": dry_run,
+    })))
+}
+
+async fn rebalance_status(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let s = client
+        .rebalance_status()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(serde_json::json!({
+        "running": s.running,
+        "enabled": s.enabled,
+        "interval_secs": s.interval_secs,
+        "last_started_unix_ms": s.last_started_unix_ms,
+        "last_finished_unix_ms": s.last_finished_unix_ms,
+        "last_duration_ms": s.last_duration_ms,
+        "last_moved": s.last_moved,
+        "last_kept": s.last_kept,
+        "last_failed": s.last_failed,
+        "last_error": s.last_error,
+        "total_moves": s.total_moves,
+        "total_sweeps": s.total_sweeps,
+    })))
+}
+
+async fn cluster_status(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let s = client
+        .cluster_status()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(serde_json::json!({
+        "shard_count": s.shard_count,
+        "replication_factor": s.replication_factor,
+        "last_health_unix_ms": s.last_health_unix_ms,
+        "last_config_reload_unix_ms": s.last_config_reload_unix_ms,
+        "nodes": s.nodes.into_iter().map(|n| serde_json::json!({
+            "id": n.id,
+            "grpc": n.grpc,
+            "shard_ids": n.shard_ids,
+            "healthy": n.healthy,
+            "ready": n.ready,
+            "is_leader": n.is_leader,
+            "source": n.source,
+            "primary_for_shards": n.primary_for_shards,
+        })).collect::<Vec<_>>(),
     })))
 }
 

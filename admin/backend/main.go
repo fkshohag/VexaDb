@@ -77,6 +77,11 @@ func main() {
 	// Proxy to a local embedding server (LM Studio, Ollama, OpenAI) — avoids browser CORS.
 	e.POST("/embed", handleEmbed)
 
+	// PDF → text + chunks. Body limit matches the handler's hard cap so large
+	// files fail fast at the middleware boundary instead of partway through.
+	e.POST("/pdf/extract", handlePdfExtract,
+		middleware.BodyLimit(fmt.Sprintf("%dM", maxPdfBytes/(1024*1024))))
+
 	// Tiny config endpoint the frontend reads on boot.
 	embedURL := env("EMBED_DEFAULT_URL", "")
 	embedModel := env("EMBED_DEFAULT_MODEL", "text-embedding-nomic-embed-text-v1.5")

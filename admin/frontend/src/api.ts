@@ -69,6 +69,21 @@ export interface SnapshotInfo {
   size_bytes?: number;
 }
 
+export interface PdfChunk {
+  idx: number;
+  text: string;
+  page: number;
+  char_start: number;
+  char_end: number;
+}
+
+export interface PdfExtractResult {
+  filename: string;
+  pages: number;
+  chars: number;
+  chunks: PdfChunk[];
+}
+
 export const api = {
   config: () => fetch("/config.json").then((r) => r.json() as Promise<ServerConfig>),
 
@@ -129,6 +144,35 @@ export const api = {
     http<SnapshotInfo>("POST", "/v1/snapshots", {}, apiKey),
   deleteSnapshot: (id: string, apiKey?: string) =>
     http<void>("DELETE", `/v1/snapshots/${encodeURIComponent(id)}`, undefined, apiKey),
+
+  /**
+   * Upload a PDF to the admin backend (`/pdf/extract`) which parses it server-
+   * side, splits the text into chunks, and returns them. The frontend then
+   * embeds + upserts each chunk — keeping all DB-side code unchanged.
+   */
+  extractPdf: async (
+    file: File,
+    chunkSize: number,
+    chunkOverlap: number
+  ): Promise<PdfExtractResult> => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("chunk_size", String(chunkSize));
+    fd.append("chunk_overlap", String(chunkOverlap));
+    const res = await fetch("/pdf/extract", { method: "POST", body: fd });
+    const body = await res.text();
+    if (!res.ok) {
+      let msg = body;
+      try {
+        const j = JSON.parse(body) as { error?: string };
+        if (j.error) msg = j.error;
+      } catch {
+        /* not JSON */
+      }
+      throw new Error(msg || `extract failed: HTTP ${res.status}`);
+    }
+    return JSON.parse(body) as PdfExtractResult;
+  },
 };
 
 /**

@@ -6,10 +6,11 @@ import { CollectionList } from "./components/CollectionList";
 import { CollectionDetail } from "./components/CollectionDetail";
 import { SearchPanel } from "./components/SearchPanel";
 import { UpsertPanel } from "./components/UpsertPanel";
+import { PdfUploadPanel } from "./components/PdfUploadPanel";
 import { AdminPanel } from "./components/AdminPanel";
 import { CreateCollectionDialog } from "./components/CreateCollectionDialog";
 
-type Tab = "overview" | "search" | "upsert" | "admin";
+type Tab = "overview" | "search" | "upsert" | "pdf" | "admin";
 
 interface Toast {
   level: "error" | "success";
@@ -142,13 +143,13 @@ export default function App() {
             </div>
 
             <div className="tabs">
-              {(["overview", "search", "upsert", "admin"] as const).map((t) => (
+              {(["overview", "search", "upsert", "pdf", "admin"] as const).map((t) => (
                 <div
                   key={t}
                   className={`tab ${tab === t ? "active" : ""}`}
                   onClick={() => setTab(t)}
                 >
-                  {t.charAt(0).toUpperCase() + t.slice(1)}
+                  {t === "pdf" ? "PDF" : t.charAt(0).toUpperCase() + t.slice(1)}
                 </div>
               ))}
             </div>
@@ -161,6 +162,16 @@ export default function App() {
 
             {tab === "upsert" && (
               <UpsertPanel
+                apiKey={apiKey}
+                info={info}
+                onError={showError}
+                onSuccess={showSuccess}
+                onUpserted={() => setRefreshKey((k) => k + 1)}
+              />
+            )}
+
+            {tab === "pdf" && (
+              <PdfUploadPanel
                 apiKey={apiKey}
                 info={info}
                 onError={showError}

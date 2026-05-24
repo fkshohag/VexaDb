@@ -23,19 +23,26 @@ export function CollectionList({ apiKey, selected, onSelect, refreshKey, onCreat
         setNames(list);
         setError(null);
 
-        const entries = await Promise.all(
-          list.map(async (n) => {
+        // Stream counts in waves of 4 so the gateway doesn't get hammered
+        // with 50+ parallel describe calls when the cluster is under load.
+        // Counts appear incrementally instead of waiting for the slowest one.
+        const concurrency = 4;
+        let cursor = 0;
+        const next = async () => {
+          while (!cancelled && cursor < list.length) {
+            const i = cursor++;
+            const name = list[i];
             try {
-              const d = await api.describeCollection(n, apiKey || undefined);
-              return [n, d.vector_count] as const;
+              const d = await api.describeCollection(name, apiKey || undefined);
+              if (cancelled) return;
+              setCounts((prev) => ({ ...prev, [name]: d.vector_count }));
             } catch {
-              return [n, -1] as const;
+              if (cancelled) return;
+              setCounts((prev) => ({ ...prev, [name]: -1 }));
             }
-          })
-        );
-        if (!cancelled) {
-          setCounts(Object.fromEntries(entries));
-        }
+          }
+        };
+        await Promise.all(Array.from({ length: concurrency }, next));
       } catch (e) {
         if (!cancelled) setError(String((e as Error).message));
       }

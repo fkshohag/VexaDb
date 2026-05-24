@@ -282,6 +282,87 @@ impl VectorDbClient {
         Ok(())
     }
 
+    /// Page through every point on this *one* node's local shard.
+    /// `cursor` is opaque; pass an empty string to start. The returned cursor
+    /// is empty when the iteration is complete.
+    pub async fn scroll(
+        &mut self,
+        collection: &str,
+        cursor: &str,
+        limit: u32,
+    ) -> anyhow::Result<(Vec<VectorPoint>, String)> {
+        let resp = self
+            .inner
+            .scroll(self.authed(vectordb_proto::vectordb::v1::ScrollRequest {
+                collection: collection.into(),
+                cursor: cursor.into(),
+                limit,
+            }))
+            .await?
+            .into_inner();
+        Ok((resp.points, resp.next_cursor))
+    }
+
+    /// Trigger a one-shot rebalance sweep on the router.
+    pub async fn rebalance(
+        &mut self,
+        dry_run: bool,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::RebalanceResponse> {
+        let resp = self
+            .inner
+            .rebalance(self.authed(vectordb_proto::vectordb::v1::RebalanceRequest { dry_run }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// Read auto-rebalance status from the router.
+    pub async fn rebalance_status(
+        &mut self,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::RebalanceStatusResponse> {
+        Ok(self
+            .inner
+            .rebalance_status(self.authed(
+                vectordb_proto::vectordb::v1::RebalanceStatusRequest {},
+            ))
+            .await?
+            .into_inner())
+    }
+
+    /// Register this data node with the cluster router (heartbeat).
+    pub async fn register_node(
+        &mut self,
+        node_id: &str,
+        grpc: &str,
+        shard_ids: Vec<u32>,
+        shard_count: u32,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::RegisterNodeResponse> {
+        let resp = self
+            .inner
+            .register_node(self.authed(vectordb_proto::vectordb::v1::RegisterNodeRequest {
+                node_id: node_id.into(),
+                grpc: grpc.into(),
+                shard_ids,
+                shard_count,
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// Cluster topology snapshot from the router.
+    pub async fn cluster_status(
+        &mut self,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::ClusterStatusResponse> {
+        Ok(self
+            .inner
+            .cluster_status(self.authed(
+                vectordb_proto::vectordb::v1::ClusterStatusRequest {},
+            ))
+            .await?
+            .into_inner())
+    }
+
     pub async fn bulk_upsert(
         &mut self,
         collection: &str,

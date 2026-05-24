@@ -1,55 +1,149 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures::future::join_all;
-use vectordb_cluster::{merge_top_k, ClusterConfig, ShardRouter};
+use vectordb_cluster::{merge_top_k, ClusterConfig};
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::vectordb::v1::{
     vector_service_server::VectorService, BulkUpsertRequest, BulkUpsertResponse, CollectionSpec,
-    CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
+    ClusterStatusRequest, ClusterStatusResponse, ClusterNodeStatus, CompactWalRequest,
+    CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
     CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse,
     DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
     DescribeCollectionRequest, DescribeCollectionResponse, GetRequest, GetResponse, HealthRequest,
     HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
-    ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse, ReindexCollectionRequest,
-    ReindexCollectionResponse, SearchRequest, SearchResponse, UpsertRequest, UpsertResponse,
-    VectorPoint,
+    ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    RebalanceCollectionReport, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
+    RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse,
+    ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest, ScrollResponse,
+    SearchRequest, SearchResponse, UpsertRequest, UpsertResponse, VectorPoint,
 };
 
 use crate::pool::ClientPool;
+use crate::rebalance::RebalanceCoordinator;
+use crate::topology::TopologyManager;
+use crate::{RebalanceConfig, TopologyConfig};
 
 pub struct RouterService {
     pool: ClientPool,
-    router: ShardRouter,
+    topology: Arc<TopologyManager>,
     node_id: String,
+    rebalance: RebalanceCoordinator,
 }
 
 impl RouterService {
     pub fn new(node_id: impl Into<String>, cluster: &ClusterConfig, shard_count: u32) -> Self {
-        Self {
-            pool: ClientPool::default(),
-            router: ShardRouter::from_cluster(cluster, shard_count),
+        Self::with_rebalance(node_id, cluster, shard_count, RebalanceConfig::default())
+    }
+
+    pub fn with_rebalance(
+        node_id: impl Into<String>,
+        cluster: &ClusterConfig,
+        shard_count: u32,
+        rebalance_cfg: RebalanceConfig,
+    ) -> Self {
+        let (svc, _) = Self::with_topology(
+            node_id,
+            cluster,
+            shard_count,
+            rebalance_cfg,
+            TopologyConfig::default(),
+            None,
+        );
+        svc
+    }
+
+  pub fn with_topology(
+        node_id: impl Into<String>,
+        cluster: &ClusterConfig,
+        shard_count: u32,
+        rebalance_cfg: RebalanceConfig,
+        topology_cfg: TopologyConfig,
+        config_path: Option<PathBuf>,
+    ) -> (Self, Arc<TopologyManager>) {
+        let pool = ClientPool::default();
+        let topology = Arc::new(TopologyManager::new(
+            pool.clone(),
+            cluster,
+            shard_count,
+            topology_cfg,
+            config_path,
+        ));
+        let rebalance =
+            RebalanceCoordinator::new(pool.clone(), topology.router(), rebalance_cfg);
+        let svc = Self {
+            pool,
+            topology: topology.clone(),
             node_id: node_id.into(),
-        }
+            rebalance,
+        };
+        (svc, topology)
+    }
+
+    pub fn rebalance(&self) -> RebalanceCoordinator {
+        self.rebalance.clone()
+    }
+
+    pub fn topology(&self) -> Arc<TopologyManager> {
+        self.topology.clone()
     }
 
     async fn clients_for_all_shards(
         &self,
     ) -> Result<Vec<(u32, vectordb_client::VectorDbClient)>, Status> {
+        let endpoints: Vec<(u32, String)> = self
+            .topology
+            .router()
+            .read()
+            .shard_endpoints()
+            .map(|(s, ep)| (s, ep.to_string()))
+            .collect();
+        if endpoints.is_empty() {
+            return Err(Status::failed_precondition(
+                "no shard endpoints configured; set cluster.nodes or wait for RegisterNode",
+            ));
+        }
         let mut out = Vec::new();
-        for (shard, ep) in self.router.shard_endpoints() {
+        for (shard, ep) in endpoints {
             let client = self
                 .pool
-                .get(ep)
+                .get(&ep)
                 .await
                 .map_err(|e| Status::unavailable(format!("shard {shard} at {ep}: {e}")))?;
             out.push((shard, client));
         }
-        if out.is_empty() {
-            return Err(Status::failed_precondition(
-                "no shard endpoints configured; set cluster.nodes with advertise_addr",
-            ));
-        }
         Ok(out)
+    }
+
+    /// Connect to every shard we can reach. Missing shards are logged and
+    /// skipped — used for read paths that tolerate partial availability
+    /// (list/describe/search during WAL replay or rolling restarts).
+    async fn clients_for_shards_best_effort(
+        &self,
+    ) -> Vec<(u32, vectordb_client::VectorDbClient)> {
+        let endpoints: Vec<(u32, String)> = self
+            .topology
+            .router()
+            .read()
+            .shard_endpoints()
+            .map(|(s, ep)| (s, ep.to_string()))
+            .collect();
+        let mut out = Vec::new();
+        for (shard, ep) in endpoints {
+            match self.pool.get(&ep).await {
+                Ok(client) => out.push((shard, client)),
+                Err(e) => {
+                    tracing::warn!(
+                        shard,
+                        endpoint = %ep,
+                        error = %e,
+                        "shard unreachable (partial read)"
+                    );
+                }
+            }
+        }
+        out
     }
 
     async fn client_for_point(
@@ -57,11 +151,14 @@ impl RouterService {
         point_id: &str,
     ) -> Result<vectordb_client::VectorDbClient, Status> {
         let ep = self
-            .router
+            .topology
+            .router()
+            .read()
             .endpoint_for_point(point_id)
+            .map(|s| s.to_string())
             .ok_or_else(|| Status::not_found("no endpoint for point shard"))?;
         self.pool
-            .get(ep)
+            .get(&ep)
             .await
             .map_err(|e| Status::unavailable(e.to_string()))
     }
@@ -76,7 +173,7 @@ impl VectorService for RouterService {
         Ok(Response::new(HealthResponse {
             status: "ok".into(),
             node_id: self.node_id.clone(),
-            shard_count: self.router.shard_count(),
+            shard_count: self.topology.shard_count(),
             is_leader: true,
             raft_role: String::new(),
             leader_endpoint: String::new(),
@@ -119,15 +216,51 @@ impl VectorService for RouterService {
         &self,
         _request: Request<ListCollectionsRequest>,
     ) -> Result<Response<ListCollectionsResponse>, Status> {
-        let clients = self.clients_for_all_shards().await?;
-        let mut names = Vec::new();
-        if let Some((_, mut first)) = clients.into_iter().next() {
-            names = first
-                .list_collections()
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        let clients = self.clients_for_shards_best_effort().await;
+        if clients.is_empty() {
+            return Err(Status::unavailable(
+                "no shard endpoints reachable; wait for data nodes to finish WAL replay",
+            ));
         }
-        Ok(Response::new(ListCollectionsResponse { names }))
+
+        let mut names = std::collections::BTreeSet::new();
+        let mut ok_shards = 0usize;
+        let mut failures = 0usize;
+        let mut last_err: Option<String> = None;
+        for (shard, mut client) in clients {
+            match client.list_collections().await {
+                Ok(shard_names) => {
+                    ok_shards += 1;
+                    names.extend(shard_names);
+                }
+                Err(e) => {
+                    failures += 1;
+                    last_err = Some(e.to_string());
+                    tracing::warn!(
+                        shard,
+                        error = %e,
+                        "list_collections failed on shard (partial read)"
+                    );
+                }
+            }
+        }
+        if ok_shards == 0 {
+            return Err(Status::internal(format!(
+                "all reachable shards failed list_collections; last error: {}",
+                last_err.unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        if failures > 0 {
+            tracing::warn!(
+                ok = ok_shards,
+                failed = failures,
+                collections = names.len(),
+                "list_collections returned partial results"
+            );
+        }
+        Ok(Response::new(ListCollectionsResponse {
+            names: names.into_iter().collect(),
+        }))
     }
 
     async fn describe_collection(
@@ -135,18 +268,52 @@ impl VectorService for RouterService {
         request: Request<DescribeCollectionRequest>,
     ) -> Result<Response<DescribeCollectionResponse>, Status> {
         let name = request.into_inner().name;
-        let clients = self.clients_for_all_shards().await?;
+        let clients = self.clients_for_shards_best_effort().await;
+        if clients.is_empty() {
+            return Err(Status::unavailable(
+                "no shard endpoints reachable; wait for data nodes to finish WAL replay",
+            ));
+        }
+
         let mut spec: Option<CollectionSpec> = None;
         let mut total = 0u64;
-        for (_, mut client) in clients {
-            let (s, count) = client
-                .describe_collection(&name)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            if spec.is_none() {
-                spec = Some(s);
+        let mut ok_shards = 0usize;
+        let mut failures = 0usize;
+        let mut last_err: Option<String> = None;
+        for (shard, mut client) in clients {
+            match client.describe_collection(&name).await {
+                Ok((s, count)) => {
+                    ok_shards += 1;
+                    if spec.is_none() {
+                        spec = Some(s);
+                    }
+                    total += count;
+                }
+                Err(e) => {
+                    failures += 1;
+                    last_err = Some(e.to_string());
+                    tracing::warn!(
+                        shard,
+                        collection = %name,
+                        error = %e,
+                        "describe_collection failed on shard (partial read)"
+                    );
+                }
             }
-            total += count;
+        }
+        if ok_shards == 0 {
+            return Err(Status::internal(format!(
+                "all reachable shards failed describe_collection({name}); last error: {}",
+                last_err.unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        if failures > 0 {
+            tracing::warn!(
+                collection = %name,
+                ok = ok_shards,
+                failed = failures,
+                "describe_collection returned partial results"
+            );
         }
         Ok(Response::new(DescribeCollectionResponse {
             spec,
@@ -159,28 +326,121 @@ impl VectorService for RouterService {
         request: Request<UpsertRequest>,
     ) -> Result<Response<UpsertResponse>, Status> {
         let req = request.into_inner();
+        let collection = req.collection;
+
+        // Bucket points by destination endpoint via consistent-hash ring.
         let mut by_endpoint: HashMap<String, Vec<VectorPoint>> = HashMap::new();
         for point in req.points {
             let ep = self
-                .router
+                .topology
+                .router()
+                .read()
                 .endpoint_for_point(&point.id)
                 .ok_or_else(|| Status::not_found(format!("no shard for {}", point.id)))?
                 .to_string();
             by_endpoint.entry(ep).or_default().push(point);
         }
-        let mut upserted = 0u64;
-        for (ep, points) in by_endpoint {
-            let mut client = self
-                .pool
-                .get(&ep)
-                .await
-                .map_err(|e| Status::unavailable(e.to_string()))?;
-            upserted += client
-                .upsert(&req.collection, points)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+        if by_endpoint.is_empty() {
+            return Ok(Response::new(UpsertResponse { upserted: 0 }));
         }
-        Ok(Response::new(UpsertResponse { upserted }))
+
+        // Fan out concurrently so a slow shard doesn't serialize the whole
+        // request, AND so a failure on shard N still attempts shards M, P
+        // (matches the search path's resilience model). Errors per shard are
+        // logged, then aggregated into a single status if any shard failed —
+        // the caller can retry the whole call (upsert is idempotent on point
+        // id) without worrying about which shards were already written.
+        let fan_out: Vec<_> = by_endpoint
+            .into_iter()
+            .map(|(ep, points)| {
+                let collection = collection.clone();
+                let pool = self.pool.clone();
+                let count = points.len();
+                async move {
+                    let mut client = match pool.get(&ep).await {
+                        Ok(c) => c,
+                        Err(e) => return (ep, count, Err(format!("connect: {e}"))),
+                    };
+                    // Retry on transient leader-election windows. A shard
+                    // that just lost its leader will return either
+                    // "not leader; current leader=None" (no redirect target)
+                    // or Unavailable while a new election runs. Elections
+                    // typically settle within ~1s on a healthy cluster, so
+                    // 4 attempts with 100/300/700ms backoff (≈1.1s) is
+                    // enough to mask the transient and still bail fast on
+                    // a real outage.
+                    let mut last: Option<String> = None;
+                    for (attempt, delay_ms) in [(1u32, 0u64), (2, 100), (3, 300), (4, 700)] {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                        match client.upsert(&collection, points.clone()).await {
+                            Ok(n) => return (ep, count, Ok(n)),
+                            Err(e) => {
+                                let msg = e.to_string();
+                                let transient = msg.contains("not leader")
+                                    || msg.contains("FailedPrecondition")
+                                    || msg.contains("Unavailable")
+                                    || msg.contains("failed to reach quorum");
+                                last = Some(msg);
+                                if !transient {
+                                    break;
+                                }
+                                tracing::debug!(
+                                    endpoint = %ep,
+                                    collection = %collection,
+                                    attempt,
+                                    error = %last.as_deref().unwrap_or(""),
+                                    "upsert transient error, will retry"
+                                );
+                            }
+                        }
+                    }
+                    (ep, count, Err(last.unwrap_or_else(|| "unknown".into())))
+                }
+            })
+            .collect();
+
+        let results = join_all(fan_out).await;
+        let mut upserted = 0u64;
+        let mut failures: Vec<String> = Vec::new();
+        let mut failed_shards = 0usize;
+        let total_shards = results.len();
+        for (ep, count, res) in results {
+            match res {
+                Ok(n) => upserted += n,
+                Err(msg) => {
+                    failed_shards += 1;
+                    tracing::warn!(
+                        endpoint = %ep,
+                        collection = %collection,
+                        points = count,
+                        error = %msg,
+                        "upsert failed on shard"
+                    );
+                    failures.push(format!("{ep}: {msg}"));
+                }
+            }
+        }
+
+        if failed_shards == 0 {
+            return Ok(Response::new(UpsertResponse { upserted }));
+        }
+        // Partial or total failure. Surface every failing shard's error so
+        // the caller doesn't have to grep router logs to figure out who
+        // rejected the write.
+        let summary = format!(
+            "upsert failed on {failed_shards}/{total_shards} shards (partial upserted={upserted}); errors: {}",
+            failures.join("; ")
+        );
+        tracing::error!(
+            collection = %collection,
+            failed_shards,
+            total_shards,
+            partial_upserted = upserted,
+            "upsert returning failure"
+        );
+        Err(Status::internal(summary))
     }
 
     async fn search(
@@ -233,13 +493,41 @@ impl VectorService for RouterService {
             })
             .collect();
 
+        // Fan out and tolerate per-shard failures: return whatever shards
+        // came back, log the rest. A single dead shard no longer black-holes
+        // the entire query.
         let results = join_all(futures).await;
+        let total = results.len();
         let mut all_hits = Vec::new();
+        let mut failures = 0usize;
+        let mut last_err: Option<String> = None;
         for res in results {
-            let hits = res.map_err(|e| Status::internal(e.to_string()))?;
-            for h in hits {
-                all_hits.push((h.id, h.score));
+            match res {
+                Ok(hits) => {
+                    for h in hits {
+                        all_hits.push((h.id, h.score));
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    last_err = Some(e.to_string());
+                    tracing::warn!(error = %e, "shard search failed (returning partial results)");
+                }
             }
+        }
+        if failures == total {
+            // All shards failed → there's no useful answer to return.
+            return Err(Status::internal(format!(
+                "all {total} shards failed; last error: {}",
+                last_err.unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        if failures > 0 {
+            tracing::warn!(
+                ok = total - failures,
+                failed = failures,
+                "search returned partial results"
+            );
         }
         let merged = merge_top_k(all_hits, top_k);
         Ok(Response::new(SearchResponse {
@@ -258,7 +546,9 @@ impl VectorService for RouterService {
         let mut by_endpoint: HashMap<String, Vec<String>> = HashMap::new();
         for id in req.ids {
             let ep = self
-                .router
+                .topology
+                .router()
+                .read()
                 .endpoint_for_point(&id)
                 .ok_or_else(|| Status::not_found(format!("no shard for {id}")))?
                 .to_string();
@@ -345,7 +635,9 @@ impl VectorService for RouterService {
         let mut by_endpoint: HashMap<String, Vec<VectorPoint>> = HashMap::new();
         for point in req.points {
             let ep = self
-                .router
+                .topology
+                .router()
+                .read()
                 .endpoint_for_point(&point.id)
                 .ok_or_else(|| Status::not_found(format!("no shard for {}", point.id)))?
                 .to_string();
@@ -386,7 +678,9 @@ impl VectorService for RouterService {
             }
             for point in chunk.points {
                 let ep = self
-                    .router
+                    .topology
+                    .router()
+                    .read()
                     .endpoint_for_point(&point.id)
                     .ok_or_else(|| Status::not_found(format!("no shard for {}", point.id)))?
                     .to_string();
@@ -459,6 +753,116 @@ impl VectorService for RouterService {
         }
         Ok(Response::new(ReindexCollectionResponse {
             vectors_reindexed: total,
+        }))
+    }
+
+    async fn scroll(
+        &self,
+        _request: Request<ScrollRequest>,
+    ) -> Result<Response<ScrollResponse>, Status> {
+        // Scroll is a *per-shard* operation — call shards directly via the
+        // rebalance tooling, not through the router. Returning an error
+        // keeps the router from accidentally aggregating across shards
+        // and breaking cursor semantics.
+        Err(Status::failed_precondition(
+            "Scroll is per-shard; rebalance tools should connect to shard nodes directly",
+        ))
+    }
+
+    async fn rebalance(
+        &self,
+        request: Request<RebalanceRequest>,
+    ) -> Result<Response<RebalanceResponse>, Status> {
+        let dry_run = request.into_inner().dry_run;
+        let report = self
+            .rebalance
+            .run_once(dry_run)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(RebalanceResponse {
+            moved: report.moved,
+            kept: report.kept,
+            failed: report.failed,
+            duration_ms: report.duration_ms,
+            per_collection: report
+                .per_collection
+                .into_iter()
+                .map(|c| RebalanceCollectionReport {
+                    collection: c.collection,
+                    moved: c.moved,
+                    kept: c.kept,
+                    failed: c.failed,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn rebalance_status(
+        &self,
+        _request: Request<RebalanceStatusRequest>,
+    ) -> Result<Response<RebalanceStatusResponse>, Status> {
+        let s = self.rebalance.status();
+        let cfg = self.rebalance.config();
+        Ok(Response::new(RebalanceStatusResponse {
+            running: s.running,
+            enabled: cfg.enabled,
+            interval_secs: cfg.interval_secs,
+            last_started_unix_ms: s.last_started_unix_ms.unwrap_or(0),
+            last_finished_unix_ms: s.last_finished_unix_ms.unwrap_or(0),
+            last_duration_ms: s.last_duration_ms.unwrap_or(0),
+            last_moved: s.last_moved,
+            last_kept: s.last_kept,
+            last_failed: s.last_failed,
+            last_error: s.last_error.unwrap_or_default(),
+            total_moves: s.total_moves,
+            total_sweeps: s.total_sweeps,
+        }))
+    }
+
+    async fn register_node(
+        &self,
+        request: Request<RegisterNodeRequest>,
+    ) -> Result<Response<RegisterNodeResponse>, Status> {
+        let req = request.into_inner();
+        if req.node_id.is_empty() || req.grpc.is_empty() {
+            return Err(Status::invalid_argument("node_id and grpc required"));
+        }
+        self.topology.register_node(
+            req.node_id,
+            req.grpc,
+            req.shard_ids,
+            req.shard_count,
+        );
+        Ok(Response::new(RegisterNodeResponse {
+            accepted: true,
+            shard_count: self.topology.shard_count(),
+        }))
+    }
+
+    async fn cluster_status(
+        &self,
+        _request: Request<ClusterStatusRequest>,
+    ) -> Result<Response<ClusterStatusResponse>, Status> {
+        let st = self.topology.status();
+        Ok(Response::new(ClusterStatusResponse {
+            shard_count: st.shard_count,
+            replication_factor: st.replication_factor as u64,
+            last_health_unix_ms: st.last_health_unix_ms,
+            last_config_reload_unix_ms: st.last_config_reload_unix_ms.unwrap_or(0),
+            nodes: st
+                .nodes
+                .into_iter()
+                .map(|n| ClusterNodeStatus {
+                    id: n.id,
+                    grpc: n.grpc,
+                    shard_ids: n.shard_ids,
+                    healthy: n.healthy,
+                    ready: n.ready,
+                    is_leader: n.is_leader,
+                    source: n.source,
+                    primary_for_shards: n.primary_for_shards,
+                })
+                .collect(),
         }))
     }
 }

@@ -1,18 +1,29 @@
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
+# ---------------------------------------------------------------------------
+# Defaults / variables
+# ---------------------------------------------------------------------------
 COMPOSE       ?= docker compose
 GATEWAY_URL   ?= http://127.0.0.1:8080
 ROUTER_GRPC   ?= http://127.0.0.1:6333
 ADMIN_URL     ?= http://127.0.0.1:8090
 CARGO_FLAGS   ?=
 
-# Default target: bring up the entire stack (cluster + gateway + admin panel).
+# Cluster shape — pass to `make up` to override:
+#   make up RF=3 SHARDS=2
+RF      ?=
+SHARDS  ?=
+
+CLUSTER := ./scripts/cluster.py
+
+# `make all` and `make up` are aliases. Cluster shape is persisted in
+# .cluster.state.json so subsequent commands remember RF/SHARDS.
 .PHONY: all
-all: up info ## Bring up the full stack and print URLs.
+all: up ## Build + start the cluster (alias for `up`).
 
 # ---------------------------------------------------------------------------
-# Help (default target)
+# Help
 # ---------------------------------------------------------------------------
 
 .PHONY: help
@@ -20,92 +31,81 @@ help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "Available targets:\n\n"} \
 		/^[a-zA-Z0-9_.-]+:.*##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 }' \
 		$(MAKEFILE_LIST)
+	@echo
+	@echo "Cluster lifecycle (one source of truth — scripts/cluster.py):"
+	@echo "  make up                       # 1 shard, RF=1 (default)"
+	@echo "  make up RF=3 SHARDS=2         # 2 shards × 3 replicas = 6 data nodes"
+	@echo "  make scale-rf RF=5            # bump replication factor"
+	@echo "  make add-shard                # add capacity (auto-rebalance moves data)"
+	@echo "  make down                     # stop (keeps volumes)"
+	@echo "  make nuke                     # stop and DELETE data volumes"
+	@echo
 
 # ---------------------------------------------------------------------------
-# macOS / filesystem hygiene
+# Cluster lifecycle (the only docker compose user-facing surface)
 # ---------------------------------------------------------------------------
 
-.PHONY: clean-macos
-clean-macos: ## Strip macOS AppleDouble (._*) and .DS_Store files that break Docker builds.
-	@find . -name '._*' -type f -delete 2>/dev/null || true
-	@find . -name '.DS_Store' -type f -delete 2>/dev/null || true
-	@command -v dot_clean >/dev/null 2>&1 && dot_clean -m . || true
-	@echo "macOS artifacts cleaned."
-
-# ---------------------------------------------------------------------------
-# Docker / docker-compose
-# ---------------------------------------------------------------------------
-
-.PHONY: docker-build
-docker-build: clean-macos ## Build all docker-compose images (cleans ._* first).
-	$(COMPOSE) build
-
-.PHONY: docker-rebuild
-docker-rebuild: clean-macos ## Force a no-cache rebuild of all images.
-	$(COMPOSE) build --no-cache
+# Build cluster.py args from RF/SHARDS env (omit when unset so cluster.py
+# falls back to the persisted state).
+CLUSTER_UP_ARGS :=
+ifneq ($(RF),)
+CLUSTER_UP_ARGS += --rf $(RF)
+endif
+ifneq ($(SHARDS),)
+CLUSTER_UP_ARGS += --shards $(SHARDS)
+endif
 
 .PHONY: up
-up: clean-macos ## Start the stack in the background (builds if needed).
-	$(COMPOSE) up -d --build
+up: ## Generate compose + configs from RF/SHARDS, then start (default RF=1, SHARDS=1).
+	$(CLUSTER) up $(CLUSTER_UP_ARGS)
 
-.PHONY: up-fg
-up-fg: clean-macos ## Start the stack in the foreground (attached).
-	$(COMPOSE) up --build
+.PHONY: scale-rf
+scale-rf: ## Change replication factor in place. Usage: make scale-rf RF=5
+	@if [ -z "$(RF)" ]; then echo "ERROR: pass RF=N (e.g. make scale-rf RF=5)"; exit 1; fi
+	$(CLUSTER) scale-rf --rf $(RF)
+
+.PHONY: add-shard
+add-shard: ## Add one new shard (router auto-rebalance moves ~1/N of data).
+	$(CLUSTER) add-shard
 
 .PHONY: down
-down: ## Stop the stack (keeps volumes).
-	$(COMPOSE) down
+down: ## Stop the cluster (keeps data volumes).
+	$(CLUSTER) down
 
 .PHONY: nuke
-nuke: ## Stop the stack and delete data volumes (DESTRUCTIVE).
-	$(COMPOSE) down -v
-
-.PHONY: restart
-restart: down up ## Restart the stack.
+nuke: ## Stop and DELETE data volumes (DESTRUCTIVE).
+	$(CLUSTER) nuke
 
 .PHONY: ps
 ps: ## Show container status.
-	$(COMPOSE) ps
+	$(CLUSTER) ps
 
 .PHONY: logs
-logs: ## Tail logs from all services.
-	$(COMPOSE) logs -f --tail=100
+logs: ## Tail logs from all services. Pass SERVICE=name for one service.
+	$(CLUSTER) logs $(SERVICE)
 
-.PHONY: logs-router logs-gateway logs-shard-0 logs-shard-1 logs-admin
+.PHONY: info
+info: ## Print cluster URLs.
+	$(CLUSTER) info
+
+.PHONY: render
+render: ## Regenerate compose + configs without starting docker.
+	$(CLUSTER) render $(CLUSTER_UP_ARGS)
+
+# ---------------------------------------------------------------------------
+# Convenience aliases
+# ---------------------------------------------------------------------------
+
+.PHONY: restart
+restart: down up ## Restart the cluster.
+
+.PHONY: logs-router logs-gateway logs-admin
 logs-router:   ## Tail router logs.
-	$(COMPOSE) logs -f --tail=100 router
+	$(CLUSTER) logs router
 logs-gateway:  ## Tail gateway logs.
-	$(COMPOSE) logs -f --tail=100 gateway
-logs-shard-0:  ## Tail shard-0 logs.
-	$(COMPOSE) logs -f --tail=100 shard-0
-logs-shard-1:  ## Tail shard-1 logs.
-	$(COMPOSE) logs -f --tail=100 shard-1
+	$(CLUSTER) logs gateway
 logs-admin:    ## Tail admin panel logs.
-	$(COMPOSE) logs -f --tail=100 admin
-
-.PHONY: sh-router sh-gateway sh-admin
-sh-router:     ## Exec a shell inside the router container.
-	$(COMPOSE) exec router /bin/bash
-sh-gateway:    ## Exec a shell inside the gateway container.
-	$(COMPOSE) exec gateway /bin/bash
-sh-admin:      ## Exec a shell inside the admin container.
-	$(COMPOSE) exec admin /bin/bash
-
-# ---------------------------------------------------------------------------
-# Admin panel (build / open / status)
-# ---------------------------------------------------------------------------
-
-.PHONY: admin-build
-admin-build: clean-macos ## Build only the admin panel image.
-	$(COMPOSE) build admin
-
-.PHONY: admin-up
-admin-up: clean-macos ## (Re)start just the admin panel (and its deps).
-	$(COMPOSE) up -d --build admin
-
-.PHONY: admin-down
-admin-down: ## Stop only the admin panel.
-	$(COMPOSE) stop admin
+	$(CLUSTER) logs admin
 
 .PHONY: admin-open
 admin-open: ## Open the admin panel in your browser.
@@ -114,35 +114,34 @@ admin-open: ## Open the admin panel in your browser.
 		echo "Open $(ADMIN_URL) manually."
 
 .PHONY: admin-dev
-admin-dev: ## Run the admin panel in dev mode (Go + Vite, hot reload). Requires Go + Node locally.
+admin-dev: ## Run the admin panel in dev mode (Go + Vite, hot reload).
 	cd admin && ./scripts/dev.sh
 
-.PHONY: info
-info: ## Print the URLs for everything in the stack.
-	@echo
-	@echo "  ┌──────────────────────────────────────────────────────────┐"
-	@echo "  │ VectorDB stack is up.                                    │"
-	@echo "  ├──────────────────────────────────────────────────────────┤"
-	@echo "  │ Admin panel    : $(ADMIN_URL)                  │"
-	@echo "  │ REST gateway   : $(GATEWAY_URL)                  │"
-	@echo "  │ Router gRPC    : 127.0.0.1:6333                          │"
-	@echo "  │ Shard 0 / 1    : 127.0.0.1:6334 / 6335                   │"
-	@echo "  └──────────────────────────────────────────────────────────┘"
-	@echo
-	@echo "  make logs        # tail all containers"
-	@echo "  make smoke       # end-to-end smoke test against the gateway"
-	@echo "  make admin-open  # open the admin UI"
-	@echo "  make down        # stop the stack"
-	@echo "  make nuke        # stop and DELETE data volumes"
+# ---------------------------------------------------------------------------
+# macOS / filesystem hygiene
+# ---------------------------------------------------------------------------
+
+.PHONY: clean-macos
+clean-macos: ## Strip macOS AppleDouble (._*) and .DS_Store files.
+	@find . -name '._*' -type f -delete 2>/dev/null || true
+	@find . -name '.DS_Store' -type f -delete 2>/dev/null || true
+	@command -v dot_clean >/dev/null 2>&1 && dot_clean -m . || true
+	@echo "macOS artifacts cleaned."
 
 # ---------------------------------------------------------------------------
-# Smoke test against the gateway
+# Smoke test against the running gateway
 # ---------------------------------------------------------------------------
 
 SMOKE_COLLECTION ?= smoke-$(shell date +%s)
 
 .PHONY: smoke
-smoke: ## End-to-end smoke test against the running gateway (uses a unique collection name).
+smoke: ## End-to-end smoke test against the running gateway.
+	@echo "→ waiting for gateway at $(GATEWAY_URL)/health..."
+	@for i in $$(seq 1 30); do \
+		curl -fsS $(GATEWAY_URL)/health >/dev/null 2>&1 && break; \
+		sleep 1; \
+		if [ $$i -eq 30 ]; then echo "gateway never became healthy"; exit 1; fi; \
+	done
 	@echo "→ health"
 	@curl -fsS $(GATEWAY_URL)/health && echo
 	@echo "→ create collection '$(SMOKE_COLLECTION)'"
@@ -173,8 +172,12 @@ check: ## cargo check on the full workspace.
 	cargo check --workspace $(CARGO_FLAGS)
 
 .PHONY: build
-build: ## cargo build (release) for server + gateway.
-	cargo build --release -p vectordb-server -p vectordb-gateway $(CARGO_FLAGS)
+build: ## cargo build (release) for server + gateway + cli.
+	cargo build --release \
+		-p vectordb-server \
+		-p vectordb-gateway \
+		-p vectordb-cli \
+		$(CARGO_FLAGS)
 
 .PHONY: test
 test: ## Run all workspace tests.
@@ -185,7 +188,7 @@ fmt: ## Format the workspace.
 	cargo fmt --all
 
 .PHONY: fmt-check
-fmt-check: ## Check formatting (CI-friendly).
+fmt-check: ## Check formatting.
 	cargo fmt --all -- --check
 
 .PHONY: clippy
@@ -213,5 +216,5 @@ run-shard-0: ## Run shard-0 locally (config/node-0.toml).
 	cargo run -p vectordb-server -- --config config/node-0.toml
 run-shard-1: ## Run shard-1 locally (config/node-1.toml).
 	cargo run -p vectordb-server -- --config config/node-1.toml
-run-router:  ## Run router locally (config/router.toml, uses 127.0.0.1).
+run-router:  ## Run router locally (config/router.toml).
 	cargo run -p vectordb-server -- --config config/router.toml

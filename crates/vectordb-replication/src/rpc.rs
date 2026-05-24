@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::raft::v1::{
     raft_service_server::RaftService, AppendEntriesRequest, AppendEntriesResponse,
-    RequestVoteRequest, RequestVoteResponse,
+    InstallSnapshotChunk, InstallSnapshotResponse, RequestVoteRequest, RequestVoteResponse,
 };
 
 use crate::node::RaftNode;
@@ -36,5 +36,20 @@ impl RaftService for RaftServiceImpl {
         Ok(Response::new(
             self.node.handle_append_entries(request.into_inner()),
         ))
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<Streaming<InstallSnapshotChunk>>,
+    ) -> Result<Response<InstallSnapshotResponse>, Status> {
+        let mut stream = request.into_inner();
+        let mut last_resp = InstallSnapshotResponse {
+            term: self.node.current_term(),
+            success: true,
+        };
+        while let Some(msg) = stream.message().await? {
+            last_resp = self.node.handle_install_snapshot_chunk(msg)?;
+        }
+        Ok(Response::new(last_resp))
     }
 }

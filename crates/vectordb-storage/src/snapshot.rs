@@ -96,7 +96,61 @@ impl SnapshotManager {
     }
 }
 
-fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Relative paths of durable shard files inside a snapshot directory
+/// (`wal.log`, files under `meta/`). Skips `manifest.json` and `snapshots/`.
+pub fn collect_payload_files(snapshot_root: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut out = Vec::new();
+    let wal = snapshot_root.join("wal.log");
+    if wal.is_file() {
+        out.push((wal, "wal.log".into()));
+    }
+    let meta = snapshot_root.join("meta");
+    if meta.is_dir() {
+        collect_files_recursive(&meta, &meta, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn collect_files_recursive(
+    base: &Path,
+    dir: &Path,
+    out: &mut Vec<(PathBuf, String)>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(base, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(base)
+                .map_err(|_| EngineError::Rocks("path prefix".into()))?;
+            let name = format!("meta/{}", rel.to_string_lossy().replace('\\', "/"));
+            out.push((path, name));
+        }
+    }
+    Ok(())
+}
+
+/// Copy `wal.log` and `meta/` from a snapshot payload tree into a live data
+/// directory (overwriting existing).
+pub fn install_payload_into_data_dir(payload_root: &Path, data_dir: &Path) -> Result<()> {
+    let wal_src = payload_root.join("wal.log");
+    if wal_src.is_file() {
+        copy_recursive(&wal_src, &data_dir.join("wal.log"))?;
+    }
+    let meta_src = payload_root.join("meta");
+    if meta_src.is_dir() {
+        let meta_dst = data_dir.join("meta");
+        if meta_dst.exists() {
+            fs::remove_dir_all(&meta_dst)?;
+        }
+        copy_recursive(&meta_src, &meta_dst)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
     if src.is_dir() {
         fs::create_dir_all(dst)?;
         for entry in fs::read_dir(src)? {

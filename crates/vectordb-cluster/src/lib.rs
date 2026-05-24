@@ -5,5 +5,5 @@ pub mod ring;
 pub mod router;
 
 pub use membership::{ClusterConfig, NodeId, NodeRole, NodeState};
-pub use ring::HashRing;
+pub use ring::{shard_for_point, HashRing};
 pub use router::{merge_top_k, ShardId, ShardRouter};

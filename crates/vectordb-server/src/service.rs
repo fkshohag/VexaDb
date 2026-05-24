@@ -3,24 +3,26 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_cluster::ShardRouter;
 use vectordb_core::{
-    CollectionConfig, DistanceMetric, Filter, PayloadFieldIndex, PayloadIndexKind, QuantizationConfig,
-    SearchMode, SparseVector,
+    CollectionConfig, DistanceMetric, Filter, PayloadFieldIndex, PayloadIndexKind,
+    QuantizationConfig, SearchMode, SparseVector,
 };
-use vectordb_storage::search::SearchParams;
 use vectordb_proto::vectordb::v1::{
     vector_service_server::VectorService, BulkUpsertRequest, BulkUpsertResponse,
-    CollectionSpec, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
-    CreateCollectionResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
-    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeCollectionRequest,
+    ClusterStatusRequest, ClusterStatusResponse, CollectionSpec, CompactWalRequest,
+    CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse, CreateSnapshotRequest,
+    CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
+    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeCollectionRequest,
     DescribeCollectionResponse, DistanceMetric as ProtoMetric, GetRequest, GetResponse,
     HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
     ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind,
-    ReindexCollectionRequest, ReindexCollectionResponse, SearchRequest, SearchResponse,
-    SnapshotInfo, UpsertRequest, UpsertResponse, VectorPoint,
+    PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, RebalanceRequest,
+    RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse, RegisterNodeRequest,
+    RegisterNodeResponse, ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest,
+    ScrollResponse, SearchRequest, SearchResponse, SnapshotInfo, UpsertRequest, UpsertResponse,
+    VectorPoint,
 };
 use vectordb_replication::RaftNode;
+use vectordb_storage::search::SearchParams;
 use vectordb_storage::{CollectionEngine, EngineError};
 
 use crate::config::ServerConfig;
@@ -58,20 +60,38 @@ impl VectorServiceImpl {
         };
         let cluster = cfg.cluster_config();
         let router = ShardRouter::from_cluster(&cluster, cfg.cluster.shard_count);
-        Ok(Self {
+        let node_id = cfg.cluster.node_id.clone();
+        let shard_count = cfg.cluster.shard_count;
+        let local_shard = cfg.cluster.shard_id;
+        let shard_ids = vec![local_shard];
+        let router_grpc = cfg.cluster.router_grpc.clone();
+
+        let svc = Self {
             engine,
             replicated,
             router,
-            node_id: cfg.cluster.node_id,
-            shard_count: cfg.cluster.shard_count,
-            local_shard: cfg.cluster.shard_id,
-            vector_endpoint,
+            node_id: node_id.clone(),
+            shard_count,
+            local_shard,
+            vector_endpoint: vector_endpoint.clone(),
             readiness_requires_leader: cfg.server.readiness_requires_leader,
-        })
+        };
+
+        if let Some(router_ep) = router_grpc {
+            spawn_router_registration(router_ep, node_id, vector_endpoint, shard_ids, shard_count);
+        }
+
+        Ok(svc)
     }
 
     fn raft_ref(&self) -> Option<&RaftNode> {
         self.replicated.as_ref().map(|r| r.raft.as_ref())
+    }
+
+    /// Shared handle to the underlying engine — for background tasks
+    /// (auto-snapshot, rebalance, etc.).
+    pub fn engine_handle(&self) -> Arc<CollectionEngine> {
+        self.engine.clone()
     }
 
     fn owns_point(&self, point_id: &str) -> bool {
@@ -331,10 +351,7 @@ impl VectorService for VectorServiceImpl {
         Ok(Response::new(DeleteResponse { deleted }))
     }
 
-    async fn get(
-        &self,
-        request: Request<GetRequest>,
-    ) -> Result<Response<GetResponse>, Status> {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
         if !self.owns_point(&req.id) {
             return Err(Status::failed_precondition(
@@ -527,6 +544,73 @@ impl VectorService for VectorServiceImpl {
             vectors_reindexed: n,
         }))
     }
+
+    async fn rebalance(
+        &self,
+        _request: Request<RebalanceRequest>,
+    ) -> Result<Response<RebalanceResponse>, Status> {
+        Err(Status::failed_precondition(
+            "Rebalance must be sent to the router, not a data node",
+        ))
+    }
+
+    async fn rebalance_status(
+        &self,
+        _request: Request<RebalanceStatusRequest>,
+    ) -> Result<Response<RebalanceStatusResponse>, Status> {
+        Err(Status::failed_precondition(
+            "RebalanceStatus must be sent to the router, not a data node",
+        ))
+    }
+
+    async fn scroll(
+        &self,
+        request: Request<ScrollRequest>,
+    ) -> Result<Response<ScrollResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit == 0 {
+            256
+        } else {
+            req.limit as usize
+        };
+        let (rows, next_cursor) = self
+            .engine
+            .scroll(&req.collection, &req.cursor, limit)
+            .map_err(map_engine_err)?;
+        let points = rows
+            .into_iter()
+            .map(|(id, vector, payload)| VectorPoint {
+                id,
+                values: vector.values,
+                payload: payload
+                    .map(|v| serde_json::to_vec(&v).unwrap_or_default())
+                    .unwrap_or_default(),
+                sparse: None,
+            })
+            .collect();
+        Ok(Response::new(ScrollResponse {
+            points,
+            next_cursor,
+        }))
+    }
+
+    async fn register_node(
+        &self,
+        _request: Request<RegisterNodeRequest>,
+    ) -> Result<Response<RegisterNodeResponse>, Status> {
+        Err(Status::failed_precondition(
+            "RegisterNode must be sent to the router",
+        ))
+    }
+
+    async fn cluster_status(
+        &self,
+        _request: Request<ClusterStatusRequest>,
+    ) -> Result<Response<ClusterStatusResponse>, Status> {
+        Err(Status::failed_precondition(
+            "ClusterStatus must be sent to the router",
+        ))
+    }
 }
 
 impl VectorServiceImpl {
@@ -550,6 +634,50 @@ impl VectorServiceImpl {
                 .map_err(map_engine_err)
         }
     }
+}
+
+/// Heartbeat loop: data nodes register with the router on boot and every 30s.
+fn spawn_router_registration(
+    router_grpc: String,
+    node_id: String,
+    grpc: String,
+    shard_ids: Vec<u32>,
+    shard_count: u32,
+) {
+    tokio::spawn(async move {
+        async fn try_register(
+            router_grpc: &str,
+            node_id: &str,
+            grpc: &str,
+            shard_ids: &[u32],
+            shard_count: u32,
+        ) {
+            match vectordb_client::VectorDbClient::connect(router_grpc.to_string()).await {
+                Ok(mut client) => {
+                    if let Err(e) = client
+                        .register_node(node_id, grpc, shard_ids.to_vec(), shard_count)
+                        .await
+                    {
+                        tracing::warn!(node_id = %node_id, error = %e, "router registration failed");
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    router = %router_grpc,
+                    error = %e,
+                    "cannot reach router for registration"
+                ),
+            }
+        }
+
+        try_register(&router_grpc, &node_id, &grpc, &shard_ids, shard_count).await;
+
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            try_register(&router_grpc, &node_id, &grpc, &shard_ids, shard_count).await;
+        }
+    });
 }
 
 fn proto_points_to_bulk(
@@ -629,11 +757,7 @@ fn config_to_spec(cfg: CollectionConfig) -> CollectionSpec {
             .collect(),
         sparse_enabled: cfg.sparse_enabled,
         bm25_text_field: cfg.bm25_text_field.clone().unwrap_or_default(),
-        scalar_quantization: cfg
-            .quantization
-            .as_ref()
-            .map(|q| q.scalar)
-            .unwrap_or(false),
+        scalar_quantization: cfg.quantization.as_ref().map(|q| q.scalar).unwrap_or(false),
     }
 }
 
@@ -696,4 +820,3 @@ fn map_engine_err(e: EngineError) -> Status {
         other => Status::internal(other.to_string()),
     }
 }
-

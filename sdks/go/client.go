@@ -267,3 +267,110 @@ func (c *Client) ReindexCollection(ctx context.Context, collection string) (uint
 	err := c.do(ctx, http.MethodPost, "/v1/collections/"+collection+"/reindex", nil, &out)
 	return out.VectorsReindexed, err
 }
+
+// RebalanceResult is returned by Rebalance.
+type RebalanceResult struct {
+	Moved         uint64 `json:"moved"`
+	Kept          uint64 `json:"kept"`
+	Failed        uint64 `json:"failed"`
+	DurationMs    uint64 `json:"duration_ms"`
+	DryRun        bool   `json:"dry_run"`
+	PerCollection []struct {
+		Collection string `json:"collection"`
+		Moved      uint64 `json:"moved"`
+		Kept       uint64 `json:"kept"`
+		Failed     uint64 `json:"failed"`
+	} `json:"per_collection"`
+}
+
+// Rebalance triggers a manual rebalance sweep. Set dryRun=true to see what
+// would move without actually moving anything.
+func (c *Client) Rebalance(ctx context.Context, dryRun bool) (*RebalanceResult, error) {
+	var out RebalanceResult
+	err := c.do(ctx, http.MethodPost, "/v1/admin/rebalance", map[string]any{"dry_run": dryRun}, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RebalanceStatus describes the rebalance coordinator state.
+type RebalanceStatus struct {
+	Running             bool    `json:"running"`
+	Enabled             bool    `json:"enabled"`
+	IntervalSecs        uint64  `json:"interval_secs"`
+	LastStartedUnixMs   *uint64 `json:"last_started_unix_ms,omitempty"`
+	LastFinishedUnixMs  *uint64 `json:"last_finished_unix_ms,omitempty"`
+	LastDurationMs      *uint64 `json:"last_duration_ms,omitempty"`
+	LastMoved           uint64  `json:"last_moved"`
+	LastKept            uint64  `json:"last_kept"`
+	LastFailed          uint64  `json:"last_failed"`
+	LastError           string  `json:"last_error"`
+	TotalMoves          uint64  `json:"total_moves"`
+	TotalSweeps         uint64  `json:"total_sweeps"`
+}
+
+func (c *Client) RebalanceStatus(ctx context.Context) (*RebalanceStatus, error) {
+	var out RebalanceStatus
+	err := c.do(ctx, http.MethodGet, "/v1/admin/rebalance", nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ClusterNode describes one data node in the cluster.
+type ClusterNode struct {
+	ID                string   `json:"id"`
+	GRPC              string   `json:"grpc"`
+	ShardIDs          []uint32 `json:"shard_ids"`
+	Healthy           bool     `json:"healthy"`
+	Ready             bool     `json:"ready"`
+	IsLeader          bool     `json:"is_leader"`
+	Source            string   `json:"source"`
+	PrimaryForShards  []uint32 `json:"primary_for_shards"`
+}
+
+// ClusterStatus describes the cluster topology.
+type ClusterStatus struct {
+	ShardCount             uint32        `json:"shard_count"`
+	ReplicationFactor      uint32        `json:"replication_factor"`
+	LastHealthUnixMs       *uint64       `json:"last_health_unix_ms,omitempty"`
+	LastConfigReloadUnixMs *uint64       `json:"last_config_reload_unix_ms,omitempty"`
+	Nodes                  []ClusterNode `json:"nodes"`
+}
+
+func (c *Client) ClusterStatus(ctx context.Context) (*ClusterStatus, error) {
+	var out ClusterStatus
+	err := c.do(ctx, http.MethodGet, "/v1/admin/cluster", nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Snapshot describes one snapshot artifact.
+type Snapshot struct {
+	ID          string `json:"id"`
+	CreatedAtMs uint64 `json:"created_at_ms"`
+	Path        string `json:"path"`
+}
+
+func (c *Client) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
+	var out []Snapshot
+	err := c.do(ctx, http.MethodGet, "/v1/snapshots", nil, &out)
+	return out, err
+}
+
+func (c *Client) CreateSnapshot(ctx context.Context) (*Snapshot, error) {
+	var out Snapshot
+	err := c.do(ctx, http.MethodPost, "/v1/snapshots", nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteSnapshot(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/snapshots/"+id, nil, nil)
+}

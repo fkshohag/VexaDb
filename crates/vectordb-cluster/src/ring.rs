@@ -40,6 +40,13 @@ impl HashRing {
     }
 }
 
+/// Convenience: compute the shard for a point id given a shard count.
+/// Uses the standard ring (128 vnodes/shard) and is therefore consistent
+/// with the live router. Useful for offline tools (rebalance, audit).
+pub fn shard_for_point(point_id: &str, shard_count: u32) -> u32 {
+    HashRing::new(shard_count, 128).shard_for_key(point_id.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
