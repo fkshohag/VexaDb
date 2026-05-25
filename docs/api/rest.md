@@ -5,7 +5,7 @@ default it listens on `:8080` and proxies to a gRPC server or router.
 
 - **Auth** (when enabled): `x-api-key: <key>` *or* `Authorization: Bearer <key>`
 - **Content-Type**: `application/json`
-- **Probes** (no auth required): `/health`, `/live`, `/ready`, `/metrics`
+- **Probes** (no auth required): `/health`, `/live`, `/ready`, `/metrics`, `/v1/version`
 
 > All payloads are pretty-printed in this doc; production calls don’t need
 > whitespace.
@@ -20,8 +20,28 @@ default it listens on `:8080` and proxies to a gRPC server or router.
 | `GET` | `/live` | `200` if process up. |
 | `GET` | `/ready` | `200` only if `HealthResponse.ready` (leader, if Raft). |
 | `GET` | `/metrics` | Prometheus text format (gateway counters). |
+| `GET` | `/v1/version` | Returns `{ "version", "server", "git_commit" }` — used by SDKs as a connectivity probe (Milvus-compatible). |
 
 Server-side Prometheus is at `[metrics].listen` (default `:9090`).
+
+---
+
+## Collection metadata (Milvus parity)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/collections/:name/rename` | Body `{ "new_name": "…" }`; renames atomically and re-targets aliases. |
+| `PATCH` | `/v1/collections/:name/properties` | Body `{ "set": {…}, "unset": ["…"] }`; merge / remove opaque properties (TTL, `mmap.enabled`, etc.). |
+| `GET` | `/v1/collections/:name/aliases` | List aliases pointing to this collection. |
+| `GET` | `/v1/aliases` | List all aliases. |
+| `POST` | `/v1/aliases` | Body `{ "alias", "collection" }` — create. |
+| `GET` | `/v1/aliases/:alias` | Resolve alias → `{ "alias", "collection" }`. |
+| `PUT` | `/v1/aliases/:alias` | Body `{ "collection" }` — reassign. |
+| `DELETE` | `/v1/aliases/:alias` | Drop alias (idempotent). |
+
+Required privileges: `AlterCollection` for rename/properties, `AlterAlias` for alias mutations. The `admin` and `read_write` built-in roles include both.
+
+`GET /v1/collections/:name` now returns `properties` and `aliases` in the body.
 
 ---
 

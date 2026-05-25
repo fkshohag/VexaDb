@@ -125,6 +125,8 @@ impl RbacState {
             "Upsert",
             "Delete",
             "Get",
+            "AlterCollection",
+            "AlterAlias",
         ] {
             let obj = match p {
                 "ListCollections" => ObjectType::Global,

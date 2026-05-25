@@ -2652,6 +2652,7 @@ dependencies = [
  "vectordb-cluster",
  "vectordb-proto",
  "vectordb-rbac",
+ "vectordb-storage",
 ]
 
 [[package]]

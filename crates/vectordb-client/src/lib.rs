@@ -8,9 +8,10 @@ use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
     ApplyRbacRequest, BulkUpsertRequest, CollectionSpec, CompactWalRequest, CompactWalResponse,
     CreateCollectionRequest, CreateSnapshotRequest, DeleteCollectionRequest, DeleteRequest,
-    DeleteSnapshotRequest, DescribeCollectionRequest, DistanceMetric, GetRbacSnapshotRequest,
-    GetRequest, HealthRequest, HealthResponse, ImportChunk, ListCollectionsRequest,
-    ListSnapshotsRequest, QueryRequest, QueryResponse, ReindexCollectionRequest,
+    DeleteSnapshotRequest, DescribeAliasRequest, DescribeCollectionRequest, DistanceMetric,
+    GetRbacSnapshotRequest, GetRequest, HealthRequest, HealthResponse, ImportChunk,
+    ListAliasesRequest, ListCollectionsRequest, ListSnapshotsRequest,
+    MutateCollectionMetaRequest, QueryRequest, QueryResponse, ReindexCollectionRequest,
     ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest, StatsResponse,
     UpsertRequest, VectorPoint,
 };
@@ -137,6 +138,16 @@ impl VectorDbClient {
         &mut self,
         name: &str,
     ) -> anyhow::Result<(CollectionSpec, u64)> {
+        let (spec, count, _) = self.describe_collection_full(name).await?;
+        Ok((spec, count))
+    }
+
+    /// Same as [`describe_collection`] but also returns the list of aliases
+    /// pointing to this collection.
+    pub async fn describe_collection_full(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<(CollectionSpec, u64, Vec<String>)> {
         let resp = self
             .inner
             .describe_collection(self.authed(DescribeCollectionRequest {
@@ -144,7 +155,49 @@ impl VectorDbClient {
             }))
             .await?
             .into_inner();
-        Ok((resp.spec.context("missing spec")?, resp.vector_count))
+        Ok((
+            resp.spec.context("missing spec")?,
+            resp.vector_count,
+            resp.aliases,
+        ))
+    }
+
+    /// Apply a collection-meta mutation (rename / alias / properties) via gRPC.
+    /// `op` is a `vectordb_storage::MetaOp` serialized to JSON by the caller.
+    pub async fn mutate_collection_meta(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .mutate_collection_meta(self.authed(MutateCollectionMetaRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_aliases(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let resp = self
+            .inner
+            .list_aliases(self.authed(ListAliasesRequest {
+                collection: collection.into(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp
+            .aliases
+            .into_iter()
+            .map(|a| (a.alias, a.collection))
+            .collect())
+    }
+
+    pub async fn describe_alias(&mut self, alias: &str) -> anyhow::Result<String> {
+        let resp = self
+            .inner
+            .describe_alias(self.authed(DescribeAliasRequest {
+                alias: alias.into(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.collection)
     }
 
     pub async fn upsert(
@@ -543,5 +596,6 @@ pub fn cosine_collection(name: &str, dimension: u32) -> CollectionSpec {
         sparse_enabled: false,
         bm25_text_field: String::new(),
         scalar_quantization: false,
+        properties: std::collections::HashMap::new(),
     }
 }

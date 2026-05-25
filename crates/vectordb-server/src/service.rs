@@ -7,15 +7,17 @@ use vectordb_core::{
     QuantizationConfig, ScoredPoint, SearchMode, SparseVector,
 };
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest,
-    BulkUpsertResponse, ClusterStatusRequest, ClusterStatusResponse, CollectionSpec,
-    CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
-    CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse,
-    DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
+    vector_service_server::VectorService, AliasEntry, ApplyRbacRequest, ApplyRbacResponse,
+    BulkUpsertRequest, BulkUpsertResponse, ClusterStatusRequest, ClusterStatusResponse,
+    CollectionSpec, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
+    CreateCollectionResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
+    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse,
     DescribeCollectionRequest, DescribeCollectionResponse, DistanceMetric as ProtoMetric,
     GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest,
-    HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
-    ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    HealthResponse, ImportChunk, ImportStreamResponse, ListAliasesRequest, ListAliasesResponse,
+    ListCollectionsRequest, ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    MutateCollectionMetaRequest, MutateCollectionMetaResponse,
     PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, RebalanceRequest,
     RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse, RegisterNodeRequest,
     RegisterNodeResponse, QueryRequest, QueryResponse, ReindexCollectionRequest,
@@ -221,14 +223,17 @@ impl VectorService for VectorServiceImpl {
     ) -> Result<Response<DescribeCollectionResponse>, Status> {
         require_collection(&self.rbac, &request, &request.get_ref().name, Privilege::DescribeCollection)?;
         let name = request.into_inner().name;
+        let resolved = self.engine.resolve_alias(&name);
         let cfg = self
             .engine
-            .describe_collection(&name)
+            .describe_collection(&resolved)
             .map_err(map_engine_err)?;
-        let stats = self.engine.stats(&name).map_err(map_engine_err)?;
+        let stats = self.engine.stats(&resolved).map_err(map_engine_err)?;
+        let aliases = self.engine.aliases_for(&resolved);
         Ok(Response::new(DescribeCollectionResponse {
             spec: Some(config_to_spec(cfg)),
             vector_count: stats.vector_count as u64,
+            aliases,
         }))
     }
 
@@ -420,6 +425,77 @@ impl VectorService for VectorServiceImpl {
         let json = serde_json::to_vec(&snap)
             .map_err(|e| Status::internal(format!("snapshot serialize: {e}")))?;
         Ok(Response::new(GetRbacSnapshotResponse { snapshot_json: json }))
+    }
+
+    async fn mutate_collection_meta(
+        &self,
+        request: Request<MutateCollectionMetaRequest>,
+    ) -> Result<Response<MutateCollectionMetaResponse>, Status> {
+        let op: vectordb_storage::MetaOp = serde_json::from_slice(&request.get_ref().op_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))?;
+        // Authorize based on the affected collection. Aliases use their target.
+        let (target, priv_kind) = match &op {
+            vectordb_storage::MetaOp::RenameCollection { old, .. } => {
+                (old.clone(), Privilege::AlterCollection)
+            }
+            vectordb_storage::MetaOp::CreateAlias { collection, .. }
+            | vectordb_storage::MetaOp::AlterAlias { collection, .. } => {
+                (collection.clone(), Privilege::AlterAlias)
+            }
+            vectordb_storage::MetaOp::DropAlias { alias } => {
+                let coll = self
+                    .engine
+                    .describe_alias(alias)
+                    .unwrap_or_else(|_| alias.clone());
+                (coll, Privilege::AlterAlias)
+            }
+            vectordb_storage::MetaOp::AlterCollectionProperties { name, .. } => {
+                (name.clone(), Privilege::AlterCollection)
+            }
+        };
+        require_collection(&self.rbac, &request, &target, priv_kind)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(MutateCollectionMetaResponse {}))
+    }
+
+    async fn list_aliases(
+        &self,
+        request: Request<ListAliasesRequest>,
+    ) -> Result<Response<ListAliasesResponse>, Status> {
+        let req = request.into_inner();
+        let aliases = if req.collection.is_empty() {
+            self.engine.list_aliases()
+        } else {
+            self.engine
+                .aliases_for(&req.collection)
+                .into_iter()
+                .map(|a| (a, req.collection.clone()))
+                .collect()
+        };
+        Ok(Response::new(ListAliasesResponse {
+            aliases: aliases
+                .into_iter()
+                .map(|(alias, collection)| AliasEntry { alias, collection })
+                .collect(),
+        }))
+    }
+
+    async fn describe_alias(
+        &self,
+        request: Request<DescribeAliasRequest>,
+    ) -> Result<Response<DescribeAliasResponse>, Status> {
+        let alias = request.into_inner().alias;
+        let collection = self
+            .engine
+            .describe_alias(&alias)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(DescribeAliasResponse { collection }))
     }
 
     async fn delete(
@@ -891,6 +967,7 @@ fn spec_to_config(spec: CollectionSpec) -> Result<CollectionConfig, Status> {
     } else {
         None
     };
+    cfg.properties = spec.properties.into_iter().collect();
     cfg.validate()
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
     Ok(cfg)
@@ -912,6 +989,7 @@ fn config_to_spec(cfg: CollectionConfig) -> CollectionSpec {
         sparse_enabled: cfg.sparse_enabled,
         bm25_text_field: cfg.bm25_text_field.clone().unwrap_or_default(),
         scalar_quantization: cfg.quantization.as_ref().map(|q| q.scalar).unwrap_or(false),
+        properties: cfg.properties.into_iter().collect(),
     }
 }
 
@@ -970,6 +1048,9 @@ fn map_engine_err(e: EngineError) -> Status {
     match e {
         EngineError::CollectionNotFound(n) => Status::not_found(n),
         EngineError::CollectionExists(n) => Status::already_exists(n),
+        EngineError::AliasNotFound(n) => Status::not_found(format!("alias not found: {n}")),
+        EngineError::AliasExists(n) => Status::already_exists(format!("alias exists: {n}")),
+        EngineError::InvalidMeta(m) => Status::invalid_argument(m),
         EngineError::Core(c) => Status::invalid_argument(c.to_string()),
         other => Status::internal(other.to_string()),
     }

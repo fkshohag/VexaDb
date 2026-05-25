@@ -3,7 +3,7 @@ use std::sync::Arc;
 use vectordb_core::{CollectionConfig, SparseVector};
 use vectordb_rbac::RbacOp;
 use vectordb_replication::RaftNode;
-use vectordb_storage::{BulkPoint, CollectionEngine, WalEntry};
+use vectordb_storage::{BulkPoint, CollectionEngine, MetaOp, WalEntry};
 
 pub struct ReplicatedEngine {
     pub engine: Arc<CollectionEngine>,
@@ -93,5 +93,13 @@ impl ReplicatedEngine {
     pub async fn apply_rbac(&self, op: RbacOp) -> anyhow::Result<()> {
         self.ensure_leader().map_err(anyhow::Error::msg)?;
         self.raft.propose(WalEntry::Rbac { op }).await
+    }
+
+    /// Propose a collection-metadata op via Raft.
+    pub async fn apply_meta(&self, op: MetaOp) -> anyhow::Result<()> {
+        self.ensure_leader().map_err(anyhow::Error::msg)?;
+        // Validate up-front so we don't pollute the WAL with rejected ops.
+        // Storage rechecks on apply too — this is defense in depth.
+        self.raft.propose(WalEntry::Meta { op }).await
     }
 }

@@ -36,6 +36,13 @@ service VectorService {
   // forward-compatible (new privilege names, new fields, new RbacOp variants).
   rpc ApplyRbac(ApplyRbacRequest) returns (ApplyRbacResponse);
   rpc GetRbacSnapshot(GetRbacSnapshotRequest) returns (GetRbacSnapshotResponse);
+
+  // Collection-metadata mutations (rename / aliases / properties).
+  // op_json is the JSON-encoded MetaOp enum (see vectordb_storage::MetaOp).
+  rpc MutateCollectionMeta(MutateCollectionMetaRequest) returns (MutateCollectionMetaResponse);
+  // Read-side helpers.
+  rpc ListAliases(ListAliasesRequest) returns (ListAliasesResponse);
+  rpc DescribeAlias(DescribeAliasRequest) returns (DescribeAliasResponse);
 }
 
 message ApplyRbacRequest {
@@ -48,6 +55,34 @@ message GetRbacSnapshotRequest {}
 
 message GetRbacSnapshotResponse {
   bytes snapshot_json = 1;
+}
+
+message MutateCollectionMetaRequest {
+  bytes op_json = 1;
+}
+
+message MutateCollectionMetaResponse {}
+
+message ListAliasesRequest {
+  // When empty, returns all aliases across all collections.
+  string collection = 1;
+}
+
+message AliasEntry {
+  string alias = 1;
+  string collection = 2;
+}
+
+message ListAliasesResponse {
+  repeated AliasEntry aliases = 1;
+}
+
+message DescribeAliasRequest {
+  string alias = 1;
+}
+
+message DescribeAliasResponse {
+  string collection = 1;
 }
 
 enum DistanceMetric {
@@ -95,6 +130,8 @@ message CollectionSpec {
   bool sparse_enabled = 8;
   string bm25_text_field = 9;
   bool scalar_quantization = 10;
+  // User-defined opaque properties (TTL, mmap.enabled, ...).
+  map<string, string> properties = 11;
 }
 
 message SparseVector {
@@ -127,6 +164,8 @@ message DescribeCollectionRequest {
 message DescribeCollectionResponse {
   CollectionSpec spec = 1;
   uint64 vector_count = 2;
+  // Aliases pointing to this collection.
+  repeated string aliases = 3;
 }
 
 message VectorPoint {

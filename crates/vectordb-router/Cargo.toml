@@ -10,6 +10,7 @@ vectordb-cluster.workspace = true
 vectordb-proto.workspace = true
 vectordb-client.workspace = true
 vectordb-rbac.workspace = true
+vectordb-storage.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

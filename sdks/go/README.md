@@ -25,6 +25,77 @@ Local development:
 replace github.com/vectordb/vectordb/sdks/go => ../sdks/go
 ```
 
+## Collection management (Milvus v2.6 parity)
+
+```go
+// Create with rich options
+schema := entity.NewSchema().
+    WithField(entity.NewField().WithName("id").WithDataType(entity.FieldTypeVarChar).WithIsPrimaryKey(true).WithMaxLength(64)).
+    WithField(entity.NewField().WithName("vec").WithDataType(entity.FieldTypeFloatVector).WithDim(1536))
+
+_ = cli.CreateCollection(ctx, vexaclient.NewCreateCollectionOption("books", schema).
+    WithMetricType(entity.COSINE).
+    WithProperty("collection.ttl.seconds", 86400).
+    WithConsistencyLevel(entity.ClStrong))
+
+// Read-side: option signatures or plain string
+has, _ := cli.HasCollection(ctx, vexaclient.NewHasCollectionOption("books"))
+col, _ := cli.DescribeCollection(ctx, vexaclient.NewDescribeCollectionOption("books"))
+stats, _ := cli.GetCollectionStats(ctx, vexaclient.NewGetCollectionStatsOption("books"))
+
+// Rename + properties
+_ = cli.RenameCollection(ctx, vexaclient.NewRenameCollectionOption("books", "library"))
+_ = cli.AlterCollectionProperties(ctx,
+    vexaclient.NewAlterCollectionPropertiesOption("library").
+        WithProperty("mmap.enabled", true))
+_ = cli.DropCollectionProperties(ctx,
+    vexaclient.NewDropCollectionPropertiesOption("library", "mmap.enabled"))
+
+// Aliases
+_ = cli.CreateAlias(ctx, vexaclient.NewCreateAliasOption("library", "books_v2"))
+_ = cli.AlterAlias(ctx,  vexaclient.NewAlterAliasOption("books_v2", "library_v3"))
+a, _ := cli.DescribeAlias(ctx, vexaclient.NewDescribeAliasOption("books_v2"))
+list, _ := cli.ListAliases(ctx, vexaclient.NewListAliasesOption("")) // all
+_ = cli.DropAlias(ctx, vexaclient.NewDropAliasOption("books_v2"))
+
+// Replica / shard topology
+replicas, _ := cli.DescribeReplica(ctx, vexaclient.NewDescribeReplicaOption("library"))
+_ = a; _ = col; _ = stats; _ = has; _ = list; _ = replicas
+```
+
+## Client management
+
+`New` accepts a `ClientConfig` modeled after Milvus's
+[`ClientConfig`](milvus-sdk-go/v2.6.x/Client/ClientConfig.md):
+
+| Field | Purpose |
+|-------|---------|
+| `Address` | Gateway URL (`host:port`, `http://…`, or `https://…`) — **required** |
+| `Username` / `Password` | Auto-calls `/v1/auth/login` and stores the returned token |
+| `APIKey` | API token (`tokenid:secret`) or legacy superuser key — wins over user/pass |
+| `DBName` | Sent as `x-vexa-db` on every request (multi-DB forward-compat) |
+| `EnableTLSAuth` | Force TLS even with a schemeless `Address` |
+| `InsecureSkipVerify` | Skip cert verification for dev / self-signed |
+| `DisableConn` | Skip the post-construct `/v1/version` probe (tests) |
+| `Timeout` | Per-request HTTP timeout (default 60s) |
+| `HTTPClient` | Override the transport (advanced) |
+| `UserAgent` | Custom `User-Agent` (default `vexadb-go/<version>`) |
+| `RetryRateLimit` | `{MaxRetry, MaxBackoff}` — retries on 429/503/502/504 |
+| `ServerVersion` | Populated by `New` from `/v1/version` |
+
+`GetServerVersion` and the richer `ServerInfo` mirror the Milvus Client API:
+
+```go
+cli, _ := vexaclient.New(ctx, &vexaclient.ClientConfig{Address: "http://127.0.0.1:8080"})
+defer cli.Close(ctx)
+
+ver, _ := cli.GetServerVersion(ctx, vexaclient.NewGetServerVersionOption())
+info, _ := cli.ServerInfo(ctx, vexaclient.NewServerInfoOption())
+fmt.Println(ver, info.GitCommit)
+
+_ = cli.UsingDatabase(ctx, vexaclient.NewUsingDatabaseOption("analytics"))
+```
+
 ## Quick example
 
 ```go

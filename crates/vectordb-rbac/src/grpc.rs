@@ -127,6 +127,12 @@ pub fn method_priv(method: &str) -> Option<MethodPriv> {
         "Query" | "Scroll" => p(Query, false),
         "Delete" => p(Delete, false),
         "Get" => p(Get, false),
+        // Collection-meta RPCs do their own per-op authorization in the
+        // server handler (the affected collection depends on the op kind),
+        // so the global interceptor only checks that the user is
+        // authenticated.
+        "MutateCollectionMeta" => None,
+        "ListAliases" | "DescribeAlias" => p(DescribeCollection, true),
         _ => None,
     }
 }

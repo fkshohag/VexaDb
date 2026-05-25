@@ -66,6 +66,11 @@ pub struct CollectionConfig {
     /// Optional scalar quantization for stored vectors (search still uses f32 in HNSW).
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
+    /// Opaque user-defined properties (Milvus parity: TTL, mmap.enabled, …).
+    /// Always keyed by string. Server stores them but does not interpret most;
+    /// some well-known keys (see `well_known_properties`) influence runtime.
+    #[serde(default)]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +120,7 @@ impl CollectionConfig {
             sparse_enabled: false,
             bm25_text_field: None,
             quantization: None,
+            properties: std::collections::BTreeMap::new(),
         }
     }
 

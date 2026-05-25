@@ -51,6 +51,33 @@ pub enum WalEntry {
     /// Appended last so bincode's variant-index encoding stays
     /// backwards-compatible with WAL files written before RBAC existed.
     Rbac { op: vectordb_rbac::RbacOp },
+    /// Replicated collection-metadata mutations (rename, aliases, properties).
+    /// Appended after `Rbac` for the same compat reason.
+    Meta { op: MetaOp },
+}
+
+/// Replicated metadata operation. Always tied to a single collection (or
+/// alias) and applied through Raft so all replicas converge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MetaOp {
+    /// Rename an existing collection. Fails if `new_name` already exists or
+    /// collides with an existing alias.
+    RenameCollection { old: String, new: String },
+    /// Create a new alias pointing to `collection`. Fails if `alias` exists
+    /// or collides with a collection name.
+    CreateAlias { alias: String, collection: String },
+    /// Drop an alias (no-op if missing).
+    DropAlias { alias: String },
+    /// Reassign an alias to a different collection.
+    AlterAlias { alias: String, collection: String },
+    /// Merge `set` into the collection's properties, then remove `unset` keys.
+    AlterCollectionProperties {
+        name: String,
+        #[serde(default)]
+        set: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        unset: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

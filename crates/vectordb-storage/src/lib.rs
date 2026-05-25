@@ -11,4 +11,4 @@ pub mod wal_compact;
 
 pub use engine::{CollectionEngine, CollectionStats, EngineConfig, EngineError, WalCompactionStats};
 pub use snapshot::{collect_payload_files, SnapshotManager, SnapshotMeta};
-pub use wal::{BulkPoint, WalEntry};
+pub use wal::{BulkPoint, MetaOp, WalEntry};

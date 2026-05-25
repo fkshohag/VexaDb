@@ -87,6 +87,9 @@ struct CreateCollectionBody {
     bm25_text_field: Option<String>,
     #[serde(default)]
     scalar_quantization: Option<bool>,
+    /// Opaque user-defined properties (Milvus parity: TTL, mmap.enabled, …).
+    #[serde(default)]
+    properties: std::collections::HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/live", get(live))
         .route("/ready", get(ready))
         .route("/metrics", get(http_metrics))
+        .route("/v1/version", get(version))
         .route("/v1/collections", get(list_collections).post(create_collection))
         .route(
             "/v1/collections/:name",
@@ -273,9 +277,17 @@ async fn main() -> anyhow::Result<()> {
             post(bulk_upsert).layer(DefaultBodyLimit::max(WRITE_BODY_LIMIT)),
         )
         .route("/v1/collections/:name/reindex", post(reindex_collection))
+        .route("/v1/collections/:name/rename", post(rename_collection))
+        .route("/v1/collections/:name/properties", patch(alter_properties))
+        .route("/v1/collections/:name/aliases", get(list_aliases_for))
         .route("/v1/collections/:name/search", post(search))
         .route("/v1/collections/:name/query", post(query_points))
         .route("/v1/collections/:name/stats", get(collection_stats))
+        .route("/v1/aliases", get(list_aliases).post(create_alias))
+        .route(
+            "/v1/aliases/:alias",
+            get(describe_alias).put(alter_alias).delete(drop_alias),
+        )
         .route("/v1/admin/compact-wal", post(compact_wal))
         .route("/v1/admin/rebalance", post(trigger_rebalance).get(rebalance_status))
         .route("/v1/admin/cluster", get(cluster_status))
@@ -356,6 +368,27 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthBody>, Statu
     Ok(Json(HealthBody { status }))
 }
 
+#[derive(Serialize)]
+struct VersionBody {
+    /// Semantic version of the gateway crate (matches the cluster).
+    version: &'static str,
+    /// Free-form server identifier — useful when multiple VexaDb clusters
+    /// share a client codebase. Set via `VECTORDB_SERVER_NAME` env.
+    server: String,
+    /// Optional git commit, populated at build time when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_commit: Option<&'static str>,
+}
+
+/// `GET /v1/version` — used by SDKs for connection probes (Milvus parity).
+async fn version() -> Json<VersionBody> {
+    Json(VersionBody {
+        version: env!("CARGO_PKG_VERSION"),
+        server: std::env::var("VECTORDB_SERVER_NAME").unwrap_or_else(|_| "vexadb".to_string()),
+        git_commit: option_env!("VERGEN_GIT_SHA"),
+    })
+}
+
 async fn list_collections(State(state): State<AppState>) -> Result<Json<Vec<String>>, StatusCode> {
     let mut client = state.client.lock().await;
     client
@@ -397,6 +430,7 @@ async fn create_collection(
     spec.sparse_enabled = body.sparse_enabled.unwrap_or(false);
     spec.bm25_text_field = body.bm25_text_field.unwrap_or_default();
     spec.scalar_quantization = body.scalar_quantization.unwrap_or(false);
+    spec.properties = body.properties;
 
     let mut client = state.client.lock().await;
     client
@@ -411,14 +445,46 @@ async fn describe_collection(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let mut client = state.client.lock().await;
-    let (spec, count) = client
-        .describe_collection(&name)
+    let (spec, count, aliases) = client
+        .describe_collection_full(&name)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
     Ok(Json(serde_json::json!({
-        "spec": format!("{spec:?}"),
+        "name": spec.name,
+        "dimension": spec.dimension,
+        "metric": metric_to_string(spec.metric),
+        "m": spec.m,
+        "ef_construction": spec.ef_construction,
+        "ef_search": spec.ef_search,
+        "payload_indexes": spec.payload_indexes.iter().map(|p| serde_json::json!({
+            "field": p.field,
+            "kind": index_kind_to_string(p.kind),
+        })).collect::<Vec<_>>(),
+        "sparse_enabled": spec.sparse_enabled,
+        "bm25_text_field": spec.bm25_text_field,
+        "scalar_quantization": spec.scalar_quantization,
+        "properties": spec.properties,
+        "aliases": aliases,
         "vector_count": count,
     })))
+}
+
+fn metric_to_string(m: i32) -> &'static str {
+    match DistanceMetric::try_from(m).unwrap_or(DistanceMetric::Unspecified) {
+        DistanceMetric::Cosine => "cosine",
+        DistanceMetric::Euclidean => "euclidean",
+        DistanceMetric::DotProduct => "dot_product",
+        DistanceMetric::Unspecified => "unspecified",
+    }
+}
+
+fn index_kind_to_string(k: i32) -> &'static str {
+    match PayloadIndexKind::try_from(k).unwrap_or(PayloadIndexKind::Unspecified) {
+        PayloadIndexKind::Keyword => "keyword",
+        PayloadIndexKind::Numeric => "numeric",
+        PayloadIndexKind::Bool => "bool",
+        PayloadIndexKind::Unspecified => "unspecified",
+    }
 }
 
 async fn delete_collection(
@@ -431,6 +497,172 @@ async fn delete_collection(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- Collection meta: rename, aliases, properties (Milvus parity) -------
+
+#[derive(Deserialize)]
+struct RenameCollectionBody {
+    new_name: String,
+}
+
+async fn rename_collection(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<RenameCollectionBody>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({
+        "RenameCollection": { "old": name, "new": body.new_name }
+    });
+    forward_meta_op(&state, op).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AlterPropertiesBody {
+    /// Keys to set / overwrite.
+    #[serde(default)]
+    set: std::collections::BTreeMap<String, String>,
+    /// Keys to remove.
+    #[serde(default)]
+    unset: Vec<String>,
+}
+
+async fn alter_properties(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<AlterPropertiesBody>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({
+        "AlterCollectionProperties": {
+            "name": name,
+            "set": body.set,
+            "unset": body.unset,
+        }
+    });
+    forward_meta_op(&state, op).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct CreateAliasBody {
+    alias: String,
+    collection: String,
+}
+
+async fn create_alias(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAliasBody>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({
+        "CreateAlias": { "alias": body.alias, "collection": body.collection }
+    });
+    forward_meta_op(&state, op).await?;
+    Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+struct AlterAliasBody {
+    collection: String,
+}
+
+async fn alter_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    Json(body): Json<AlterAliasBody>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({
+        "AlterAlias": { "alias": alias, "collection": body.collection }
+    });
+    forward_meta_op(&state, op).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn drop_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({ "DropAlias": { "alias": alias } });
+    forward_meta_op(&state, op).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct AliasRow {
+    alias: String,
+    collection: String,
+}
+
+async fn list_aliases(State(state): State<AppState>) -> Result<Json<Vec<AliasRow>>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let rows = client
+        .list_aliases("")
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(alias, collection)| AliasRow { alias, collection })
+            .collect(),
+    ))
+}
+
+async fn list_aliases_for(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let rows = client
+        .list_aliases(&name)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(rows.into_iter().map(|(a, _)| a).collect()))
+}
+
+#[derive(Serialize)]
+struct AliasDetail {
+    alias: String,
+    collection: String,
+}
+
+async fn describe_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+) -> Result<Json<AliasDetail>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let collection = client
+        .describe_alias(&alias)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(Json(AliasDetail { alias, collection }))
+}
+
+async fn forward_meta_op(state: &AppState, op: serde_json::Value) -> Result<(), StatusCode> {
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .mutate_collection_meta(bytes)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            // Map a few well-known gRPC errors back to HTTP statuses.
+            if msg.contains("alias not found") || msg.contains("collection not found") {
+                StatusCode::NOT_FOUND
+            } else if msg.contains("alias exists")
+                || msg.contains("collection exists")
+                || msg.contains("AlreadyExists")
+            {
+                StatusCode::CONFLICT
+            } else if msg.contains("invalid")
+                || msg.contains("InvalidArgument")
+                || msg.contains("collides")
+            {
+                StatusCode::BAD_REQUEST
+            } else if msg.contains("PermissionDenied") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_GATEWAY
+            }
+        })
 }
 
 async fn upsert(

@@ -15,7 +15,7 @@ use vectordb_rbac::{RbacError, RbacOp, RbacSnapshot, RbacState};
 
 use crate::payload_index::PayloadIndexes;
 use crate::snapshot::{SnapshotManager, SnapshotMeta};
-use crate::wal::{BulkPoint, WalEntry, WriteAheadLog};
+use crate::wal::{BulkPoint, MetaOp, WalEntry, WriteAheadLog};
 use crate::wal_compact::export_state_to_wal;
 
 const RBAC_SNAPSHOT_KEY: &[u8] = b"__rbac_snapshot__";
@@ -38,6 +38,12 @@ pub enum EngineError {
     InvalidPayload(String),
     #[error("rbac error: {0}")]
     Rbac(#[from] RbacError),
+    #[error("alias exists: {0}")]
+    AliasExists(String),
+    #[error("alias not found: {0}")]
+    AliasNotFound(String),
+    #[error("invalid meta op: {0}")]
+    InvalidMeta(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -85,6 +91,9 @@ pub struct CollectionEngine {
     /// snapshot in `meta_db` and replicated through the same WAL/Raft as
     /// collection operations via [`WalEntry::Rbac`].
     rbac: RwLock<RbacState>,
+    /// alias -> collection. Persisted under `alias:<name>` keys in `meta_db`
+    /// and replicated through `WalEntry::Meta` (Milvus-parity).
+    aliases: RwLock<HashMap<String, String>>,
 }
 
 pub(crate) const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
@@ -109,11 +118,13 @@ impl CollectionEngine {
             meta_db: RwLock::new(meta_db),
             wal: RwLock::new(wal),
             rbac: RwLock::new(RbacState::new()),
+            aliases: RwLock::new(HashMap::new()),
         };
 
         engine.load_rbac_from_meta()?;
         engine.replay_wal()?;
         engine.load_collections_from_meta()?;
+        engine.load_aliases_from_meta()?;
         Ok(engine)
     }
 
@@ -167,6 +178,231 @@ impl CollectionEngine {
         Ok(())
     }
 
+    // ---- Aliases / rename / properties (Milvus parity) --------------------
+
+    fn load_aliases_from_meta(&self) -> Result<()> {
+        let meta = self.meta_db.read();
+        let iter = meta.iterator(rocksdb::IteratorMode::Start);
+        let mut aliases = self.aliases.write();
+        for item in iter {
+            let (key, value) = item.map_err(|e| EngineError::Rocks(e.to_string()))?;
+            let key_str = String::from_utf8_lossy(&key);
+            if !key_str.starts_with("alias:") {
+                continue;
+            }
+            let alias = key_str.trim_start_matches("alias:").to_string();
+            let coll = String::from_utf8_lossy(&value).to_string();
+            aliases.insert(alias, coll);
+        }
+        Ok(())
+    }
+
+    fn persist_alias(&self, alias: &str, collection: &str) -> Result<()> {
+        let key = format!("alias:{alias}");
+        self.meta_db
+            .read()
+            .put(key, collection.as_bytes())
+            .map_err(|e| EngineError::Rocks(e.to_string()))
+    }
+
+    fn delete_alias_meta(&self, alias: &str) -> Result<()> {
+        let key = format!("alias:{alias}");
+        self.meta_db
+            .read()
+            .delete(key)
+            .map_err(|e| EngineError::Rocks(e.to_string()))
+    }
+
+    /// Apply a metadata op locally (WAL + state). Used by Raft followers
+    /// on commit. Leaders should propose `WalEntry::Meta` through Raft.
+    pub fn commit_meta(&self, op: MetaOp) -> Result<()> {
+        // Validate before WAL append to keep WAL clean.
+        self.validate_meta(&op)?;
+        let entry = WalEntry::Meta { op };
+        self.commit_entry(&entry)
+    }
+
+    fn validate_meta(&self, op: &MetaOp) -> Result<()> {
+        let collections = self.collections.read();
+        let aliases = self.aliases.read();
+        match op {
+            MetaOp::RenameCollection { old, new } => {
+                if !collections.contains_key(old) {
+                    return Err(EngineError::CollectionNotFound(old.clone()));
+                }
+                if old == new {
+                    return Ok(());
+                }
+                if collections.contains_key(new) {
+                    return Err(EngineError::CollectionExists(new.clone()));
+                }
+                if aliases.contains_key(new) {
+                    return Err(EngineError::InvalidMeta(format!(
+                        "new name {new} collides with alias"
+                    )));
+                }
+            }
+            MetaOp::CreateAlias { alias, collection } => {
+                if !collections.contains_key(collection) {
+                    return Err(EngineError::CollectionNotFound(collection.clone()));
+                }
+                if aliases.contains_key(alias) {
+                    return Err(EngineError::AliasExists(alias.clone()));
+                }
+                if collections.contains_key(alias) {
+                    return Err(EngineError::InvalidMeta(format!(
+                        "alias {alias} collides with existing collection"
+                    )));
+                }
+            }
+            MetaOp::AlterAlias { alias, collection } => {
+                if !collections.contains_key(collection) {
+                    return Err(EngineError::CollectionNotFound(collection.clone()));
+                }
+                if !aliases.contains_key(alias) {
+                    return Err(EngineError::AliasNotFound(alias.clone()));
+                }
+            }
+            MetaOp::DropAlias { alias: _ } => { /* idempotent */ }
+            MetaOp::AlterCollectionProperties { name, .. } => {
+                if !collections.contains_key(name) {
+                    return Err(EngineError::CollectionNotFound(name.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_meta(&self, op: &MetaOp) -> Result<()> {
+        match op {
+            MetaOp::RenameCollection { old, new } => self.apply_rename(old, new),
+            MetaOp::CreateAlias { alias, collection }
+            | MetaOp::AlterAlias { alias, collection } => {
+                self.persist_alias(alias, collection)?;
+                self.aliases
+                    .write()
+                    .insert(alias.clone(), collection.clone());
+                Ok(())
+            }
+            MetaOp::DropAlias { alias } => {
+                self.delete_alias_meta(alias)?;
+                self.aliases.write().remove(alias);
+                Ok(())
+            }
+            MetaOp::AlterCollectionProperties { name, set, unset } => {
+                self.apply_alter_properties(name, set, unset)
+            }
+        }
+    }
+
+    fn apply_rename(&self, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let mut collections = self.collections.write();
+        let mut state = collections
+            .remove(old)
+            .ok_or_else(|| EngineError::CollectionNotFound(old.to_string()))?;
+        state.config.name = new.to_string();
+        let json =
+            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        let meta = self.meta_db.read();
+        meta.delete(format!("collection:{old}"))
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        meta.put(format!("collection:{new}"), json)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        drop(meta);
+        // Rewrite any aliases that pointed to `old`.
+        let mut aliases = self.aliases.write();
+        for v in aliases.values_mut() {
+            if v == old {
+                *v = new.to_string();
+            }
+        }
+        for (alias, target) in aliases.iter() {
+            if target == new {
+                self.persist_alias(alias, new)?;
+            }
+        }
+        collections.insert(new.to_string(), state);
+        Ok(())
+    }
+
+    fn apply_alter_properties(
+        &self,
+        name: &str,
+        set: &std::collections::BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<()> {
+        let mut collections = self.collections.write();
+        let state = collections
+            .get_mut(name)
+            .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))?;
+        for (k, v) in set {
+            state.config.properties.insert(k.clone(), v.clone());
+        }
+        for k in unset {
+            state.config.properties.remove(k);
+        }
+        let json =
+            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(format!("collection:{name}"), json)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Resolve an alias to its target collection name. Returns the input
+    /// unchanged when it's already a collection.
+    pub fn resolve_alias(&self, name: &str) -> String {
+        if self.collections.read().contains_key(name) {
+            return name.to_string();
+        }
+        if let Some(target) = self.aliases.read().get(name).cloned() {
+            return target;
+        }
+        name.to_string()
+    }
+
+    /// All aliases as `(alias, collection)` pairs.
+    pub fn list_aliases(&self) -> Vec<(String, String)> {
+        self.aliases
+            .read()
+            .iter()
+            .map(|(a, c)| (a.clone(), c.clone()))
+            .collect()
+    }
+
+    /// Aliases pointing to `collection`.
+    pub fn aliases_for(&self, collection: &str) -> Vec<String> {
+        self.aliases
+            .read()
+            .iter()
+            .filter(|(_, target)| target.as_str() == collection)
+            .map(|(a, _)| a.clone())
+            .collect()
+    }
+
+    /// Resolve a single alias to its collection. Returns `Err(AliasNotFound)`.
+    pub fn describe_alias(&self, alias: &str) -> Result<String> {
+        self.aliases
+            .read()
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| EngineError::AliasNotFound(alias.to_string()))
+    }
+
+    /// Returns the properties map for `name` (after alias resolution).
+    pub fn properties(&self, name: &str) -> Result<std::collections::BTreeMap<String, String>> {
+        let resolved = self.resolve_alias(name);
+        let collections = self.collections.read();
+        collections
+            .get(&resolved)
+            .map(|s| s.config.properties.clone())
+            .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.config.data_dir
     }
@@ -204,8 +440,10 @@ impl CollectionEngine {
             WriteAheadLog::open_with(wal_path, self.config.sync_wal)?;
 
         self.collections.write().clear();
+        self.aliases.write().clear();
         self.replay_wal()?;
         self.load_collections_from_meta()?;
+        self.load_aliases_from_meta()?;
         Ok(())
     }
 
@@ -383,6 +621,7 @@ impl CollectionEngine {
             }
             WalEntry::Checkpoint { .. } => Ok(()),
             WalEntry::Rbac { op } => self.apply_rbac(op),
+            WalEntry::Meta { op } => self.apply_meta(op),
         }
     }
 

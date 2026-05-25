@@ -6,15 +6,17 @@ use futures::future::join_all;
 use vectordb_cluster::{merge_top_k, ClusterConfig};
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest,
-    BulkUpsertResponse, CollectionSpec, ClusterStatusRequest, ClusterStatusResponse,
-    ClusterNodeStatus, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
-    CreateCollectionResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
-    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeCollectionRequest,
-    DescribeCollectionResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest,
-    GetResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
-    ListCollectionsRequest, ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    vector_service_server::VectorService, AliasEntry, ApplyRbacRequest, ApplyRbacResponse,
+    BulkUpsertRequest, BulkUpsertResponse, CollectionSpec, ClusterStatusRequest,
+    ClusterStatusResponse, ClusterNodeStatus, CompactWalRequest, CompactWalResponse,
+    CreateCollectionRequest, CreateCollectionResponse, CreateSnapshotRequest,
+    CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
+    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest,
+    DescribeAliasResponse, DescribeCollectionRequest, DescribeCollectionResponse,
+    GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest,
+    HealthResponse, ImportChunk, ImportStreamResponse, ListAliasesRequest, ListAliasesResponse,
+    ListCollectionsRequest, ListCollectionsResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, MutateCollectionMetaRequest, MutateCollectionMetaResponse,
     RebalanceCollectionReport, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
     RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse,
     QueryRequest, QueryResponse, ReindexCollectionRequest, ReindexCollectionResponse,
@@ -292,14 +294,18 @@ impl VectorService for RouterService {
         let mut ok_shards = 0usize;
         let mut failures = 0usize;
         let mut last_err: Option<String> = None;
+        let mut alias_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (shard, mut client) in clients {
-            match client.describe_collection(&name).await {
-                Ok((s, count)) => {
+            match client.describe_collection_full(&name).await {
+                Ok((s, count, aliases)) => {
                     ok_shards += 1;
                     if spec.is_none() {
                         spec = Some(s);
                     }
                     total += count;
+                    for a in aliases {
+                        alias_set.insert(a);
+                    }
                 }
                 Err(e) => {
                     failures += 1;
@@ -330,6 +336,7 @@ impl VectorService for RouterService {
         Ok(Response::new(DescribeCollectionResponse {
             spec,
             vector_count: total,
+            aliases: alias_set.into_iter().collect(),
         }))
     }
 
@@ -668,6 +675,92 @@ impl VectorService for RouterService {
             }
         }
         Err(Status::unavailable("no shard returned an RBAC snapshot"))
+    }
+
+    async fn mutate_collection_meta(
+        &self,
+        request: Request<MutateCollectionMetaRequest>,
+    ) -> Result<Response<MutateCollectionMetaResponse>, Status> {
+        // Authorize at the router before fan-out so we fail fast and don't
+        // partially apply on shards. Per-handler check on each data node
+        // is still in place as defense-in-depth.
+        let op: vectordb_storage::MetaOp = serde_json::from_slice(&request.get_ref().op_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))?;
+        let (target, priv_kind) = match &op {
+            vectordb_storage::MetaOp::RenameCollection { old, .. } => {
+                (old.clone(), Privilege::AlterCollection)
+            }
+            vectordb_storage::MetaOp::CreateAlias { collection, .. }
+            | vectordb_storage::MetaOp::AlterAlias { collection, .. } => {
+                (collection.clone(), Privilege::AlterAlias)
+            }
+            vectordb_storage::MetaOp::DropAlias { alias } => {
+                (alias.clone(), Privilege::AlterAlias)
+            }
+            vectordb_storage::MetaOp::AlterCollectionProperties { name, .. } => {
+                (name.clone(), Privilege::AlterCollection)
+            }
+        };
+        require_collection(&self.rbac, &request, &target, priv_kind)?;
+        let req = request.into_inner();
+        // Fan-out to all shards: meta is Raft-replicated but each shard's
+        // engine has its own meta-DB (collection list lives per shard).
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.mutate_collection_meta(req.op_json.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err.unwrap_or_else(|| {
+                Status::unavailable("no shard accepted mutate_collection_meta")
+            }));
+        }
+        Ok(Response::new(MutateCollectionMetaResponse {}))
+    }
+
+    async fn list_aliases(
+        &self,
+        request: Request<ListAliasesRequest>,
+    ) -> Result<Response<ListAliasesResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut merged: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (_, mut client) in clients {
+            if let Ok(rows) = client.list_aliases(&collection).await {
+                for (alias, coll) in rows {
+                    merged.entry(alias).or_insert(coll);
+                }
+            }
+        }
+        Ok(Response::new(ListAliasesResponse {
+            aliases: merged
+                .into_iter()
+                .map(|(alias, collection)| AliasEntry { alias, collection })
+                .collect(),
+        }))
+    }
+
+    async fn describe_alias(
+        &self,
+        request: Request<DescribeAliasRequest>,
+    ) -> Result<Response<DescribeAliasResponse>, Status> {
+        let alias = request.into_inner().alias;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut last_err: Option<String> = None;
+        for (_, mut client) in clients {
+            match client.describe_alias(&alias).await {
+                Ok(coll) => return Ok(Response::new(DescribeAliasResponse { collection: coll })),
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        Err(Status::not_found(format!(
+            "alias not found: {alias} ({})",
+            last_err.unwrap_or_else(|| "no shards reachable".into())
+        )))
     }
 
     async fn delete(

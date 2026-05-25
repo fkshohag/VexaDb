@@ -45,6 +45,10 @@ pub enum Privilege {
     Rebalance,
     CompactWal,
     ClusterStatus,
+    /// Rename a collection or set/drop collection properties (Milvus parity).
+    AlterCollection,
+    /// Create/drop/reassign collection aliases (Milvus parity).
+    AlterAlias,
     // Data plane
     Search,
     Query,
@@ -68,6 +72,8 @@ impl Privilege {
         Privilege::Rebalance,
         Privilege::CompactWal,
         Privilege::ClusterStatus,
+        Privilege::AlterCollection,
+        Privilege::AlterAlias,
         Privilege::Search,
         Privilege::Query,
         Privilege::Insert,
@@ -89,6 +95,8 @@ impl Privilege {
             Privilege::Rebalance => "Rebalance",
             Privilege::CompactWal => "CompactWal",
             Privilege::ClusterStatus => "ClusterStatus",
+            Privilege::AlterCollection => "AlterCollection",
+            Privilege::AlterAlias => "AlterAlias",
             Privilege::Search => "Search",
             Privilege::Query => "Query",
             Privilege::Insert => "Insert",
@@ -115,7 +123,9 @@ impl Privilege {
             | Privilege::Get
             | Privilege::DescribeCollection
             | Privilege::CollectionStats
-            | Privilege::Reindex => ObjectType::Collection,
+            | Privilege::Reindex
+            | Privilege::AlterCollection
+            | Privilege::AlterAlias => ObjectType::Collection,
             _ => ObjectType::Global,
         }
     }
