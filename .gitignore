@@ -169,3 +169,7 @@ $RECYCLE.BIN/
 graphify-out/
 agent-transcripts/
 .graphify_python
+
+# Go SDK
+# =============================================================================
+sdks/go/milvus-sdk-go/

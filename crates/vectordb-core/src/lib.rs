@@ -5,6 +5,7 @@ pub mod collection;
 pub mod distance;
 pub mod error;
 pub mod filter;
+pub mod filter_expr;
 pub mod fusion;
 pub mod hnsw;
 pub mod quantize;
@@ -20,6 +21,8 @@ pub use collection::{
 pub use distance::Distance;
 pub use error::{Error, Result};
 pub use filter::{Condition, FieldCondition, FieldOp, Filter};
+pub use filter_expr::{parse_filter_expr, parse_filter_input, FilterParseError};
+pub use types::OutputOptions;
 pub use fusion::{rrf_fusion, weighted_fusion};
 pub use hnsw::{HnswConfig, HnswIndex};
 pub use quantize::ScalarQuantizer;

@@ -1,13 +1,15 @@
+mod rbac;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
-    extract::{DefaultBodyLimit, Path, Request, State},
-    http::{HeaderMap, StatusCode},
-    middleware::{from_fn_with_state, Next},
-    response::Response,
-    routing::{delete, get, post},
+    extract::{DefaultBodyLimit, Path, State},
+    http::StatusCode,
+    middleware::from_fn_with_state,
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use clap::Parser;
@@ -18,11 +20,12 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
-use vectordb_auth::{AuthConfig, AuthError, HEADER_API_KEY, HEADER_AUTHORIZATION};
 use vectordb_client::{cosine_collection, VectorDbClient};
 use vectordb_proto::vectordb::v1::{
     DistanceMetric, PayloadFieldIndex, PayloadIndexKind, VectorPoint,
 };
+
+pub use rbac::RbacContext;
 
 #[derive(Parser, Debug)]
 #[command(name = "vectordb-gateway", about = "HTTP/JSON gateway for VectorDB")]
@@ -33,9 +36,19 @@ struct Cli {
     #[arg(long, env = "VECTORDB_HTTP", default_value = "0.0.0.0:8080")]
     listen: String,
 
-    /// Comma-separated API keys (enables auth when set).
+    /// Comma-separated legacy API keys. Each key is treated as a superuser
+    /// credential (backward compat with the pre-RBAC gateway).
     #[arg(long, env = "VECTORDB_API_KEYS")]
     api_keys: Option<String>,
+
+    /// Bootstrap a `root` superuser with this password if no users exist.
+    /// RBAC stays enabled across restarts once any user is present.
+    #[arg(long, env = "VECTORDB_ROOT_PASSWORD")]
+    root_password: Option<String>,
+
+    /// How often to refresh the RBAC snapshot from the cluster.
+    #[arg(long, env = "VECTORDB_RBAC_REFRESH_SECS", default_value = "15")]
+    rbac_refresh_secs: u64,
 
     #[arg(long, env = "VECTORDB_TLS_CERT")]
     tls_cert: Option<PathBuf>,
@@ -50,9 +63,9 @@ lazy_static! {
 }
 
 #[derive(Clone)]
-struct AppState {
-    client: Arc<Mutex<VectorDbClient>>,
-    auth: Arc<AuthConfig>,
+pub struct AppState {
+    pub client: Arc<Mutex<VectorDbClient>>,
+    pub rbac: RbacContext,
 }
 
 #[derive(Serialize)]
@@ -115,6 +128,41 @@ struct SearchBody {
     search_mode: Option<String>,
     #[serde(default)]
     hybrid_alpha: Option<f32>,
+    /// Top-level payload keys to return. Empty + with_payload=true → all keys.
+    #[serde(default)]
+    output_fields: Vec<String>,
+    #[serde(default)]
+    with_payload: bool,
+    #[serde(default)]
+    with_vector: bool,
+}
+
+/// Filter-only retrieval body (Milvus-style `Query`).
+#[derive(Deserialize)]
+struct QueryBody {
+    /// JSON object **or** string expression (`category == 'books'`).
+    #[serde(default)]
+    filter: Value,
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default = "default_query_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default)]
+    output_fields: Vec<String>,
+    #[serde(default = "default_with_payload")]
+    with_payload: bool,
+    #[serde(default)]
+    with_vector: bool,
+}
+
+fn default_query_limit() -> u32 {
+    100
+}
+
+fn default_with_payload() -> bool {
+    true
 }
 
 #[derive(Deserialize, Default)]
@@ -133,6 +181,10 @@ fn default_top_k() -> u32 {
 struct SearchHit {
     id: String,
     score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vector: Option<Vec<f32>>,
 }
 
 #[derive(Deserialize)]
@@ -160,20 +212,40 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut auth = AuthConfig::default();
-    if let Some(keys) = &cli.api_keys {
-        auth.keys = keys
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        auth.required = true;
+
+    let legacy_keys: Vec<String> = cli
+        .api_keys
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let grpc_api_key = legacy_keys.first().cloned();
+    let grpc_client = Arc::new(Mutex::new(
+        VectorDbClient::connect_with(&cli.grpc, grpc_api_key).await?,
+    ));
+
+    let rbac_enabled = !legacy_keys.is_empty() || cli.root_password.is_some();
+    let mut rbac_ctx = RbacContext::new(grpc_client.clone(), legacy_keys.clone(), rbac_enabled);
+
+    if let Err(e) = rbac::bootstrap(&rbac_ctx, cli.root_password.as_deref()).await {
+        tracing::warn!(error = %e, "RBAC bootstrap failed (will retry on next mutation)");
     }
-    let api_key = auth.keys.first().cloned();
-    let client = VectorDbClient::connect_with(&cli.grpc, api_key).await?;
+    // Re-evaluate: if the cluster already has users, auto-enable RBAC even if
+    // no env var was set (operator restored from a snapshot, for example).
+    if !rbac_ctx.enabled && !rbac_ctx.snapshot().users.is_empty() {
+        rbac_ctx.enabled = true;
+    }
+    let final_enabled = rbac_ctx.enabled;
+    rbac::start_refresh_loop(rbac_ctx.clone(), Duration::from_secs(cli.rbac_refresh_secs.max(1)));
+
     let state = AppState {
-        client: Arc::new(Mutex::new(client)),
-        auth: Arc::new(auth),
+        client: grpc_client,
+        rbac: rbac_ctx,
     };
 
     // axum's default body limit is 2MB which is too small for real bulk
@@ -202,6 +274,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/collections/:name/reindex", post(reindex_collection))
         .route("/v1/collections/:name/search", post(search))
+        .route("/v1/collections/:name/query", post(query_points))
+        .route("/v1/collections/:name/stats", get(collection_stats))
         .route("/v1/admin/compact-wal", post(compact_wal))
         .route("/v1/admin/rebalance", post(trigger_rebalance).get(rebalance_status))
         .route("/v1/admin/cluster", get(cluster_status))
@@ -209,7 +283,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/collections/:name/points/:id", get(get_point))
         .route("/v1/snapshots", get(list_snapshots).post(create_snapshot))
         .route("/v1/snapshots/:id", delete(delete_snapshot))
-        .layer(from_fn_with_state(state.clone(), auth_middleware))
+        // ---- Auth & RBAC management ----
+        .route("/v1/auth/login", post(rbac::login))
+        .route("/v1/auth/tokens", post(rbac::create_token))
+        .route("/v1/auth/tokens/:id", delete(rbac::revoke_token))
+        .route("/v1/users", post(rbac::create_user).get(rbac::list_users))
+        .route("/v1/users/:name", get(rbac::describe_user).delete(rbac::drop_user))
+        .route("/v1/users/:name/password", patch(rbac::update_password))
+        .route("/v1/users/:name/roles/:role", post(rbac::grant_role).delete(rbac::revoke_role))
+        .route("/v1/roles", post(rbac::create_role).get(rbac::list_roles))
+        .route("/v1/roles/:name", get(rbac::describe_role).delete(rbac::drop_role))
+        .route("/v1/roles/:role/grants", post(rbac::grant_privilege).delete(rbac::revoke_privilege))
+        .route("/v1/privilege-groups", post(rbac::create_privilege_group).get(rbac::list_privilege_groups))
+        .route("/v1/privilege-groups/:name", delete(rbac::drop_privilege_group).patch(rbac::patch_privilege_group))
+        .route("/v1/admin/rbac/backup", post(rbac::backup_rbac))
+        .route("/v1/admin/rbac/restore", post(rbac::restore_rbac))
+        .layer(from_fn_with_state(state.clone(), rbac::rbac_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -217,7 +306,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         http = %cli.listen,
         grpc = %cli.grpc,
-        auth = cli.api_keys.is_some(),
+        rbac = final_enabled,
+        legacy_keys = !legacy_keys.is_empty(),
         tls = cli.tls_cert.is_some(),
         "vectordb-gateway listening"
     );
@@ -236,29 +326,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn auth_middleware(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    request: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let path = request.uri().path();
-    if matches!(path, "/health" | "/live" | "/ready" | "/metrics") {
-        return Ok(next.run(request).await);
-    }
-    HTTP_REQUESTS.inc();
-    let authorization = headers
-        .get(HEADER_AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let api_key = headers.get(HEADER_API_KEY).and_then(|v| v.to_str().ok());
-    state
-        .auth
-        .check_headers(authorization, api_key)
-        .map_err(|e| match e {
-            AuthError::MissingKey | AuthError::InvalidKey => StatusCode::UNAUTHORIZED,
-        })?;
-    Ok(next.run(request).await)
-}
 
 async fn live() -> StatusCode {
     StatusCode::OK
@@ -380,16 +447,34 @@ async fn upsert(
     Ok(Json(serde_json::json!({ "upserted": n })))
 }
 
+fn filter_value_to_json(filter: &Value) -> Result<String, StatusCode> {
+    if filter.is_null() {
+        return Ok(String::new());
+    }
+    if let Some(expr) = filter.as_str() {
+        let parsed = vectordb_core::parse_filter_input(expr)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        return match parsed {
+            Some(f) => Ok(serde_json::to_string(&f).unwrap_or_default()),
+            None => Ok(String::new()),
+        };
+    }
+    Ok(filter.to_string())
+}
+
+fn payload_bytes_to_value(bytes: &[u8]) -> Option<Value> {
+    if bytes.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(bytes).ok()
+}
+
 async fn search(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(body): Json<SearchBody>,
 ) -> Result<Json<Vec<SearchHit>>, StatusCode> {
-    let filter_json = if body.filter.is_null() {
-        String::new()
-    } else {
-        body.filter.to_string()
-    };
+    let filter_json = filter_value_to_json(&body.filter)?;
     let sparse_query = body.sparse_query.map(|s| vectordb_proto::vectordb::v1::SparseVector {
         indices: s.indices,
         values: s.values,
@@ -408,6 +493,9 @@ async fn search(
             body.text_query,
             search_mode,
             hybrid_alpha,
+            body.output_fields,
+            body.with_payload,
+            body.with_vector,
         )
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -416,9 +504,85 @@ async fn search(
             .map(|h| SearchHit {
                 id: h.id,
                 score: h.score,
+                payload: if body.with_payload {
+                    payload_bytes_to_value(&h.payload)
+                } else {
+                    None
+                },
+                vector: if body.with_vector && !h.vector.is_empty() {
+                    Some(h.vector)
+                } else {
+                    None
+                },
             })
             .collect(),
     ))
+}
+
+async fn query_points(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<QueryBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let filter_json = filter_value_to_json(&body.filter)?;
+    let mut client = state.client.lock().await;
+    let resp = client
+        .query(
+            &name,
+            filter_json,
+            body.ids,
+            body.limit,
+            body.offset,
+            body.output_fields,
+            body.with_payload,
+            body.with_vector,
+        )
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let points: Vec<Value> = resp
+        .points
+        .into_iter()
+        .map(|p| {
+            let payload = payload_bytes_to_value(&p.payload);
+            serde_json::json!({
+                "id": p.id,
+                "values": if body.with_vector && !p.values.is_empty() { Some(p.values) } else { None },
+                "payload": payload,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "points": points })))
+}
+
+async fn collection_stats(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let s = client.stats(&name).await.map_err(|e| {
+        if e.to_string().contains("not found") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    })?;
+    let metric = match vectordb_proto::vectordb::v1::DistanceMetric::try_from(s.metric) {
+        Ok(vectordb_proto::vectordb::v1::DistanceMetric::Cosine)
+        | Ok(vectordb_proto::vectordb::v1::DistanceMetric::Unspecified) => "cosine",
+        Ok(vectordb_proto::vectordb::v1::DistanceMetric::Euclidean) => "euclidean",
+        Ok(vectordb_proto::vectordb::v1::DistanceMetric::DotProduct) => "dot",
+        _ => "cosine",
+    };
+    Ok(Json(serde_json::json!({
+        "name": s.name,
+        "vector_count": s.vector_count,
+        "dimension": s.dimension,
+        "metric": metric,
+        "sparse_enabled": s.sparse_enabled,
+        "bm25_text_field": s.bm25_text_field,
+        "payload_index_count": s.payload_index_count,
+        "scalar_quantization": s.scalar_quantization,
+    })))
 }
 
 fn points_from_body(points: Vec<PointBody>) -> Vec<VectorPoint> {

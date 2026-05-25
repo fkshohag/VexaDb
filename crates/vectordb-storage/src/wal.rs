@@ -46,6 +46,11 @@ pub enum WalEntry {
     Checkpoint {
         snapshot_id: String,
     },
+    /// Mutate the replicated RBAC state (users, tokens, roles, grants).
+    ///
+    /// Appended last so bincode's variant-index encoding stays
+    /// backwards-compatible with WAL files written before RBAC existed.
+    Rbac { op: vectordb_rbac::RbacOp },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

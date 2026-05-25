@@ -6,11 +6,13 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
-    BulkUpsertRequest, CollectionSpec, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
-    CreateSnapshotRequest, DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest,
-    DescribeCollectionRequest, DistanceMetric, GetRequest, HealthRequest, HealthResponse,
-    ImportChunk, ListCollectionsRequest, ListSnapshotsRequest, ReindexCollectionRequest,
-    ReindexCollectionResponse, SearchRequest, SnapshotInfo, UpsertRequest, VectorPoint,
+    ApplyRbacRequest, BulkUpsertRequest, CollectionSpec, CompactWalRequest, CompactWalResponse,
+    CreateCollectionRequest, CreateSnapshotRequest, DeleteCollectionRequest, DeleteRequest,
+    DeleteSnapshotRequest, DescribeCollectionRequest, DistanceMetric, GetRbacSnapshotRequest,
+    GetRequest, HealthRequest, HealthResponse, ImportChunk, ListCollectionsRequest,
+    ListSnapshotsRequest, QueryRequest, QueryResponse, ReindexCollectionRequest,
+    ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest, StatsResponse,
+    UpsertRequest, VectorPoint,
 };
 use vectordb_proto::VectorServiceClient;
 
@@ -188,8 +190,21 @@ impl VectorDbClient {
         filter_ids: Vec<String>,
         filter_json: String,
     ) -> anyhow::Result<Vec<vectordb_proto::vectordb::v1::ScoredPoint>> {
-        self.search_hybrid(collection, query, top_k, filter_ids, filter_json, None, None, "", 0.5)
-            .await
+        self.search_hybrid(
+            collection,
+            query,
+            top_k,
+            filter_ids,
+            filter_json,
+            None,
+            None,
+            "",
+            0.5,
+            vec![],
+            false,
+            false,
+        )
+        .await
     }
 
     /// Full search including sparse/BM25/hybrid modes.
@@ -204,6 +219,9 @@ impl VectorDbClient {
         text_query: Option<String>,
         search_mode: &str,
         hybrid_alpha: f32,
+        output_fields: Vec<String>,
+        with_payload: bool,
+        with_vector: bool,
     ) -> anyhow::Result<Vec<vectordb_proto::vectordb::v1::ScoredPoint>> {
         Ok(self
             .inner
@@ -217,10 +235,77 @@ impl VectorDbClient {
                 text_query: text_query.unwrap_or_default(),
                 search_mode: search_mode.into(),
                 hybrid_alpha,
+                output_fields,
+                with_payload,
+                with_vector,
             }))
             .await?
             .into_inner()
             .hits)
+    }
+
+    /// Filter-only retrieval (no query vector).
+    pub async fn query(
+        &mut self,
+        collection: &str,
+        filter_json: String,
+        ids: Vec<String>,
+        limit: u32,
+        offset: u32,
+        output_fields: Vec<String>,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> anyhow::Result<QueryResponse> {
+        Ok(self
+            .inner
+            .query(self.authed(QueryRequest {
+                collection: collection.into(),
+                filter_json,
+                ids,
+                limit,
+                offset,
+                output_fields,
+                with_payload,
+                with_vector,
+            }))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn stats(&mut self, collection: &str) -> anyhow::Result<StatsResponse> {
+        Ok(self
+            .inner
+            .stats(self.authed(StatsRequest {
+                collection: collection.into(),
+            }))
+            .await?
+            .into_inner())
+    }
+
+    /// Apply one RBAC mutation. `op_json` must be a JSON-serialized
+    /// [`vectordb_rbac::RbacOp`]. Followers redirect to the leader.
+    pub async fn apply_rbac(&mut self, op_json: Vec<u8>) -> Result<(), Status> {
+        self.redirect_on_leader(|mut c| {
+            let op_json = op_json.clone();
+            async move {
+                c.inner
+                    .apply_rbac(c.authed(ApplyRbacRequest { op_json }))
+                    .await?;
+                Ok(())
+            }
+        })
+        .await
+    }
+
+    /// Fetch the current RBAC snapshot as JSON bytes (decode into
+    /// [`vectordb_rbac::RbacSnapshot`]).
+    pub async fn get_rbac_snapshot(&mut self) -> Result<Vec<u8>, Status> {
+        Ok(self
+            .inner
+            .get_rbac_snapshot(self.authed(GetRbacSnapshotRequest {}))
+            .await?
+            .into_inner()
+            .snapshot_json)
     }
 
     pub async fn delete(&mut self, collection: &str, ids: Vec<String>) -> anyhow::Result<u64> {

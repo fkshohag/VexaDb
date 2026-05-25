@@ -114,7 +114,11 @@ pub fn hybrid_search(
 fn sparse_to_scored(pairs: Vec<(String, f32)>) -> Vec<ScoredPoint> {
     pairs
         .into_iter()
-        .map(|(id, score)| ScoredPoint { id, score })
+        .map(|(id, score)| ScoredPoint {
+            id,
+            score,
+            ..Default::default()
+        })
         .collect()
 }
 

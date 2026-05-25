@@ -5,7 +5,7 @@
 | **Rust** | [`crates/vectordb-client`](../../crates/vectordb-client/) | gRPC | leader-redirect, full proto surface |
 | **Python** | [`sdks/python`](../../sdks/python/) | REST | `RagPipeline`, sync `httpx` |
 | **Node.js / TS** | [`sdks/nodejs`](../../sdks/nodejs/) | REST | Native `fetch`, Node 18+ |
-| **Go** | [`sdks/go`](../../sdks/go/) | REST | Module `github.com/vectordb/vectordb/sdks/go` |
+| **Go** | [`sdks/go`](../../sdks/go/) | REST | `vexaclient` + `entity` (Milvus-style options) |
 | **Java** | [`sdks/java`](../../sdks/java/) | REST | Maven, Java 17+, Gson |
 
 All REST SDKs accept the same options:
@@ -24,7 +24,7 @@ Every REST SDK has methods for:
 
 - `health`, `live`, `ready`
 - `list_collections`, `create_collection`, `describe_collection`, `delete_collection`
-- `upsert`, `bulk_upsert`, `search`, `delete_points`, `get_point`
+- `upsert`, `bulk_upsert`, `search`, `query`, `delete_points`, `get_point`, `stats`
 - `compact_wal`, `reindex_collection`
 - `create_snapshot`, `list_snapshots`, `delete_snapshot`
 
@@ -33,7 +33,7 @@ And RAG helpers:
 - `chunk_text` / `chunkText` / `ChunkText` / `RagUtil.chunkText`
 - `expand_query` / `expandQuery` / `ExpandQuery` / `RagUtil.expandQuery`
 - `rerank_by_overlap` / `rerankByOverlap` / `RerankByOverlap` / `RagUtil.rerankByOverlap`
-- `RagPipeline` class with `ingest()` and `query()`
+- `RagPipeline` / `rag.Pipeline` with `ingest()` and `query()`
 
 ---
 
@@ -82,13 +82,16 @@ cd sdks/go && go build ./...
 ```
 
 ```go
-import "github.com/vectordb/vectordb/sdks/go"
+import (
+    "github.com/vectordb/vectordb/sdks/go/entity"
+    "github.com/vectordb/vectordb/sdks/go/vexaclient"
+)
 
-c := vectordb.NewClient("http://127.0.0.1:8080", os.Getenv("VECTORDB_API_KEY"))
-ctx := context.Background()
-_ = c.CreateCollection(ctx, "docs", 1536, vectordb.CreateCollectionOpts{})
-_, _ = c.Upsert(ctx, "docs", []vectordb.Point{{ID: "a", Values: vec}})
-hits, _ := c.Search(ctx, "docs", query, vectordb.SearchOpts{TopK: 5})
+cli, _ := vexaclient.New(ctx, &vexaclient.ClientConfig{Address: "http://127.0.0.1:8080"})
+_ = cli.CreateCollection(ctx, vexaclient.NewSimpleCreateCollectionOption("docs", 1536))
+_, _ = cli.Insert(ctx, vexaclient.NewColumnBasedInsertOption("docs").
+    WithIDs([]string{"a"}).WithFloatVectorColumn("vector", 1536, [][]float32{vec}))
+hits, _ := cli.Search(ctx, vexaclient.NewSearchOption("docs", 5, []entity.Vector{entity.FloatVector(query)}))
 ```
 
 Tests: `go test ./...`. Demo: `go run ./examples/rag_demo`.

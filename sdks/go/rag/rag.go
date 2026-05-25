@@ -1,4 +1,5 @@
-package vectordb
+// Package rag provides chunking, ingestion, and retrieval helpers on top of vexaclient.
+package rag
 
 import (
 	"context"
@@ -7,6 +8,9 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/vectordb/vectordb/sdks/go/entity"
+	"github.com/vectordb/vectordb/sdks/go/vexaclient"
 )
 
 // EmbedFunc maps text to a dense embedding vector.
@@ -19,14 +23,14 @@ type Document struct {
 	Payload map[string]any
 }
 
-// RagHit is a retrieved chunk with metadata.
-type RagHit struct {
-	ID          string
-	Score       float64
-	Text        string
-	Payload     map[string]any
-	ChunkIndex  int
-	DocumentID  string
+// Hit is a retrieved chunk with metadata.
+type Hit struct {
+	ID         string
+	Score      float64
+	Text       string
+	Payload    map[string]any
+	ChunkIndex int
+	DocumentID string
 }
 
 // ChunkText splits text into overlapping windows.
@@ -113,7 +117,7 @@ func ExpandQuery(query string, maxVariants int) []string {
 }
 
 // RerankByOverlap re-orders hits by token overlap with the query.
-func RerankByOverlap(query string, hits []RagHit, topK int) []RagHit {
+func RerankByOverlap(query string, hits []Hit, topK int) []Hit {
 	qTokens := tokenSet(strings.ToLower(query))
 	if len(qTokens) == 0 {
 		if topK > 0 && len(hits) > topK {
@@ -122,7 +126,7 @@ func RerankByOverlap(query string, hits []RagHit, topK int) []RagHit {
 		return hits
 	}
 	type scored struct {
-		hit   RagHit
+		hit   Hit
 		score float64
 	}
 	scoredHits := make([]scored, len(hits))
@@ -140,7 +144,7 @@ func RerankByOverlap(query string, hits []RagHit, topK int) []RagHit {
 	sort.Slice(scoredHits, func(i, j int) bool {
 		return scoredHits[i].score > scoredHits[j].score
 	})
-	out := make([]RagHit, len(scoredHits))
+	out := make([]Hit, len(scoredHits))
 	for i, s := range scoredHits {
 		h := s.hit
 		h.Score = s.score
@@ -164,24 +168,24 @@ func tokenSet(s string) map[string]bool {
 	return m
 }
 
-// RagPipeline chunks documents, embeds, and searches a collection.
-type RagPipeline struct {
-	Client           *Client
-	Collection       string
-	Dimension        int
-	Embed            EmbedFunc
-	TextField        string
-	ChunkSize        int
-	Overlap          int
-	Metric           string
-	BM25TextField    string
-	SparseEnabled    bool
-	collectionReady  bool
+// Pipeline chunks documents, embeds, and searches a collection.
+type Pipeline struct {
+	Client          *vexaclient.Client
+	Collection      string
+	Dimension       int
+	Embed           EmbedFunc
+	TextField       string
+	ChunkSize       int
+	Overlap         int
+	Metric          entity.MetricType
+	BM25TextField   string
+	SparseEnabled   bool
+	collectionReady bool
 }
 
-// NewRagPipeline builds a RAG helper with defaults.
-func NewRagPipeline(client *Client, collection string, dimension int, embed EmbedFunc) *RagPipeline {
-	return &RagPipeline{
+// NewPipeline builds a RAG helper with defaults.
+func NewPipeline(client *vexaclient.Client, collection string, dimension int, embed EmbedFunc) *Pipeline {
+	return &Pipeline{
 		Client:     client,
 		Collection: collection,
 		Dimension:  dimension,
@@ -189,36 +193,28 @@ func NewRagPipeline(client *Client, collection string, dimension int, embed Embe
 		TextField:  "text",
 		ChunkSize:  512,
 		Overlap:    64,
-		Metric:     "cosine",
+		Metric:     entity.COSINE,
 	}
 }
 
-func (p *RagPipeline) EnsureCollection(ctx context.Context) error {
+func (p *Pipeline) EnsureCollection(ctx context.Context) error {
 	if p.collectionReady {
 		return nil
 	}
-	names, err := p.Client.ListCollections(ctx)
+	ok, err := p.Client.HasCollection(ctx, p.Collection)
 	if err != nil {
 		return err
 	}
-	found := false
-	for _, n := range names {
-		if n == p.Collection {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !ok {
 		bm25 := p.BM25TextField
 		if bm25 == "" {
 			bm25 = p.TextField
 		}
-		err = p.Client.CreateCollection(ctx, p.Collection, p.Dimension, CreateCollectionOpts{
-			Metric:         p.Metric,
-			SparseEnabled:  p.SparseEnabled,
-			BM25TextField:  bm25,
-		})
-		if err != nil {
+		opt := vexaclient.NewSimpleCreateCollectionOption(p.Collection, int64(p.Dimension)).
+			WithMetricType(p.Metric).
+			WithSparseEnabled(p.SparseEnabled).
+			WithBM25TextField(bm25)
+		if err := p.Client.CreateCollection(ctx, opt); err != nil {
 			return err
 		}
 	}
@@ -227,11 +223,15 @@ func (p *RagPipeline) EnsureCollection(ctx context.Context) error {
 }
 
 // Ingest chunks and upserts documents.
-func (p *RagPipeline) Ingest(ctx context.Context, docs []Document, bulk bool) (uint64, error) {
+func (p *Pipeline) Ingest(ctx context.Context, docs []Document, bulk bool) (uint64, error) {
 	if err := p.EnsureCollection(ctx); err != nil {
 		return 0, err
 	}
-	var points []Point
+	var ids []string
+	var vectors [][]float32
+	var texts []string
+	var docIDs []string
+	var chunkIdxs []int64
 	for _, doc := range docs {
 		chunks := ChunkText(doc.Text, p.ChunkSize, p.Overlap)
 		for i, chunk := range chunks {
@@ -242,33 +242,36 @@ func (p *RagPipeline) Ingest(ctx context.Context, docs []Document, bulk bool) (u
 			if len(vec) != p.Dimension {
 				return 0, fmt.Errorf("embedding dimension %d != %d", len(vec), p.Dimension)
 			}
-			payload := map[string]any{}
-			for k, v := range doc.Payload {
-				payload[k] = v
-			}
-			payload[p.TextField] = chunk
-			payload["document_id"] = doc.ID
-			payload["chunk_index"] = i
-			points = append(points, Point{
-				ID:      fmt.Sprintf("%s#%d", doc.ID, i),
-				Values:  vec,
-				Payload: payload,
-			})
+			id := fmt.Sprintf("%s#%d", doc.ID, i)
+			ids = append(ids, id)
+			vectors = append(vectors, vec)
+			texts = append(texts, chunk)
+			docIDs = append(docIDs, doc.ID)
+			chunkIdxs = append(chunkIdxs, int64(i))
 		}
 	}
-	if len(points) == 0 {
+	if len(ids) == 0 {
 		return 0, nil
 	}
+	insert := vexaclient.NewColumnBasedInsertOption(p.Collection).
+		WithIDs(ids).
+		WithFloatVectorColumn("vector", p.Dimension, vectors).
+		WithVarcharColumn(p.TextField, texts).
+		WithVarcharColumn("document_id", docIDs).
+		WithInt64Column("chunk_index", chunkIdxs)
 	if bulk {
-		return p.Client.BulkUpsert(ctx, p.Collection, points, 500)
+		res, err := p.Client.BulkUpsert(ctx, p.Collection, insert, 500)
+		return res.Upserted, err
 	}
-	return p.Client.Upsert(ctx, p.Collection, points)
+	res, err := p.Client.Upsert(ctx, insert)
+	return res.Upserted, err
 }
 
 // QueryOpts configures retrieval.
 type QueryOpts struct {
 	TopK        int
-	Filter      map[string]any
+	FilterExpr  string
+	FilterJSON  map[string]any
 	SearchMode  string
 	HybridAlpha float32
 	MultiQuery  bool
@@ -276,7 +279,7 @@ type QueryOpts struct {
 }
 
 // Query embeds the query and returns ranked chunks.
-func (p *RagPipeline) Query(ctx context.Context, queryText string, opts QueryOpts) ([]RagHit, error) {
+func (p *Pipeline) Query(ctx context.Context, queryText string, opts QueryOpts) ([]Hit, error) {
 	if err := p.EnsureCollection(ctx); err != nil {
 		return nil, err
 	}
@@ -288,7 +291,7 @@ func (p *RagPipeline) Query(ctx context.Context, queryText string, opts QueryOpt
 	if opts.MultiQuery {
 		queries = ExpandQuery(queryText, 3)
 	}
-	byID := map[string]RagHit{}
+	byID := map[string]Hit{}
 	for _, q := range queries {
 		vec, err := p.Embed(ctx, q)
 		if err != nil {
@@ -298,39 +301,34 @@ func (p *RagPipeline) Query(ctx context.Context, queryText string, opts QueryOpt
 		if searchMode == "" {
 			searchMode = "dense"
 		}
-		textQ := ""
-		if searchMode != "dense" {
-			textQ = q
+		search := vexaclient.NewSearchOption(p.Collection, topK, []entity.Vector{entity.FloatVector(vec)}).
+			WithSearchMode(searchMode).
+			WithHybridAlpha(opts.HybridAlpha).
+			WithPayload(true)
+		if opts.FilterExpr != "" {
+			search = search.WithFilter(opts.FilterExpr)
 		}
-		raw, err := p.Client.Search(ctx, p.Collection, vec, SearchOpts{
-			TopK:        topK,
-			Filter:      opts.Filter,
-			TextQuery:   textQ,
-			SearchMode:  searchMode,
-			HybridAlpha: opts.HybridAlpha,
-		})
+		if opts.FilterJSON != nil {
+			search = search.WithFilterJSON(opts.FilterJSON)
+		}
+		if searchMode != "dense" {
+			search = search.WithTextQuery(q)
+		}
+		raw, err := p.Client.Search(ctx, search)
 		if err != nil {
 			return nil, err
 		}
 		for rank, row := range raw {
-			point, err := p.Client.GetPoint(ctx, p.Collection, row.ID)
-			if err != nil {
-				return nil, err
-			}
-			payload := map[string]any{}
-			if point != nil {
-				if pl, ok := point["payload"].(map[string]any); ok {
-					payload = pl
-				}
-			}
-			text, _ := payload[p.TextField].(string)
-			docID, _ := payload["document_id"].(string)
+			text, _ := row.Payload[p.TextField].(string)
+			docID, _ := row.Payload["document_id"].(string)
 			if docID == "" {
 				parts := strings.SplitN(row.ID, "#", 2)
 				docID = parts[0]
 			}
 			chunkIdx := 0
-			if ci, ok := payload["chunk_index"].(float64); ok {
+			if ci, ok := row.Payload["chunk_index"].(float64); ok {
+				chunkIdx = int(ci)
+			} else if ci, ok := row.Payload["chunk_index"].(int64); ok {
 				chunkIdx = int(ci)
 			}
 			rrf := 1.0 / float64(60+rank+1)
@@ -338,18 +336,18 @@ func (p *RagPipeline) Query(ctx context.Context, queryText string, opts QueryOpt
 				existing.Score += rrf
 				byID[row.ID] = existing
 			} else {
-				byID[row.ID] = RagHit{
+				byID[row.ID] = Hit{
 					ID:         row.ID,
 					Score:      rrf,
 					Text:       text,
-					Payload:    payload,
+					Payload:    row.Payload,
 					ChunkIndex: chunkIdx,
 					DocumentID: docID,
 				}
 			}
 		}
 	}
-	hits := make([]RagHit, 0, len(byID))
+	hits := make([]Hit, 0, len(byID))
 	for _, h := range byID {
 		hits = append(hits, h)
 	}

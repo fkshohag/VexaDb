@@ -7,7 +7,8 @@ use tracing_subscriber::EnvFilter;
 use vectordb_proto::VectorServiceServer;
 use vectordb_router::{RebalanceCoordinator, RouterService};
 
-use vectordb_server::auth_interceptor::ApiKeyInterceptor;
+use vectordb_rbac::{RbacCache, RbacInterceptor};
+use vectordb_server::authz::spawn_remote_refresh;
 use vectordb_server::config::{load_config, ServerConfig};
 use vectordb_server::metrics;
 use vectordb_server::service::VectorServiceImpl;
@@ -72,7 +73,6 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = cfg.server.listen.parse()?;
     let cluster = cfg.cluster_config();
-    let auth = ApiKeyInterceptor::new(cfg.auth.clone(), true);
     let mut server = Server::builder();
 
     if let Some(tls) = &cfg.tls {
@@ -91,13 +91,28 @@ async fn main() -> anyhow::Result<()> {
             auto_topology = true,
             "starting VectorDB router"
         );
-        let (router, topology) = RouterService::with_topology(
+        let rbac_cache = RbacCache::new(cfg.auth.keys.clone());
+        let auth = RbacInterceptor::new(rbac_cache.clone(), true);
+        let (mut router, topology) = RouterService::with_topology(
             cfg.cluster.node_id.clone(),
             &cluster,
             cfg.cluster.shard_count,
             cfg.rebalance.clone(),
             cfg.topology.clone(),
             config_path.clone(),
+        );
+        router.set_rbac_cache(rbac_cache.clone());
+        // Pull RBAC snapshot from the first configured peer (or self via pool later).
+        let refresh_ep = cluster
+            .nodes
+            .first()
+            .map(|n| n.advertise_addr.clone())
+            .unwrap_or_else(|| cfg.vector_endpoint());
+        spawn_remote_refresh(
+            rbac_cache.clone(),
+            refresh_ep,
+            cfg.auth.keys.first().cloned(),
+            std::time::Duration::from_secs(5),
         );
         topology.spawn_background();
 
@@ -155,6 +170,9 @@ async fn main() -> anyhow::Result<()> {
     let svc = VectorServiceImpl::new(cfg.clone())
         .await
         .context("failed to initialize VectorDB engine")?;
+
+    // Use the service's cache (already seeded from engine) for the interceptor.
+    let auth = RbacInterceptor::new(svc.rbac_cache(), true);
 
     // Replica bootstrap runs in the background so cold start never blocks
     // gRPC for `peer_retry_secs` (default 10 min) while siblings are still

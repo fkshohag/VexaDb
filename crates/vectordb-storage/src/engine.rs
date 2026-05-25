@@ -8,14 +8,17 @@ use serde_json::Value;
 use thiserror::Error;
 use vectordb_core::{
     Bm25Index, CollectionConfig, DistanceMetric, Error as CoreError, Filter, HnswConfig, HnswIndex,
-    PointId, ScalarQuantizer, ScoredPoint, SearchMode, SparseInvertedIndex,
+    OutputOptions, PointId, ScalarQuantizer, ScoredPoint, SearchMode, SparseInvertedIndex,
     SparseVector, Vector,
 };
+use vectordb_rbac::{RbacError, RbacOp, RbacSnapshot, RbacState};
 
 use crate::payload_index::PayloadIndexes;
 use crate::snapshot::{SnapshotManager, SnapshotMeta};
 use crate::wal::{BulkPoint, WalEntry, WriteAheadLog};
 use crate::wal_compact::export_state_to_wal;
+
+const RBAC_SNAPSHOT_KEY: &[u8] = b"__rbac_snapshot__";
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -33,6 +36,8 @@ pub enum EngineError {
     CollectionNotFound(String),
     #[error("invalid payload: {0}")]
     InvalidPayload(String),
+    #[error("rbac error: {0}")]
+    Rbac(#[from] RbacError),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -76,6 +81,10 @@ pub struct CollectionEngine {
     /// Wrapped so we can reopen RocksDB after a Raft InstallSnapshot.
     meta_db: RwLock<DB>,
     wal: RwLock<WriteAheadLog>,
+    /// RBAC state (users, tokens, roles, grants). Persisted as a JSON
+    /// snapshot in `meta_db` and replicated through the same WAL/Raft as
+    /// collection operations via [`WalEntry::Rbac`].
+    rbac: RwLock<RbacState>,
 }
 
 pub(crate) const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
@@ -99,11 +108,63 @@ impl CollectionEngine {
             collections: RwLock::new(HashMap::new()),
             meta_db: RwLock::new(meta_db),
             wal: RwLock::new(wal),
+            rbac: RwLock::new(RbacState::new()),
         };
 
+        engine.load_rbac_from_meta()?;
         engine.replay_wal()?;
         engine.load_collections_from_meta()?;
         Ok(engine)
+    }
+
+    fn load_rbac_from_meta(&self) -> Result<()> {
+        let snap = self
+            .meta_db
+            .read()
+            .get(RBAC_SNAPSHOT_KEY)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        if let Some(bytes) = snap {
+            let snap: RbacSnapshot =
+                serde_json::from_slice(&bytes).map_err(|e| EngineError::Rocks(e.to_string()))?;
+            self.rbac.write().restore(snap);
+        }
+        Ok(())
+    }
+
+    fn persist_rbac(&self) -> Result<()> {
+        let snap = self.rbac.read().snapshot();
+        let bytes = serde_json::to_vec(&snap).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(RBAC_SNAPSHOT_KEY, bytes)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read-only access to the RBAC state. The caller holds a read guard;
+    /// drop it promptly so writers aren't blocked.
+    pub fn rbac(&self) -> parking_lot::RwLockReadGuard<'_, RbacState> {
+        self.rbac.read()
+    }
+
+    /// Apply an RBAC op locally (WAL + state). Used by Raft followers on
+    /// commit. Leaders should propose through Raft instead.
+    pub fn commit_rbac(&self, op: RbacOp) -> Result<()> {
+        let entry = WalEntry::Rbac { op };
+        self.commit_entry(&entry)
+    }
+
+    fn apply_rbac(&self, op: &RbacOp) -> Result<()> {
+        self.rbac.write().apply(op.clone())?;
+        self.persist_rbac()?;
+        Ok(())
+    }
+
+    /// Seed the built-in roles. Safe to call any number of times.
+    pub fn ensure_builtin_rbac(&self, now_ms: u64) -> Result<()> {
+        self.rbac.write().ensure_builtin_roles(now_ms);
+        self.persist_rbac()?;
+        Ok(())
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -321,6 +382,7 @@ impl CollectionEngine {
                 Ok(())
             }
             WalEntry::Checkpoint { .. } => Ok(()),
+            WalEntry::Rbac { op } => self.apply_rbac(op),
         }
     }
 
@@ -500,6 +562,7 @@ impl CollectionEngine {
         query: &[f32],
         k: usize,
         filter: Option<&Filter>,
+        output: OutputOptions,
     ) -> Result<Vec<ScoredPoint>> {
         self.search_params(
             collection,
@@ -512,6 +575,7 @@ impl CollectionEngine {
                 filter,
             },
             k,
+            output,
         )
     }
 
@@ -520,13 +584,71 @@ impl CollectionEngine {
         collection: &str,
         params: crate::search::SearchParams<'_>,
         k: usize,
+        output: OutputOptions,
     ) -> Result<Vec<ScoredPoint>> {
         self.ensure_collection_loaded(collection)?;
         let collections = self.collections.read();
         let state = collections
             .get(collection)
             .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
-        crate::search::hybrid_search(state, k, params).map_err(EngineError::Core)
+        let mut hits = crate::search::hybrid_search(state, k, params).map_err(EngineError::Core)?;
+        crate::output::attach_outputs(state, &mut hits, &output);
+        Ok(hits)
+    }
+
+    /// Filter-only retrieval (no ANN). Supports pagination via `offset` + `limit`.
+    pub fn query(
+        &self,
+        collection: &str,
+        filter: Option<&Filter>,
+        ids: &[String],
+        limit: usize,
+        offset: usize,
+        output: OutputOptions,
+    ) -> Result<Vec<ScoredPoint>> {
+        self.ensure_collection_loaded(collection)?;
+        let collections = self.collections.read();
+        let state = collections
+            .get(collection)
+            .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
+        let limit = limit.max(1);
+        let mut candidates: Vec<String> = if ids.is_empty() {
+            let mut all: Vec<String> = state
+                .index
+                .iter_points()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            all.sort();
+            all
+        } else {
+            let mut v = ids.to_vec();
+            v.sort();
+            v
+        };
+
+        let mut hits = Vec::new();
+        let mut skipped = 0usize;
+        for id in candidates {
+            if !matches_filter(state, filter, &id) {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if hits.len() >= limit {
+                break;
+            }
+            hits.push(ScoredPoint {
+                id,
+                score: 0.0,
+                payload: None,
+                vector: None,
+            });
+        }
+        crate::output::attach_outputs(state, &mut hits, &output);
+        Ok(hits)
     }
 
     pub fn get(
@@ -594,6 +716,15 @@ impl CollectionEngine {
             vector_count: state.index.len(),
             dimension: state.config.dimension,
             metric: state.config.metric,
+            sparse_enabled: state.config.sparse_enabled,
+            bm25_text_field: state.config.bm25_text_field.clone().unwrap_or_default(),
+            payload_index_count: state.config.payload_indexes.len(),
+            scalar_quantization: state
+                .config
+                .quantization
+                .as_ref()
+                .map(|q| q.scalar)
+                .unwrap_or(false),
         })
     }
 
@@ -758,6 +889,7 @@ pub(crate) fn brute_force_topk(
             Some(ScoredPoint {
                 id: id.clone(),
                 score: vectordb_core::Distance::to_score(state.config.metric, dist),
+                ..Default::default()
             })
         })
         .collect();
@@ -776,6 +908,21 @@ pub struct CollectionStats {
     pub vector_count: usize,
     pub dimension: usize,
     pub metric: DistanceMetric,
+    pub sparse_enabled: bool,
+    pub bm25_text_field: String,
+    pub payload_index_count: usize,
+    pub scalar_quantization: bool,
+}
+
+fn matches_filter(state: &CollectionState, filter: Option<&Filter>, id: &str) -> bool {
+    let Some(f) = filter.filter(|f| !f.is_empty()) else {
+        return true;
+    };
+    state
+        .payloads
+        .get(id)
+        .map(|p| f.matches(p))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -878,12 +1025,12 @@ mod m4_tests {
                 .unwrap();
         }
         let before = engine
-            .search("idx", &[25.0, 0.0, 0.0, 0.0], 1, None)
+            .search("idx", &[25.0, 0.0, 0.0, 0.0], 1, None, OutputOptions::default())
             .unwrap();
         let n = engine.reindex_collection("idx").unwrap();
         assert_eq!(n, 50);
         let after = engine
-            .search("idx", &[25.0, 0.0, 0.0, 0.0], 1, None)
+            .search("idx", &[25.0, 0.0, 0.0, 0.0], 1, None, OutputOptions::default())
             .unwrap();
         assert_eq!(before[0].id, after[0].id);
     }

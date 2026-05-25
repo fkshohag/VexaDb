@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use vectordb_core::{CollectionConfig, SparseVector};
+use vectordb_rbac::RbacOp;
 use vectordb_replication::RaftNode;
 use vectordb_storage::{BulkPoint, CollectionEngine, WalEntry};
 
@@ -87,5 +88,10 @@ impl ReplicatedEngine {
             total += chunk.len() as u64;
         }
         Ok(total)
+    }
+
+    pub async fn apply_rbac(&self, op: RbacOp) -> anyhow::Result<()> {
+        self.ensure_leader().map_err(anyhow::Error::msg)?;
+        self.raft.propose(WalEntry::Rbac { op }).await
     }
 }

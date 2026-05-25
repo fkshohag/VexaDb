@@ -28,6 +28,26 @@ service VectorService {
   rpc RebalanceStatus(RebalanceStatusRequest) returns (RebalanceStatusResponse);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  // M6: SDK-friendly surface — filter-only retrieval and per-collection stats.
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  // M7: RBAC — users, tokens, roles, grants, privilege groups.
+  // The op/snapshot payloads are JSON-encoded to keep this surface
+  // forward-compatible (new privilege names, new fields, new RbacOp variants).
+  rpc ApplyRbac(ApplyRbacRequest) returns (ApplyRbacResponse);
+  rpc GetRbacSnapshot(GetRbacSnapshotRequest) returns (GetRbacSnapshotResponse);
+}
+
+message ApplyRbacRequest {
+  bytes op_json = 1;
+}
+
+message ApplyRbacResponse {}
+
+message GetRbacSnapshotRequest {}
+
+message GetRbacSnapshotResponse {
+  bytes snapshot_json = 1;
 }
 
 enum DistanceMetric {
@@ -139,15 +159,64 @@ message SearchRequest {
   // dense | sparse | bm25 | hybrid_rrf | hybrid_weighted
   string search_mode = 8;
   float hybrid_alpha = 9;
+  // When non-empty, only these payload fields are returned (top-level keys).
+  // Empty + with_payload=true means "all fields".
+  repeated string output_fields = 10;
+  // Include the JSON payload on each hit (default: false to keep wire small).
+  bool with_payload = 11;
+  // Include the dense vector on each hit (default: false). Heavy — opt in.
+  bool with_vector = 12;
 }
 
 message ScoredPoint {
   string id = 1;
   float score = 2;
+  // Populated when SearchRequest.with_payload is true.
+  // JSON-encoded; gateway converts to a structured object.
+  bytes payload = 3;
+  // Populated when SearchRequest.with_vector is true.
+  repeated float vector = 4;
 }
 
 message SearchResponse {
   repeated ScoredPoint hits = 1;
+}
+
+// Filter-only retrieval. Like Search but without a query vector — useful for
+// "give me every point in this collection where category == 'books'".
+message QueryRequest {
+  string collection = 1;
+  // Structured filter encoded as JSON. Mutually compatible with `filter_expr`;
+  // the gateway parses string expressions and forwards them as JSON here.
+  string filter_json = 2;
+  // Limit results to these IDs (used to reimplement Get-many in one round-trip).
+  repeated string ids = 3;
+  uint32 limit = 4;
+  uint32 offset = 5;
+  repeated string output_fields = 6;
+  bool with_payload = 7;
+  bool with_vector = 8;
+}
+
+message QueryResponse {
+  repeated VectorPoint points = 1;
+  // Set when pagination might have more results. Empty otherwise.
+  string next_cursor = 2;
+}
+
+message StatsRequest {
+  string collection = 1;
+}
+
+message StatsResponse {
+  string name = 1;
+  uint64 vector_count = 2;
+  uint32 dimension = 3;
+  DistanceMetric metric = 4;
+  bool sparse_enabled = 5;
+  string bm25_text_field = 6;
+  uint32 payload_index_count = 7;
+  bool scalar_quantization = 8;
 }
 
 message DeleteRequest {

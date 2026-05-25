@@ -354,7 +354,9 @@ fn bench_engine(cli: &Cli) {
             .par_iter()
             .map(|q| {
                 let t = Instant::now();
-                let _ = engine.search("bench", q, cli.top_k, None).unwrap();
+                let _ = engine
+                    .search("bench", q, cli.top_k, None, vectordb_core::OutputOptions::default())
+                    .unwrap();
                 t.elapsed().as_secs_f64() * 1e6
             })
             .collect()
@@ -391,7 +393,7 @@ fn report_recall(engine: &CollectionEngine, points: &[Vec<f32>], cli: &Cli) {
     for query in &queries {
         let truth = brute_force_topk(points, query, cli.top_k);
         let got = engine
-            .search("bench", query, cli.top_k, None)
+            .search("bench", query, cli.top_k, None, vectordb_core::OutputOptions::default())
             .unwrap();
         let ids: std::collections::HashSet<_> = truth.iter().copied().collect();
         for hit in got {

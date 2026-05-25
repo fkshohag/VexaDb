@@ -1,4 +1,4 @@
-package vectordb
+package rag
 
 import "testing"
 
@@ -17,7 +17,7 @@ func TestExpandQuery(t *testing.T) {
 }
 
 func TestRerankByOverlap(t *testing.T) {
-	hits := []RagHit{
+	hits := []Hit{
 		{ID: "a", Score: 0.9, Text: "cats and dogs"},
 		{ID: "b", Score: 0.95, Text: "vector database storage"},
 	}

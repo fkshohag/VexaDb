@@ -3,32 +3,35 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_cluster::ShardRouter;
 use vectordb_core::{
-    CollectionConfig, DistanceMetric, Filter, PayloadFieldIndex, PayloadIndexKind,
-    QuantizationConfig, SearchMode, SparseVector,
+    CollectionConfig, DistanceMetric, Filter, OutputOptions, PayloadFieldIndex, PayloadIndexKind,
+    QuantizationConfig, ScoredPoint, SearchMode, SparseVector,
 };
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, BulkUpsertRequest, BulkUpsertResponse,
-    ClusterStatusRequest, ClusterStatusResponse, CollectionSpec, CompactWalRequest,
-    CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse, CreateSnapshotRequest,
-    CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
-    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeCollectionRequest,
-    DescribeCollectionResponse, DistanceMetric as ProtoMetric, GetRequest, GetResponse,
-    HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
+    vector_service_server::VectorService, ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest,
+    BulkUpsertResponse, ClusterStatusRequest, ClusterStatusResponse, CollectionSpec,
+    CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
+    CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse,
+    DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
+    DescribeCollectionRequest, DescribeCollectionResponse, DistanceMetric as ProtoMetric,
+    GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest,
+    HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
     ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, RebalanceRequest,
     RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse, RegisterNodeRequest,
-    RegisterNodeResponse, ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest,
-    ScrollResponse, SearchRequest, SearchResponse, SnapshotInfo, UpsertRequest, UpsertResponse,
-    VectorPoint,
+    RegisterNodeResponse, QueryRequest, QueryResponse, ReindexCollectionRequest,
+    ReindexCollectionResponse, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
+    SnapshotInfo, StatsRequest, StatsResponse, UpsertRequest, UpsertResponse, VectorPoint,
 };
 use vectordb_replication::RaftNode;
 use vectordb_storage::search::SearchParams;
 use vectordb_storage::{CollectionEngine, EngineError};
 
+use crate::authz::{refresh_from_engine, spawn_engine_refresh, require_collection, RbacCache};
 use crate::config::ServerConfig;
 use crate::leader;
 use crate::metrics::RpcTimer;
 use crate::replication::ReplicatedEngine;
+use vectordb_rbac::{ObjectType, Privilege};
 use vectordb_storage::BulkPoint;
 
 pub struct VectorServiceImpl {
@@ -40,6 +43,7 @@ pub struct VectorServiceImpl {
     local_shard: u32,
     vector_endpoint: String,
     readiness_requires_leader: bool,
+    rbac: RbacCache,
 }
 
 impl VectorServiceImpl {
@@ -66,6 +70,10 @@ impl VectorServiceImpl {
         let shard_ids = vec![local_shard];
         let router_grpc = cfg.cluster.router_grpc.clone();
 
+        let rbac = RbacCache::new(cfg.auth.keys.clone());
+        refresh_from_engine(&rbac, &engine);
+        spawn_engine_refresh(rbac.clone(), engine.clone(), std::time::Duration::from_secs(5));
+
         let svc = Self {
             engine,
             replicated,
@@ -75,6 +83,7 @@ impl VectorServiceImpl {
             local_shard,
             vector_endpoint: vector_endpoint.clone(),
             readiness_requires_leader: cfg.server.readiness_requires_leader,
+            rbac,
         };
 
         if let Some(router_ep) = router_grpc {
@@ -82,6 +91,11 @@ impl VectorServiceImpl {
         }
 
         Ok(svc)
+    }
+
+    /// Expose the RBAC cache so the binary can wire it into the interceptor.
+    pub fn rbac_cache(&self) -> RbacCache {
+        self.rbac.clone()
     }
 
     fn raft_ref(&self) -> Option<&RaftNode> {
@@ -179,6 +193,7 @@ impl VectorService for VectorServiceImpl {
         &self,
         request: Request<DeleteCollectionRequest>,
     ) -> Result<Response<DeleteCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().name, Privilege::DropCollection)?;
         let name = request.into_inner().name;
         if let Some(rep) = &self.replicated {
             rep.delete_collection(&name)
@@ -204,6 +219,7 @@ impl VectorService for VectorServiceImpl {
         &self,
         request: Request<DescribeCollectionRequest>,
     ) -> Result<Response<DescribeCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().name, Privilege::DescribeCollection)?;
         let name = request.into_inner().name;
         let cfg = self
             .engine
@@ -221,6 +237,7 @@ impl VectorService for VectorServiceImpl {
         request: Request<UpsertRequest>,
     ) -> Result<Response<UpsertResponse>, Status> {
         let timer = RpcTimer::start("upsert");
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Upsert)?;
         let req = request.into_inner();
         let collection = req.collection;
         let mut upserted = 0u64;
@@ -264,14 +281,13 @@ impl VectorService for VectorServiceImpl {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let timer = RpcTimer::start("search");
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Search)?;
         let req = request.into_inner();
-        let filter: Option<Filter> = if req.filter_json.trim().is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str(&req.filter_json)
-                    .map_err(|e| Status::invalid_argument(format!("invalid filter: {e}")))?,
-            )
+        let filter = parse_filter_json(&req.filter_json)?;
+        let output = OutputOptions {
+            output_fields: req.output_fields.clone(),
+            with_payload: req.with_payload,
+            with_vector: req.with_vector,
         };
         let sparse_query = proto_sparse_to_core(req.sparse_query);
         let text_query = if req.text_query.trim().is_empty() {
@@ -297,6 +313,7 @@ impl VectorService for VectorServiceImpl {
                     filter: filter.as_ref(),
                 },
                 req.top_k.max(1) as usize,
+                output,
             )
             .map_err(map_engine_err)?;
 
@@ -315,20 +332,101 @@ impl VectorService for VectorServiceImpl {
             "query completed"
         );
         Ok(Response::new(SearchResponse {
-            hits: hits
-                .into_iter()
-                .map(|h| vectordb_proto::vectordb::v1::ScoredPoint {
-                    id: h.id,
-                    score: h.score,
-                })
-                .collect(),
+            hits: hits.into_iter().map(scored_to_proto).collect(),
         }))
+    }
+
+    async fn query(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let timer = RpcTimer::start("query");
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Query)?;
+        let req = request.into_inner();
+        let filter = parse_filter_json(&req.filter_json)?;
+        let output = OutputOptions {
+            output_fields: req.output_fields.clone(),
+            with_payload: req.with_payload,
+            with_vector: req.with_vector,
+        };
+        let limit = if req.limit == 0 { 100 } else { req.limit as usize };
+        let offset = req.offset as usize;
+        let hits = self
+            .engine
+            .query(
+                &req.collection,
+                filter.as_ref(),
+                &req.ids,
+                limit,
+                offset,
+                output,
+            )
+            .map_err(map_engine_err)?;
+        timer.finish(true);
+        let points: Vec<VectorPoint> = hits
+            .into_iter()
+            .map(|h| scored_to_vector_point(h, req.with_vector))
+            .collect();
+        Ok(Response::new(QueryResponse {
+            points,
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn stats(
+        &self,
+        request: Request<StatsRequest>,
+    ) -> Result<Response<StatsResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::CollectionStats)?;
+        let req = request.into_inner();
+        let s = self
+            .engine
+            .stats(&req.collection)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(StatsResponse {
+            name: s.name,
+            vector_count: s.vector_count as u64,
+            dimension: s.dimension as u32,
+            metric: core_metric_to_proto(s.metric) as i32,
+            sparse_enabled: s.sparse_enabled,
+            bm25_text_field: s.bm25_text_field,
+            payload_index_count: s.payload_index_count as u32,
+            scalar_quantization: s.scalar_quantization,
+        }))
+    }
+
+    async fn apply_rbac(
+        &self,
+        request: Request<ApplyRbacRequest>,
+    ) -> Result<Response<ApplyRbacResponse>, Status> {
+        let req = request.into_inner();
+        let op: vectordb_rbac::RbacOp = serde_json::from_slice(&req.op_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid RbacOp JSON: {e}")))?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_rbac(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_rbac(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(ApplyRbacResponse {}))
+    }
+
+    async fn get_rbac_snapshot(
+        &self,
+        _request: Request<GetRbacSnapshotRequest>,
+    ) -> Result<Response<GetRbacSnapshotResponse>, Status> {
+        let snap = self.engine.rbac().snapshot();
+        let json = serde_json::to_vec(&snap)
+            .map_err(|e| Status::internal(format!("snapshot serialize: {e}")))?;
+        Ok(Response::new(GetRbacSnapshotResponse { snapshot_json: json }))
     }
 
     async fn delete(
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Delete)?;
         let req = request.into_inner();
         let mut deleted = 0u64;
         for id in req.ids {
@@ -352,6 +450,7 @@ impl VectorService for VectorServiceImpl {
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Get)?;
         let req = request.into_inner();
         if !self.owns_point(&req.id) {
             return Err(Status::failed_precondition(
@@ -438,6 +537,7 @@ impl VectorService for VectorServiceImpl {
         request: Request<BulkUpsertRequest>,
     ) -> Result<Response<BulkUpsertResponse>, Status> {
         let timer = RpcTimer::start("bulk_upsert");
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Insert)?;
         let req = request.into_inner();
         let chunk_size = if req.chunk_size == 0 {
             500
@@ -463,8 +563,10 @@ impl VectorService for VectorServiceImpl {
         request: Request<Streaming<ImportChunk>>,
     ) -> Result<Response<ImportStreamResponse>, Status> {
         let timer = RpcTimer::start("import_stream");
+        let principal = request.extensions().get::<vectordb_rbac::Principal>().cloned();
         let mut stream = request.into_inner();
         let mut collection = String::new();
+        let mut collection_authorized = false;
         let mut buffer: Vec<BulkPoint> = Vec::new();
         let mut total = 0u64;
         const FLUSH: usize = 500;
@@ -479,6 +581,21 @@ impl VectorService for VectorServiceImpl {
             }
             if collection.is_empty() {
                 return Err(Status::invalid_argument("collection required"));
+            }
+            if !collection_authorized {
+                if self.rbac.enabled() {
+                    let p = principal
+                        .as_ref()
+                        .ok_or_else(|| Status::unauthenticated("principal missing"))?;
+                    self.rbac
+                        .authorize(p, ObjectType::Collection, &collection, Privilege::Insert.as_str())
+                        .map_err(|_| {
+                            Status::permission_denied(format!(
+                                "no Insert privilege on collection {collection}"
+                            ))
+                        })?;
+                }
+                collection_authorized = true;
             }
             let mut batch = proto_points_to_bulk(chunk.points, &self)?;
             buffer.append(&mut batch);
@@ -531,6 +648,7 @@ impl VectorService for VectorServiceImpl {
         &self,
         request: Request<ReindexCollectionRequest>,
     ) -> Result<Response<ReindexCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Reindex)?;
         if let Some(rep) = &self.replicated {
             rep.ensure_leader()
                 .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
@@ -567,6 +685,7 @@ impl VectorService for VectorServiceImpl {
         &self,
         request: Request<ScrollRequest>,
     ) -> Result<Response<ScrollResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Query)?;
         let req = request.into_inner();
         let limit = if req.limit == 0 {
             256
@@ -678,6 +797,41 @@ fn spawn_router_registration(
             try_register(&router_grpc, &node_id, &grpc, &shard_ids, shard_count).await;
         }
     });
+}
+
+fn parse_filter_json(s: &str) -> Result<Option<Filter>, Status> {
+    vectordb_core::parse_filter_input(s)
+        .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+fn scored_to_proto(h: ScoredPoint) -> vectordb_proto::vectordb::v1::ScoredPoint {
+    vectordb_proto::vectordb::v1::ScoredPoint {
+        id: h.id,
+        score: h.score,
+        payload: h
+            .payload
+            .as_ref()
+            .map(|p| serde_json::to_vec(p).unwrap_or_default())
+            .unwrap_or_default(),
+        vector: h.vector.unwrap_or_default(),
+    }
+}
+
+fn scored_to_vector_point(h: ScoredPoint, with_vector: bool) -> VectorPoint {
+    VectorPoint {
+        id: h.id,
+        values: if with_vector {
+            h.vector.unwrap_or_default()
+        } else {
+            vec![]
+        },
+        payload: h
+            .payload
+            .as_ref()
+            .map(|p| serde_json::to_vec(p).unwrap_or_default())
+            .unwrap_or_default(),
+        sparse: None,
+    }
 }
 
 fn proto_points_to_bulk(

@@ -36,3 +36,4 @@ admin/frontend/dist/
 admin/frontend/.vite/
 admin/backend/vectordb-admin
 /graphify-out/
+sdks/go/milvus-sdk-go/

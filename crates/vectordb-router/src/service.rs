@@ -6,23 +6,27 @@ use futures::future::join_all;
 use vectordb_cluster::{merge_top_k, ClusterConfig};
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, BulkUpsertRequest, BulkUpsertResponse, CollectionSpec,
-    ClusterStatusRequest, ClusterStatusResponse, ClusterNodeStatus, CompactWalRequest,
-    CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
-    CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse,
-    DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
-    DescribeCollectionRequest, DescribeCollectionResponse, GetRequest, GetResponse, HealthRequest,
-    HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
-    ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    vector_service_server::VectorService, ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest,
+    BulkUpsertResponse, CollectionSpec, ClusterStatusRequest, ClusterStatusResponse,
+    ClusterNodeStatus, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
+    CreateCollectionResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
+    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeCollectionRequest,
+    DescribeCollectionResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest,
+    GetResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
+    ListCollectionsRequest, ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     RebalanceCollectionReport, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
     RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse,
-    ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest, ScrollResponse,
-    SearchRequest, SearchResponse, UpsertRequest, UpsertResponse, VectorPoint,
+    QueryRequest, QueryResponse, ReindexCollectionRequest, ReindexCollectionResponse,
+    ScrollRequest, ScrollResponse, SearchRequest, SearchResponse, StatsRequest, StatsResponse,
+    UpsertRequest, UpsertResponse, VectorPoint,
 };
 
 use crate::pool::ClientPool;
 use crate::rebalance::RebalanceCoordinator;
 use crate::topology::TopologyManager;
+use vectordb_rbac::{require_collection, Privilege, RbacCache};
+
 use crate::{RebalanceConfig, TopologyConfig};
 
 pub struct RouterService {
@@ -30,9 +34,14 @@ pub struct RouterService {
     topology: Arc<TopologyManager>,
     node_id: String,
     rebalance: RebalanceCoordinator,
+    rbac: RbacCache,
 }
 
 impl RouterService {
+    pub fn set_rbac_cache(&mut self, cache: RbacCache) {
+        self.rbac = cache;
+    }
+
     pub fn new(node_id: impl Into<String>, cluster: &ClusterConfig, shard_count: u32) -> Self {
         Self::with_rebalance(node_id, cluster, shard_count, RebalanceConfig::default())
     }
@@ -77,6 +86,7 @@ impl RouterService {
             topology: topology.clone(),
             node_id: node_id.into(),
             rebalance,
+            rbac: RbacCache::new(vec![]),
         };
         (svc, topology)
     }
@@ -202,6 +212,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<DeleteCollectionRequest>,
     ) -> Result<Response<DeleteCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().name, Privilege::DropCollection)?;
         let name = request.into_inner().name;
         for (_, mut client) in self.clients_for_all_shards().await? {
             client
@@ -267,6 +278,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<DescribeCollectionRequest>,
     ) -> Result<Response<DescribeCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().name, Privilege::DescribeCollection)?;
         let name = request.into_inner().name;
         let clients = self.clients_for_shards_best_effort().await;
         if clients.is_empty() {
@@ -325,6 +337,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<UpsertRequest>,
     ) -> Result<Response<UpsertResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Upsert)?;
         let req = request.into_inner();
         let collection = req.collection;
 
@@ -447,6 +460,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Search)?;
         let req = request.into_inner();
         let top_k = req.top_k.max(1) as usize;
         let collection = req.collection.clone();
@@ -458,6 +472,9 @@ impl VectorService for RouterService {
         let text_query = req.text_query.clone();
         let search_mode = req.search_mode.clone();
         let hybrid_alpha = req.hybrid_alpha;
+        let output_fields = req.output_fields.clone();
+        let with_payload = req.with_payload;
+        let with_vector = req.with_vector;
         let futures: Vec<_> = self
             .clients_for_all_shards()
             .await?
@@ -470,6 +487,7 @@ impl VectorService for RouterService {
                 let sparse_query = sparse_query.clone();
                 let text_query = text_query.clone();
                 let search_mode = search_mode.clone();
+                let output_fields = output_fields.clone();
                 async move {
                     let per_shard_k = (top_k * 2).max(top_k) as u32;
                     client
@@ -487,6 +505,9 @@ impl VectorService for RouterService {
                             },
                             &search_mode,
                             hybrid_alpha,
+                            output_fields,
+                            with_payload,
+                            with_vector,
                         )
                         .await
                 }
@@ -533,15 +554,127 @@ impl VectorService for RouterService {
         Ok(Response::new(SearchResponse {
             hits: merged
                 .into_iter()
-                .map(|(id, score)| vectordb_proto::vectordb::v1::ScoredPoint { id, score })
+                .map(|(id, score)| vectordb_proto::vectordb::v1::ScoredPoint {
+                    id,
+                    score,
+                    payload: vec![],
+                    vector: vec![],
+                })
                 .collect(),
         }))
+    }
+
+    async fn query(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Query)?;
+        let req = request.into_inner();
+        let limit = if req.limit == 0 { 100 } else { req.limit as usize };
+        let offset = req.offset as usize;
+        let collection = req.collection.clone();
+        let filter_json = req.filter_json.clone();
+        let ids = req.ids.clone();
+        let output_fields = req.output_fields.clone();
+        let with_payload = req.with_payload;
+        let with_vector = req.with_vector;
+
+        let futures: Vec<_> = self
+            .clients_for_all_shards()
+            .await?
+            .into_iter()
+            .map(|(_, mut client)| {
+                let collection = collection.clone();
+                let filter_json = filter_json.clone();
+                let ids = ids.clone();
+                let output_fields = output_fields.clone();
+                async move {
+                    client
+                        .query(
+                            &collection,
+                            filter_json,
+                            ids,
+                            limit.saturating_add(offset) as u32,
+                            0,
+                            output_fields,
+                            with_payload,
+                            with_vector,
+                        )
+                        .await
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+        let mut all_points = Vec::new();
+        for res in results {
+            if let Ok(resp) = res {
+                all_points.extend(resp.points);
+            }
+        }
+        all_points.sort_by(|a, b| a.id.cmp(&b.id));
+        all_points.dedup_by(|a, b| a.id == b.id);
+        let page: Vec<VectorPoint> = all_points.into_iter().skip(offset).take(limit).collect();
+        Ok(Response::new(QueryResponse {
+            points: page,
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn stats(
+        &self,
+        request: Request<StatsRequest>,
+    ) -> Result<Response<StatsResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::CollectionStats)?;
+        let name = request.into_inner().collection;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut total = 0u64;
+        let mut first: Option<StatsResponse> = None;
+        for (_, mut client) in clients {
+            if let Ok(s) = client.stats(&name).await {
+                total += s.vector_count;
+                if first.is_none() {
+                    first = Some(s);
+                }
+            }
+        }
+        let mut out = first.ok_or_else(|| Status::not_found(format!("collection {name}")))?;
+        out.vector_count = total;
+        Ok(Response::new(out))
+    }
+
+    async fn apply_rbac(
+        &self,
+        request: Request<ApplyRbacRequest>,
+    ) -> Result<Response<ApplyRbacResponse>, Status> {
+        let req = request.into_inner();
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            client
+                .apply_rbac(req.op_json.clone())
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(ApplyRbacResponse {}))
+    }
+
+    async fn get_rbac_snapshot(
+        &self,
+        _request: Request<GetRbacSnapshotRequest>,
+    ) -> Result<Response<GetRbacSnapshotResponse>, Status> {
+        let clients = self.clients_for_shards_best_effort().await;
+        for (_, mut client) in clients {
+            if let Ok(snap) = client.get_rbac_snapshot().await {
+                return Ok(Response::new(GetRbacSnapshotResponse { snapshot_json: snap }));
+            }
+        }
+        Err(Status::unavailable("no shard returned an RBAC snapshot"))
     }
 
     async fn delete(
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Delete)?;
         let req = request.into_inner();
         let mut by_endpoint: HashMap<String, Vec<String>> = HashMap::new();
         for id in req.ids {
@@ -573,6 +706,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<GetRequest>,
     ) -> Result<Response<GetResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Get)?;
         let req = request.into_inner();
         let mut client = self.client_for_point(&req.id).await?;
         let point = client
@@ -631,6 +765,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<BulkUpsertRequest>,
     ) -> Result<Response<BulkUpsertResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Insert)?;
         let req = request.into_inner();
         let mut by_endpoint: HashMap<String, Vec<VectorPoint>> = HashMap::new();
         for point in req.points {
@@ -742,6 +877,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<ReindexCollectionRequest>,
     ) -> Result<Response<ReindexCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Reindex)?;
         let name = request.into_inner().collection;
         let mut total = 0u64;
         for (_, mut client) in self.clients_for_all_shards().await? {

@@ -12,6 +12,7 @@ members = [
     "crates/vectordb-cli",
     "crates/vectordb-gateway",
     "crates/vectordb-auth",
+    "crates/vectordb-rbac",
     "crates/vectordb-bench",
 ]
 
@@ -31,6 +32,7 @@ vectordb-client = { path = "crates/vectordb-client" }
 vectordb-router = { path = "crates/vectordb-router" }
 vectordb-replication = { path = "crates/vectordb-replication" }
 vectordb-auth = { path = "crates/vectordb-auth" }
+vectordb-rbac = { path = "crates/vectordb-rbac" }
 
 anyhow = "1"
 async-trait = "0.1"
