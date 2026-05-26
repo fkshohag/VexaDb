@@ -63,6 +63,43 @@ replicas, _ := cli.DescribeReplica(ctx, vexaclient.NewDescribeReplicaOption("lib
 _ = a; _ = col; _ = stats; _ = has; _ = list; _ = replicas
 ```
 
+## Database management (Milvus v2.6 parity)
+
+VexaDb scopes collections by database (defaulting to `default`). The Go SDK
+mirrors Milvus's `Database/*` surface:
+
+```go
+// CRUD
+_ = cli.CreateDatabase(ctx, vexaclient.NewCreateDatabaseOption("analytics").
+    WithProperty("database.replica.number", 2))
+
+names, _ := cli.ListDatabase(ctx, vexaclient.NewListDatabaseOption())
+db, _   := cli.DescribeDatabase(ctx, vexaclient.NewDescribeDatabaseOption("analytics"))
+
+// Properties
+_ = cli.AlterDatabaseProperties(ctx,
+    vexaclient.NewAlterDatabasePropertiesOption("analytics").
+        WithProperty("tier", "hot"))
+_ = cli.DropDatabaseProperties(ctx,
+    vexaclient.NewDropDatabasePropertiesOption("analytics", "tier"))
+
+// Drop. The server rejects a drop on a non-empty database; pass
+// WithForce(true) to cascade-drop all child collections + aliases.
+_ = cli.DropDatabase(ctx, vexaclient.NewDropDatabaseOption("analytics").WithForce(true))
+
+// Switching the active database — UseDatabase is the Milvus v2.6 name,
+// UsingDatabase is the v2.5 alias; both update the x-vexa-db header used
+// on subsequent requests.
+_ = cli.UseDatabase(ctx, vexaclient.NewUseDatabaseOption("analytics"))
+
+_ = names; _ = db
+```
+
+Collections are unique per-database. `cli.UseDatabase("analytics")` followed
+by `cli.CreateCollection(ctx, NewSimpleCreateCollectionOption("docs", 128))`
+creates `analytics/docs`; the same call after `UseDatabase("research")`
+creates a separate `research/docs`.
+
 ## Client management
 
 `New` accepts a `ClientConfig` modeled after Milvus's

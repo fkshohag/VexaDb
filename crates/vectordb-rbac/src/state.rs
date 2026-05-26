@@ -127,9 +127,11 @@ impl RbacState {
             "Get",
             "AlterCollection",
             "AlterAlias",
+            "ListDatabases",
+            "DescribeDatabase",
         ] {
             let obj = match p {
-                "ListCollections" => ObjectType::Global,
+                "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,
                 _ => ObjectType::Collection,
             };
             rw.insert(GrantItem::new(obj, "*", p));
@@ -143,9 +145,11 @@ impl RbacState {
             "Search",
             "Query",
             "Get",
+            "ListDatabases",
+            "DescribeDatabase",
         ] {
             let obj = match p {
-                "ListCollections" => ObjectType::Global,
+                "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,
                 _ => ObjectType::Collection,
             };
             ro.insert(GrantItem::new(obj, "*", p));

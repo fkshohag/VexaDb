@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::from_fn_with_state,
     routing::{delete, get, patch, post},
     Json, Router,
@@ -288,6 +288,16 @@ async fn main() -> anyhow::Result<()> {
             "/v1/aliases/:alias",
             get(describe_alias).put(alter_alias).delete(drop_alias),
         )
+        // ---- Database management (Milvus parity) -----------------------
+        .route("/v1/databases", get(list_databases).post(create_database))
+        .route(
+            "/v1/databases/:name",
+            get(describe_database).delete(drop_database),
+        )
+        .route(
+            "/v1/databases/:name/properties",
+            patch(alter_database_properties).delete(drop_database_properties),
+        )
         .route("/v1/admin/compact-wal", post(compact_wal))
         .route("/v1/admin/rebalance", post(trigger_rebalance).get(rebalance_status))
         .route("/v1/admin/cluster", get(cluster_status))
@@ -339,6 +349,29 @@ async fn main() -> anyhow::Result<()> {
 }
 
 
+/// Header used by clients to scope requests to a logical database (Milvus
+/// parity). The gateway translates `(x-vexa-db: <db>, /v1/collections/foo)`
+/// into the fully-qualified `<db>/foo` collection identifier before
+/// forwarding to gRPC. Missing or empty header → built-in `default` database.
+const HEADER_DB: &str = "x-vexa-db";
+
+/// Extract the active database from request headers, falling back to the
+/// built-in `default` database.
+fn current_db(headers: &HeaderMap) -> String {
+    headers
+        .get(HEADER_DB)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(vectordb_core::DEFAULT_DATABASE)
+        .to_string()
+}
+
+/// Build a fully-qualified collection / alias identifier from `(db, name)`.
+fn fq(db: &str, name: &str) -> String {
+    format!("{db}/{name}")
+}
+
 async fn live() -> StatusCode {
     StatusCode::OK
 }
@@ -389,17 +422,29 @@ async fn version() -> Json<VersionBody> {
     })
 }
 
-async fn list_collections(State(state): State<AppState>) -> Result<Json<Vec<String>>, StatusCode> {
+async fn list_collections(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    let db = current_db(&headers);
     let mut client = state.client.lock().await;
-    client
+    let names = client
         .list_collections()
         .await
-        .map(Json)
-        .map_err(|_| StatusCode::BAD_GATEWAY)
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let prefix = format!("{db}/");
+    // Only return collections that belong to the active database, stripping
+    // the `<db>/` prefix so callers see simple names.
+    let filtered: Vec<String> = names
+        .into_iter()
+        .filter_map(|fqn| fqn.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    Ok(Json(filtered))
 }
 
 async fn create_collection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateCollectionBody>,
 ) -> Result<StatusCode, StatusCode> {
     let metric = match body.metric.as_deref().unwrap_or("cosine") {
@@ -425,6 +470,7 @@ async fn create_collection(
         })
         .collect::<Vec<_>>();
     let mut spec = cosine_collection(&body.name, body.dimension);
+    spec.database = current_db(&headers);
     spec.metric = metric as i32;
     spec.payload_indexes = payload_indexes;
     spec.sparse_enabled = body.sparse_enabled.unwrap_or(false);
@@ -442,15 +488,30 @@ async fn create_collection(
 
 async fn describe_collection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
     let mut client = state.client.lock().await;
     let (spec, count, aliases) = client
-        .describe_collection_full(&name)
+        .describe_collection_full(&fqn)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    // Strip the `db/` prefix from aliases for response clarity — clients
+    // working within the active database see just simple names.
+    let prefix = format!("{db}/");
+    let aliases: Vec<String> = aliases
+        .into_iter()
+        .map(|a| {
+            a.strip_prefix(&prefix)
+                .map(str::to_string)
+                .unwrap_or(a)
+        })
+        .collect();
     Ok(Json(serde_json::json!({
         "name": spec.name,
+        "database": if spec.database.is_empty() { db.clone() } else { spec.database },
         "dimension": spec.dimension,
         "metric": metric_to_string(spec.metric),
         "m": spec.m,
@@ -489,11 +550,13 @@ fn index_kind_to_string(k: i32) -> &'static str {
 
 async fn delete_collection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let mut client = state.client.lock().await;
     client
-        .delete_collection(&name)
+        .delete_collection(&fqn)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(StatusCode::NO_CONTENT)
@@ -508,11 +571,13 @@ struct RenameCollectionBody {
 
 async fn rename_collection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<RenameCollectionBody>,
 ) -> Result<StatusCode, StatusCode> {
+    let db = current_db(&headers);
     let op = serde_json::json!({
-        "RenameCollection": { "old": name, "new": body.new_name }
+        "RenameCollection": { "old": name, "new": body.new_name, "database": db }
     });
     forward_meta_op(&state, op).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -530,12 +595,15 @@ struct AlterPropertiesBody {
 
 async fn alter_properties(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<AlterPropertiesBody>,
 ) -> Result<StatusCode, StatusCode> {
+    let db = current_db(&headers);
     let op = serde_json::json!({
         "AlterCollectionProperties": {
             "name": name,
+            "database": db,
             "set": body.set,
             "unset": body.unset,
         }
@@ -552,10 +620,16 @@ struct CreateAliasBody {
 
 async fn create_alias(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateAliasBody>,
 ) -> Result<StatusCode, StatusCode> {
+    let db = current_db(&headers);
     let op = serde_json::json!({
-        "CreateAlias": { "alias": body.alias, "collection": body.collection }
+        "CreateAlias": {
+            "alias": body.alias,
+            "collection": body.collection,
+            "database": db,
+        }
     });
     forward_meta_op(&state, op).await?;
     Ok(StatusCode::CREATED)
@@ -568,11 +642,17 @@ struct AlterAliasBody {
 
 async fn alter_alias(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(alias): Path<String>,
     Json(body): Json<AlterAliasBody>,
 ) -> Result<StatusCode, StatusCode> {
+    let db = current_db(&headers);
     let op = serde_json::json!({
-        "AlterAlias": { "alias": alias, "collection": body.collection }
+        "AlterAlias": {
+            "alias": alias,
+            "collection": body.collection,
+            "database": db,
+        }
     });
     forward_meta_op(&state, op).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -580,9 +660,13 @@ async fn alter_alias(
 
 async fn drop_alias(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(alias): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let op = serde_json::json!({ "DropAlias": { "alias": alias } });
+    let db = current_db(&headers);
+    let op = serde_json::json!({
+        "DropAlias": { "alias": alias, "database": db }
+    });
     forward_meta_op(&state, op).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -593,29 +677,49 @@ struct AliasRow {
     collection: String,
 }
 
-async fn list_aliases(State(state): State<AppState>) -> Result<Json<Vec<AliasRow>>, StatusCode> {
+async fn list_aliases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AliasRow>>, StatusCode> {
+    let db = current_db(&headers);
     let mut client = state.client.lock().await;
     let rows = client
         .list_aliases("")
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let prefix = format!("{db}/");
     Ok(Json(
         rows.into_iter()
-            .map(|(alias, collection)| AliasRow { alias, collection })
+            .filter_map(|(fq_alias, fq_collection)| {
+                let alias = fq_alias.strip_prefix(&prefix)?.to_string();
+                let collection = fq_collection
+                    .strip_prefix(&prefix)
+                    .map(str::to_string)
+                    .unwrap_or(fq_collection);
+                Some(AliasRow { alias, collection })
+            })
             .collect(),
     ))
 }
 
 async fn list_aliases_for(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<String>>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
     let mut client = state.client.lock().await;
     let rows = client
-        .list_aliases(&name)
+        .list_aliases(&fqn)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    Ok(Json(rows.into_iter().map(|(a, _)| a).collect()))
+    let prefix = format!("{db}/");
+    Ok(Json(
+        rows.into_iter()
+            .filter_map(|(a, _)| a.strip_prefix(&prefix).map(str::to_string))
+            .collect(),
+    ))
 }
 
 #[derive(Serialize)]
@@ -626,14 +730,190 @@ struct AliasDetail {
 
 async fn describe_alias(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(alias): Path<String>,
 ) -> Result<Json<AliasDetail>, StatusCode> {
+    let db = current_db(&headers);
+    let fq_alias = fq(&db, &alias);
     let mut client = state.client.lock().await;
-    let collection = client
-        .describe_alias(&alias)
+    let fq_collection = client
+        .describe_alias(&fq_alias)
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    let prefix = format!("{db}/");
+    let collection = fq_collection
+        .strip_prefix(&prefix)
+        .map(str::to_string)
+        .unwrap_or(fq_collection);
     Ok(Json(AliasDetail { alias, collection }))
+}
+
+// ---- Database management (Milvus parity) -------------------------------
+
+#[derive(Deserialize)]
+struct CreateDatabaseBody {
+    name: String,
+    #[serde(default)]
+    properties: std::collections::BTreeMap<String, String>,
+}
+
+async fn create_database(
+    State(state): State<AppState>,
+    Json(body): Json<CreateDatabaseBody>,
+) -> Result<StatusCode, StatusCode> {
+    if body.name.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let op = serde_json::json!({
+        "CreateDatabase": {
+            "name": body.name,
+            "properties": body.properties,
+            "created_at_ms": now_ms(),
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .create_database(bytes)
+        .await
+        .map_err(map_db_grpc_err)?;
+    Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize)]
+struct DropDatabaseQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn drop_database(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DropDatabaseQuery>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({
+        "DropDatabase": { "name": name, "force": q.force }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .drop_database(bytes)
+        .await
+        .map_err(map_db_grpc_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AlterDatabaseBody {
+    #[serde(default)]
+    set: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    unset: Vec<String>,
+}
+
+async fn alter_database_properties(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<AlterDatabaseBody>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({
+        "AlterDatabaseProperties": {
+            "name": name,
+            "set": body.set,
+            "unset": body.unset,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .alter_database(bytes)
+        .await
+        .map_err(map_db_grpc_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct DropDatabasePropsBody {
+    keys: Vec<String>,
+}
+
+/// Convenience endpoint mirroring Milvus's `DropDatabaseProperties`. Forwards
+/// as a single `AlterDatabaseProperties` with an `unset` list.
+async fn drop_database_properties(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<DropDatabasePropsBody>,
+) -> Result<StatusCode, StatusCode> {
+    let op = serde_json::json!({
+        "AlterDatabaseProperties": {
+            "name": name,
+            "set": {},
+            "unset": body.keys,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .alter_database(bytes)
+        .await
+        .map_err(map_db_grpc_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_databases(State(state): State<AppState>) -> Result<Json<Vec<String>>, StatusCode> {
+    let mut client = state.client.lock().await;
+    client
+        .list_databases()
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+#[derive(Serialize)]
+struct DatabaseDetail {
+    name: String,
+    properties: std::collections::HashMap<String, String>,
+    created_at_ms: u64,
+}
+
+async fn describe_database(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<DatabaseDetail>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let info = client
+        .describe_database(&name)
+        .await
+        .map_err(map_db_grpc_err)?;
+    Ok(Json(DatabaseDetail {
+        name: info.name,
+        properties: info.properties,
+        created_at_ms: info.created_at_ms,
+    }))
+}
+
+fn map_db_grpc_err(e: anyhow::Error) -> StatusCode {
+    let msg = e.to_string();
+    if msg.contains("database not found") {
+        StatusCode::NOT_FOUND
+    } else if msg.contains("database exists") || msg.contains("AlreadyExists") {
+        StatusCode::CONFLICT
+    } else if msg.contains("not empty") || msg.contains("FailedPrecondition") {
+        StatusCode::CONFLICT
+    } else if msg.contains("InvalidArgument") || msg.contains("cannot be dropped") {
+        StatusCode::BAD_REQUEST
+    } else if msg.contains("PermissionDenied") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn forward_meta_op(state: &AppState, op: serde_json::Value) -> Result<(), StatusCode> {
@@ -667,13 +947,15 @@ async fn forward_meta_op(state: &AppState, op: serde_json::Value) -> Result<(), 
 
 async fn upsert(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<UpsertBody>,
 ) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let points = points_from_body(body.points);
     let mut client = state.client.lock().await;
     let n = client
-        .upsert(&name, points)
+        .upsert(&fqn, points)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(Json(serde_json::json!({ "upserted": n })))
@@ -703,9 +985,11 @@ fn payload_bytes_to_value(bytes: &[u8]) -> Option<Value> {
 
 async fn search(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<SearchBody>,
 ) -> Result<Json<Vec<SearchHit>>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let filter_json = filter_value_to_json(&body.filter)?;
     let sparse_query = body.sparse_query.map(|s| vectordb_proto::vectordb::v1::SparseVector {
         indices: s.indices,
@@ -716,7 +1000,7 @@ async fn search(
     let mut client = state.client.lock().await;
     let hits = client
         .search_hybrid(
-            &name,
+            &fqn,
             body.vector,
             body.top_k,
             vec![],
@@ -753,14 +1037,16 @@ async fn search(
 
 async fn query_points(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<QueryBody>,
 ) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let filter_json = filter_value_to_json(&body.filter)?;
     let mut client = state.client.lock().await;
     let resp = client
         .query(
-            &name,
+            &fqn,
             filter_json,
             body.ids,
             body.limit,
@@ -788,10 +1074,12 @@ async fn query_points(
 
 async fn collection_stats(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let mut client = state.client.lock().await;
-    let s = client.stats(&name).await.map_err(|e| {
+    let s = client.stats(&fqn).await.map_err(|e| {
         if e.to_string().contains("not found") {
             StatusCode::NOT_FOUND
         } else {
@@ -843,14 +1131,16 @@ fn points_from_body(points: Vec<PointBody>) -> Vec<VectorPoint> {
 
 async fn bulk_upsert(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<BulkUpsertBody>,
 ) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let points = points_from_body(body.points);
     let chunk_size = body.chunk_size.unwrap_or(500);
     let mut client = state.client.lock().await;
     let n = client
-        .bulk_upsert(&name, points, chunk_size)
+        .bulk_upsert(&fqn, points, chunk_size)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(Json(serde_json::json!({ "upserted": n })))
@@ -858,11 +1148,13 @@ async fn bulk_upsert(
 
 async fn reindex_collection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let mut client = state.client.lock().await;
     let resp = client
-        .reindex_collection(&name)
+        .reindex_collection(&fqn)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(Json(serde_json::json!({
@@ -977,12 +1269,14 @@ async fn compact_wal(
 
 async fn delete_points(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(body): Json<DeletePointsBody>,
 ) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let mut client = state.client.lock().await;
     let n = client
-        .delete(&name, body.ids)
+        .delete(&fqn, body.ids)
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(Json(serde_json::json!({ "deleted": n })))
@@ -990,10 +1284,12 @@ async fn delete_points(
 
 async fn get_point(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
     let mut client = state.client.lock().await;
-    let point = client.get(&name, &id).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let point = client.get(&fqn, &id).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
     match point {
         Some(p) => {
             let payload: Value = if p.payload.is_empty() {

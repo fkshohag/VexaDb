@@ -152,6 +152,8 @@ pub async fn bootstrap(ctx: &RbacContext, root_password: Option<&str>) -> anyhow
             BUILTIN_READ_WRITE,
             &[
                 (ObjectType::Global, "ListCollections"),
+                (ObjectType::Global, "ListDatabases"),
+                (ObjectType::Global, "DescribeDatabase"),
                 (ObjectType::Collection, "DescribeCollection"),
                 (ObjectType::Collection, "CollectionStats"),
                 (ObjectType::Collection, "Search"),
@@ -168,6 +170,8 @@ pub async fn bootstrap(ctx: &RbacContext, root_password: Option<&str>) -> anyhow
             BUILTIN_READ_ONLY,
             &[
                 (ObjectType::Global, "ListCollections"),
+                (ObjectType::Global, "ListDatabases"),
+                (ObjectType::Global, "DescribeDatabase"),
                 (ObjectType::Collection, "DescribeCollection"),
                 (ObjectType::Collection, "CollectionStats"),
                 (ObjectType::Collection, "Search"),
@@ -286,6 +290,12 @@ pub fn route_priv(method: &str, path: &str) -> Option<RoutePriv> {
         ("POST", ["v1", "collections", _, "reindex"]) => c(Reindex, 2),
         ("DELETE", ["v1", "collections", _, "points"]) => c(Delete, 2),
         ("GET", ["v1", "collections", _, "points", _]) => c(Get, 2),
+        // ---- Database management (Milvus parity) ------------------------
+        ("GET", ["v1", "databases"]) => g(ListDatabases),
+        ("POST", ["v1", "databases"]) => g(CreateDatabase),
+        ("GET", ["v1", "databases", _]) => g(DescribeDatabase),
+        ("DELETE", ["v1", "databases", _]) => g(DropDatabase),
+        ("PATCH", ["v1", "databases", _, "properties"]) => g(AlterDatabase),
         ("GET", ["v1", "snapshots"]) => g(Snapshot),
         ("POST", ["v1", "snapshots"]) => g(Snapshot),
         ("DELETE", ["v1", "snapshots", _]) => g(Snapshot),

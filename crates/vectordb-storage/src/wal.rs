@@ -56,28 +56,85 @@ pub enum WalEntry {
     Meta { op: MetaOp },
 }
 
-/// Replicated metadata operation. Always tied to a single collection (or
-/// alias) and applied through Raft so all replicas converge.
+/// Replicated metadata operation. Applied through Raft so all replicas
+/// converge.
+///
+/// Collection-scoped variants implicitly operate within the request's active
+/// database. Database management lives at the bottom — new variants are
+/// appended to keep bincode's variant-index encoding wire-compatible with
+/// older WAL files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetaOp {
     /// Rename an existing collection. Fails if `new_name` already exists or
-    /// collides with an existing alias.
-    RenameCollection { old: String, new: String },
+    /// collides with an existing alias in the same database.
+    RenameCollection {
+        old: String,
+        new: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
     /// Create a new alias pointing to `collection`. Fails if `alias` exists
-    /// or collides with a collection name.
-    CreateAlias { alias: String, collection: String },
+    /// or collides with a collection name in the same database.
+    CreateAlias {
+        alias: String,
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
     /// Drop an alias (no-op if missing).
-    DropAlias { alias: String },
+    DropAlias {
+        alias: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
     /// Reassign an alias to a different collection.
-    AlterAlias { alias: String, collection: String },
+    AlterAlias {
+        alias: String,
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
     /// Merge `set` into the collection's properties, then remove `unset` keys.
     AlterCollectionProperties {
+        name: String,
+        #[serde(default = "default_database")]
+        database: String,
+        #[serde(default)]
+        set: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        unset: Vec<String>,
+    },
+    // ---- Database management (Milvus-parity) -----------------------------
+    /// Create a new database. Idempotent only if `name` does not already
+    /// exist — otherwise fails so callers see a clean conflict.
+    CreateDatabase {
+        name: String,
+        #[serde(default)]
+        properties: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        created_at_ms: u64,
+    },
+    /// Drop a database. `force=false` requires the database to be empty
+    /// (no collections, no aliases). `force=true` cascade-drops every
+    /// collection and alias inside it. The built-in `default` database
+    /// cannot be dropped.
+    DropDatabase {
+        name: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Merge `set` into the database's properties, then remove `unset` keys.
+    AlterDatabaseProperties {
         name: String,
         #[serde(default)]
         set: std::collections::BTreeMap<String, String>,
         #[serde(default)]
         unset: Vec<String>,
     },
+}
+
+fn default_database() -> String {
+    vectordb_core::DEFAULT_DATABASE.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -133,6 +133,13 @@ pub fn method_priv(method: &str) -> Option<MethodPriv> {
         // authenticated.
         "MutateCollectionMeta" => None,
         "ListAliases" | "DescribeAlias" => p(DescribeCollection, true),
+        // Database management — all global-scoped privileges (per project
+        // decision; per-database object grants can be added later).
+        "CreateDatabase" => p(CreateDatabase, true),
+        "DropDatabase" => p(DropDatabase, true),
+        "ListDatabases" => p(ListDatabases, true),
+        "DescribeDatabase" => p(DescribeDatabase, true),
+        "AlterDatabase" => p(AlterDatabase, true),
         _ => None,
     }
 }

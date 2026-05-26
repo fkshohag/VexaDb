@@ -6,11 +6,12 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
-    ApplyRbacRequest, BulkUpsertRequest, CollectionSpec, CompactWalRequest, CompactWalResponse,
-    CreateCollectionRequest, CreateSnapshotRequest, DeleteCollectionRequest, DeleteRequest,
-    DeleteSnapshotRequest, DescribeAliasRequest, DescribeCollectionRequest, DistanceMetric,
+    AlterDatabaseRequest, ApplyRbacRequest, BulkUpsertRequest, CollectionSpec, CompactWalRequest,
+    CompactWalResponse, CreateCollectionRequest, CreateDatabaseRequest, CreateSnapshotRequest,
+    DatabaseInfo, DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest, DescribeAliasRequest,
+    DescribeCollectionRequest, DescribeDatabaseRequest, DistanceMetric, DropDatabaseRequest,
     GetRbacSnapshotRequest, GetRequest, HealthRequest, HealthResponse, ImportChunk,
-    ListAliasesRequest, ListCollectionsRequest, ListSnapshotsRequest,
+    ListAliasesRequest, ListCollectionsRequest, ListDatabasesRequest, ListSnapshotsRequest,
     MutateCollectionMetaRequest, QueryRequest, QueryResponse, ReindexCollectionRequest,
     ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest, StatsResponse,
     UpsertRequest, VectorPoint,
@@ -198,6 +199,50 @@ impl VectorDbClient {
             .await?
             .into_inner();
         Ok(resp.collection)
+    }
+
+    // ---- Database management (Milvus v2 parity) ---------------------------
+
+    /// Create a database via `MetaOp::CreateDatabase` JSON payload.
+    pub async fn create_database(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .create_database(self.authed(CreateDatabaseRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a database via `MetaOp::DropDatabase` JSON payload.
+    pub async fn drop_database(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_database(self.authed(DropDatabaseRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Alter a database's properties via `MetaOp::AlterDatabaseProperties`.
+    pub async fn alter_database(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .alter_database(self.authed(AlterDatabaseRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_databases(&mut self) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .inner
+            .list_databases(self.authed(ListDatabasesRequest {}))
+            .await?
+            .into_inner();
+        Ok(resp.names)
+    }
+
+    pub async fn describe_database(&mut self, name: &str) -> anyhow::Result<DatabaseInfo> {
+        let resp = self
+            .inner
+            .describe_database(self.authed(DescribeDatabaseRequest { name: name.into() }))
+            .await?
+            .into_inner();
+        resp.info.context("missing database info")
     }
 
     pub async fn upsert(
@@ -597,5 +642,7 @@ pub fn cosine_collection(name: &str, dimension: u32) -> CollectionSpec {
         bm25_text_field: String::new(),
         scalar_quantization: false,
         properties: std::collections::HashMap::new(),
+        // Empty string → server-side defaults to "default".
+        database: String::new(),
     }
 }

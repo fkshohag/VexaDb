@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use vectordb_core::{
-    Bm25Index, CollectionConfig, DistanceMetric, Error as CoreError, Filter, HnswConfig, HnswIndex,
-    OutputOptions, PointId, ScalarQuantizer, ScoredPoint, SearchMode, SparseInvertedIndex,
-    SparseVector, Vector,
+    Bm25Index, CollectionConfig, DatabaseConfig, DistanceMetric, Error as CoreError, Filter,
+    HnswConfig, HnswIndex, OutputOptions, PointId, ScalarQuantizer, ScoredPoint, SearchMode,
+    SparseInvertedIndex, SparseVector, Vector, DEFAULT_DATABASE,
 };
 use vectordb_rbac::{RbacError, RbacOp, RbacSnapshot, RbacState};
 
@@ -19,6 +19,34 @@ use crate::wal::{BulkPoint, MetaOp, WalEntry, WriteAheadLog};
 use crate::wal_compact::export_state_to_wal;
 
 const RBAC_SNAPSHOT_KEY: &[u8] = b"__rbac_snapshot__";
+
+// ---------- name qualification helpers ------------------------------------
+//
+// Internally the engine identifies every collection / alias by a
+// *fully-qualified name* `"<database>/<simple_name>"`. The public API still
+// accepts a single string for back-compat: any input without a `/` is
+// implicitly scoped to [`DEFAULT_DATABASE`]. This keeps callers that pre-date
+// the multi-database refactor working unchanged while letting the gateway
+// route per-database requests by simply forming `"db/name"` upstream.
+
+/// Return a fully-qualified collection / alias name. Bare names default to
+/// the implicit `default` database.
+fn qname(s: &str) -> String {
+    if s.contains('/') {
+        s.to_string()
+    } else {
+        format!("{DEFAULT_DATABASE}/{s}")
+    }
+}
+
+/// Split a fully-qualified name into `(database, simple_name)`. Bare names
+/// fall through to the default database.
+fn split_fq(fq: &str) -> (&str, &str) {
+    match fq.find('/') {
+        Some(i) => (&fq[..i], &fq[i + 1..]),
+        None => (DEFAULT_DATABASE, fq),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -44,6 +72,12 @@ pub enum EngineError {
     AliasNotFound(String),
     #[error("invalid meta op: {0}")]
     InvalidMeta(String),
+    #[error("database exists: {0}")]
+    DatabaseExists(String),
+    #[error("database not found: {0}")]
+    DatabaseNotFound(String),
+    #[error("database not empty: {0} (use force=true to cascade drop)")]
+    DatabaseNotEmpty(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -91,9 +125,14 @@ pub struct CollectionEngine {
     /// snapshot in `meta_db` and replicated through the same WAL/Raft as
     /// collection operations via [`WalEntry::Rbac`].
     rbac: RwLock<RbacState>,
-    /// alias -> collection. Persisted under `alias:<name>` keys in `meta_db`
-    /// and replicated through `WalEntry::Meta` (Milvus-parity).
+    /// alias -> collection. Both keys and values are fully-qualified
+    /// (`db/name`). Persisted under `alias:<fq_alias>` keys in `meta_db` and
+    /// replicated through `WalEntry::Meta` (Milvus-parity).
     aliases: RwLock<HashMap<String, String>>,
+    /// Database registry: name -> config (properties, created_at_ms). The
+    /// `default` database is always present (auto-seeded on first open).
+    /// Persisted under `database:<name>` keys.
+    databases: RwLock<HashMap<String, DatabaseConfig>>,
 }
 
 pub(crate) const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
@@ -119,12 +158,15 @@ impl CollectionEngine {
             wal: RwLock::new(wal),
             rbac: RwLock::new(RbacState::new()),
             aliases: RwLock::new(HashMap::new()),
+            databases: RwLock::new(HashMap::new()),
         };
 
         engine.load_rbac_from_meta()?;
+        engine.load_databases_from_meta()?;
         engine.replay_wal()?;
         engine.load_collections_from_meta()?;
         engine.load_aliases_from_meta()?;
+        engine.ensure_default_database()?;
         Ok(engine)
     }
 
@@ -178,6 +220,72 @@ impl CollectionEngine {
         Ok(())
     }
 
+    // ---- Database registry (Milvus parity) -------------------------------
+
+    fn load_databases_from_meta(&self) -> Result<()> {
+        let meta = self.meta_db.read();
+        let iter = meta.iterator(rocksdb::IteratorMode::Start);
+        let mut dbs = self.databases.write();
+        for item in iter {
+            let (key, value) = item.map_err(|e| EngineError::Rocks(e.to_string()))?;
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(name) = key_str.strip_prefix("database:") {
+                let cfg: DatabaseConfig = serde_json::from_slice(&value)
+                    .map_err(|e| EngineError::Rocks(format!("decode db {name}: {e}")))?;
+                dbs.insert(cfg.name.clone(), cfg);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_default_database(&self) -> Result<()> {
+        if self.databases.read().contains_key(DEFAULT_DATABASE) {
+            return Ok(());
+        }
+        let cfg = DatabaseConfig::new(DEFAULT_DATABASE);
+        self.persist_database(&cfg)?;
+        self.databases.write().insert(cfg.name.clone(), cfg);
+        Ok(())
+    }
+
+    fn persist_database(&self, cfg: &DatabaseConfig) -> Result<()> {
+        let key = format!("database:{}", cfg.name);
+        let bytes = serde_json::to_vec(cfg).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(key, bytes)
+            .map_err(|e| EngineError::Rocks(e.to_string()))
+    }
+
+    fn delete_database_meta(&self, name: &str) -> Result<()> {
+        let key = format!("database:{name}");
+        self.meta_db
+            .read()
+            .delete(key)
+            .map_err(|e| EngineError::Rocks(e.to_string()))
+    }
+
+    /// Names of every database (sorted for stable output).
+    pub fn list_databases(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.databases.read().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Full config for a database (including properties).
+    pub fn describe_database(&self, name: &str) -> Result<DatabaseConfig> {
+        self.databases
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| EngineError::DatabaseNotFound(name.to_string()))
+    }
+
+    /// True iff `db` currently exists.
+    pub fn database_exists(&self, db: &str) -> bool {
+        self.databases.read().contains_key(db)
+    }
+
     // ---- Aliases / rename / properties (Milvus parity) --------------------
 
     fn load_aliases_from_meta(&self) -> Result<()> {
@@ -190,23 +298,27 @@ impl CollectionEngine {
             if !key_str.starts_with("alias:") {
                 continue;
             }
-            let alias = key_str.trim_start_matches("alias:").to_string();
-            let coll = String::from_utf8_lossy(&value).to_string();
-            aliases.insert(alias, coll);
+            // Both legacy `alias:<name>` (default-db) and new `alias:<db>/<name>`
+            // keys are accepted; the value is stored as a fully-qualified
+            // collection name to keep cross-database aliases unambiguous.
+            let fq_alias = qname(key_str.trim_start_matches("alias:"));
+            let raw_target = String::from_utf8_lossy(&value).to_string();
+            let target = qname(&raw_target);
+            aliases.insert(fq_alias, target);
         }
         Ok(())
     }
 
-    fn persist_alias(&self, alias: &str, collection: &str) -> Result<()> {
-        let key = format!("alias:{alias}");
+    fn persist_alias(&self, fq_alias: &str, fq_collection: &str) -> Result<()> {
+        let key = format!("alias:{fq_alias}");
         self.meta_db
             .read()
-            .put(key, collection.as_bytes())
+            .put(key, fq_collection.as_bytes())
             .map_err(|e| EngineError::Rocks(e.to_string()))
     }
 
-    fn delete_alias_meta(&self, alias: &str) -> Result<()> {
-        let key = format!("alias:{alias}");
+    fn delete_alias_meta(&self, fq_alias: &str) -> Result<()> {
+        let key = format!("alias:{fq_alias}");
         self.meta_db
             .read()
             .delete(key)
@@ -225,48 +337,95 @@ impl CollectionEngine {
     fn validate_meta(&self, op: &MetaOp) -> Result<()> {
         let collections = self.collections.read();
         let aliases = self.aliases.read();
+        let databases = self.databases.read();
         match op {
-            MetaOp::RenameCollection { old, new } => {
-                if !collections.contains_key(old) {
+            MetaOp::RenameCollection { old, new, database } => {
+                check_simple_name(new)?;
+                let fq_old = format!("{database}/{old}");
+                let fq_new = format!("{database}/{new}");
+                if !collections.contains_key(&fq_old) {
                     return Err(EngineError::CollectionNotFound(old.clone()));
                 }
                 if old == new {
                     return Ok(());
                 }
-                if collections.contains_key(new) {
+                if collections.contains_key(&fq_new) {
                     return Err(EngineError::CollectionExists(new.clone()));
                 }
-                if aliases.contains_key(new) {
+                if aliases.contains_key(&fq_new) {
                     return Err(EngineError::InvalidMeta(format!(
-                        "new name {new} collides with alias"
+                        "new name {new} collides with alias in db {database}"
                     )));
                 }
             }
-            MetaOp::CreateAlias { alias, collection } => {
-                if !collections.contains_key(collection) {
+            MetaOp::CreateAlias {
+                alias,
+                collection,
+                database,
+            } => {
+                check_simple_name(alias)?;
+                let fq_alias = format!("{database}/{alias}");
+                let fq_target = format!("{database}/{collection}");
+                if !collections.contains_key(&fq_target) {
                     return Err(EngineError::CollectionNotFound(collection.clone()));
                 }
-                if aliases.contains_key(alias) {
+                if aliases.contains_key(&fq_alias) {
                     return Err(EngineError::AliasExists(alias.clone()));
                 }
-                if collections.contains_key(alias) {
+                if collections.contains_key(&fq_alias) {
                     return Err(EngineError::InvalidMeta(format!(
-                        "alias {alias} collides with existing collection"
+                        "alias {alias} collides with existing collection in db {database}"
                     )));
                 }
             }
-            MetaOp::AlterAlias { alias, collection } => {
-                if !collections.contains_key(collection) {
+            MetaOp::AlterAlias {
+                alias,
+                collection,
+                database,
+            } => {
+                let fq_alias = format!("{database}/{alias}");
+                let fq_target = format!("{database}/{collection}");
+                if !collections.contains_key(&fq_target) {
                     return Err(EngineError::CollectionNotFound(collection.clone()));
                 }
-                if !aliases.contains_key(alias) {
+                if !aliases.contains_key(&fq_alias) {
                     return Err(EngineError::AliasNotFound(alias.clone()));
                 }
             }
-            MetaOp::DropAlias { alias: _ } => { /* idempotent */ }
-            MetaOp::AlterCollectionProperties { name, .. } => {
-                if !collections.contains_key(name) {
+            MetaOp::DropAlias { .. } => { /* idempotent */ }
+            MetaOp::AlterCollectionProperties { name, database, .. } => {
+                let fq = format!("{database}/{name}");
+                if !collections.contains_key(&fq) {
                     return Err(EngineError::CollectionNotFound(name.clone()));
+                }
+            }
+            MetaOp::CreateDatabase { name, .. } => {
+                check_simple_name(name)?;
+                if databases.contains_key(name) {
+                    return Err(EngineError::DatabaseExists(name.clone()));
+                }
+            }
+            MetaOp::DropDatabase { name, force } => {
+                if name == DEFAULT_DATABASE {
+                    return Err(EngineError::InvalidMeta(
+                        "the built-in `default` database cannot be dropped".into(),
+                    ));
+                }
+                if !databases.contains_key(name) {
+                    return Err(EngineError::DatabaseNotFound(name.clone()));
+                }
+                if !force {
+                    let prefix = format!("{name}/");
+                    let has_collection = collections.keys().any(|k| k.starts_with(&prefix));
+                    let has_alias = aliases.keys().any(|k| k.starts_with(&prefix));
+                    if has_collection || has_alias {
+                        return Err(EngineError::DatabaseNotEmpty(name.clone()));
+                    }
+                }
+            }
+            MetaOp::AlterDatabaseProperties { name, .. } => {
+                if !databases.contains_key(name) {
+                    return Err(EngineError::DatabaseNotFound(name.clone()));
                 }
             }
         }
@@ -275,69 +434,171 @@ impl CollectionEngine {
 
     fn apply_meta(&self, op: &MetaOp) -> Result<()> {
         match op {
-            MetaOp::RenameCollection { old, new } => self.apply_rename(old, new),
-            MetaOp::CreateAlias { alias, collection }
-            | MetaOp::AlterAlias { alias, collection } => {
-                self.persist_alias(alias, collection)?;
-                self.aliases
-                    .write()
-                    .insert(alias.clone(), collection.clone());
+            MetaOp::RenameCollection {
+                old,
+                new,
+                database,
+            } => self.apply_rename(database, old, new),
+            MetaOp::CreateAlias {
+                alias,
+                collection,
+                database,
+            }
+            | MetaOp::AlterAlias {
+                alias,
+                collection,
+                database,
+            } => {
+                let fq_alias = format!("{database}/{alias}");
+                let fq_target = format!("{database}/{collection}");
+                self.persist_alias(&fq_alias, &fq_target)?;
+                self.aliases.write().insert(fq_alias, fq_target);
                 Ok(())
             }
-            MetaOp::DropAlias { alias } => {
-                self.delete_alias_meta(alias)?;
-                self.aliases.write().remove(alias);
+            MetaOp::DropAlias { alias, database } => {
+                let fq_alias = format!("{database}/{alias}");
+                self.delete_alias_meta(&fq_alias)?;
+                self.aliases.write().remove(&fq_alias);
                 Ok(())
             }
-            MetaOp::AlterCollectionProperties { name, set, unset } => {
-                self.apply_alter_properties(name, set, unset)
+            MetaOp::AlterCollectionProperties {
+                name,
+                database,
+                set,
+                unset,
+            } => {
+                let fq = format!("{database}/{name}");
+                self.apply_alter_properties(&fq, set, unset)
+            }
+            MetaOp::CreateDatabase {
+                name,
+                properties,
+                created_at_ms,
+            } => self.apply_create_database(name, properties.clone(), *created_at_ms),
+            MetaOp::DropDatabase { name, force } => self.apply_drop_database(name, *force),
+            MetaOp::AlterDatabaseProperties { name, set, unset } => {
+                self.apply_alter_database_properties(name, set, unset)
             }
         }
     }
 
-    fn apply_rename(&self, old: &str, new: &str) -> Result<()> {
-        if old == new {
-            return Ok(());
-        }
-        let mut collections = self.collections.write();
-        let mut state = collections
-            .remove(old)
-            .ok_or_else(|| EngineError::CollectionNotFound(old.to_string()))?;
-        state.config.name = new.to_string();
-        let json =
-            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
-        let meta = self.meta_db.read();
-        meta.delete(format!("collection:{old}"))
-            .map_err(|e| EngineError::Rocks(e.to_string()))?;
-        meta.put(format!("collection:{new}"), json)
-            .map_err(|e| EngineError::Rocks(e.to_string()))?;
-        drop(meta);
-        // Rewrite any aliases that pointed to `old`.
-        let mut aliases = self.aliases.write();
-        for v in aliases.values_mut() {
-            if v == old {
-                *v = new.to_string();
-            }
-        }
-        for (alias, target) in aliases.iter() {
-            if target == new {
-                self.persist_alias(alias, new)?;
-            }
-        }
-        collections.insert(new.to_string(), state);
+    fn apply_create_database(
+        &self,
+        name: &str,
+        properties: std::collections::BTreeMap<String, String>,
+        created_at_ms: u64,
+    ) -> Result<()> {
+        let cfg = DatabaseConfig {
+            name: name.to_string(),
+            properties,
+            created_at_ms,
+        };
+        self.persist_database(&cfg)?;
+        self.databases.write().insert(name.to_string(), cfg);
         Ok(())
     }
 
-    fn apply_alter_properties(
+    fn apply_drop_database(&self, name: &str, force: bool) -> Result<()> {
+        // Cascade-drop child collections and aliases when force=true.
+        // Build the list first to avoid holding read guards across the
+        // mutating apply_* calls.
+        if force {
+            let prefix = format!("{name}/");
+            let victim_collections: Vec<String> = self
+                .collections
+                .read()
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for fq in &victim_collections {
+                self.apply_delete_collection(fq)?;
+            }
+            let victim_aliases: Vec<String> = self
+                .aliases
+                .read()
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for fq_alias in &victim_aliases {
+                self.delete_alias_meta(fq_alias)?;
+                self.aliases.write().remove(fq_alias);
+            }
+        }
+        self.delete_database_meta(name)?;
+        self.databases.write().remove(name);
+        Ok(())
+    }
+
+    fn apply_alter_database_properties(
         &self,
         name: &str,
         set: &std::collections::BTreeMap<String, String>,
         unset: &[String],
     ) -> Result<()> {
+        let mut dbs = self.databases.write();
+        let cfg = dbs
+            .get_mut(name)
+            .ok_or_else(|| EngineError::DatabaseNotFound(name.to_string()))?;
+        for (k, v) in set {
+            cfg.properties.insert(k.clone(), v.clone());
+        }
+        for k in unset {
+            cfg.properties.remove(k);
+        }
+        let clone = cfg.clone();
+        drop(dbs);
+        self.persist_database(&clone)
+    }
+
+    fn apply_rename(&self, database: &str, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let fq_old = format!("{database}/{old}");
+        let fq_new = format!("{database}/{new}");
+        let mut collections = self.collections.write();
+        let mut state = collections
+            .remove(&fq_old)
+            .ok_or_else(|| EngineError::CollectionNotFound(old.to_string()))?;
+        state.config.name = new.to_string();
+        state.config.database = database.to_string();
+        let json =
+            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        let meta = self.meta_db.read();
+        meta.delete(format!("collection:{fq_old}"))
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        meta.put(format!("collection:{fq_new}"), json)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        drop(meta);
+        // Rewrite any aliases that pointed to `fq_old` (always within the
+        // same database since aliases never cross databases).
+        let mut aliases = self.aliases.write();
+        for v in aliases.values_mut() {
+            if v == &fq_old {
+                *v = fq_new.clone();
+            }
+        }
+        for (alias, target) in aliases.iter() {
+            if target == &fq_new {
+                self.persist_alias(alias, &fq_new)?;
+            }
+        }
+        collections.insert(fq_new, state);
+        Ok(())
+    }
+
+    fn apply_alter_properties(
+        &self,
+        fq: &str,
+        set: &std::collections::BTreeMap<String, String>,
+        unset: &[String],
+    ) -> Result<()> {
         let mut collections = self.collections.write();
         let state = collections
-            .get_mut(name)
-            .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))?;
+            .get_mut(fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.to_string()))?;
         for (k, v) in set {
             state.config.properties.insert(k.clone(), v.clone());
         }
@@ -348,24 +609,27 @@ impl CollectionEngine {
             serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
         self.meta_db
             .read()
-            .put(format!("collection:{name}"), json)
+            .put(format!("collection:{fq}"), json)
             .map_err(|e| EngineError::Rocks(e.to_string()))?;
         Ok(())
     }
 
-    /// Resolve an alias to its target collection name. Returns the input
-    /// unchanged when it's already a collection.
+    /// Resolve an alias to its target collection name. Input/output are FQN
+    /// (`db/name`); bare names are auto-qualified to the default database.
+    /// If the input is neither an alias nor a known collection it is returned
+    /// untouched (qualified) so callers see a consistent FQN form.
     pub fn resolve_alias(&self, name: &str) -> String {
-        if self.collections.read().contains_key(name) {
-            return name.to_string();
+        let fq = qname(name);
+        if self.collections.read().contains_key(&fq) {
+            return fq;
         }
-        if let Some(target) = self.aliases.read().get(name).cloned() {
+        if let Some(target) = self.aliases.read().get(&fq).cloned() {
             return target;
         }
-        name.to_string()
+        fq
     }
 
-    /// All aliases as `(alias, collection)` pairs.
+    /// Every alias in the cluster as `(fq_alias, fq_collection)` pairs.
     pub fn list_aliases(&self) -> Vec<(String, String)> {
         self.aliases
             .read()
@@ -374,26 +638,30 @@ impl CollectionEngine {
             .collect()
     }
 
-    /// Aliases pointing to `collection`.
+    /// Aliases (FQ form) pointing to `collection` (FQ form; bare names are
+    /// auto-qualified to the default database).
     pub fn aliases_for(&self, collection: &str) -> Vec<String> {
+        let fq = qname(collection);
         self.aliases
             .read()
             .iter()
-            .filter(|(_, target)| target.as_str() == collection)
+            .filter(|(_, target)| target.as_str() == fq.as_str())
             .map(|(a, _)| a.clone())
             .collect()
     }
 
-    /// Resolve a single alias to its collection. Returns `Err(AliasNotFound)`.
+    /// Resolve a single alias (FQ or bare) to its collection (FQ).
     pub fn describe_alias(&self, alias: &str) -> Result<String> {
+        let fq = qname(alias);
         self.aliases
             .read()
-            .get(alias)
+            .get(&fq)
             .cloned()
             .ok_or_else(|| EngineError::AliasNotFound(alias.to_string()))
     }
 
     /// Returns the properties map for `name` (after alias resolution).
+    /// Accepts FQ or bare names.
     pub fn properties(&self, name: &str) -> Result<std::collections::BTreeMap<String, String>> {
         let resolved = self.resolve_alias(name);
         let collections = self.collections.read();
@@ -441,9 +709,12 @@ impl CollectionEngine {
 
         self.collections.write().clear();
         self.aliases.write().clear();
+        self.databases.write().clear();
+        self.load_databases_from_meta()?;
         self.replay_wal()?;
         self.load_collections_from_meta()?;
         self.load_aliases_from_meta()?;
+        self.ensure_default_database()?;
         Ok(())
     }
 
@@ -541,16 +812,35 @@ impl CollectionEngine {
             if !key_str.starts_with("collection:") {
                 continue;
             }
-            let name = key_str.trim_start_matches("collection:").to_string();
-            let config: CollectionConfig =
+            // Either FQ (`collection:db/name`) or legacy bare (`collection:name`).
+            // `qname()` normalizes the latter into `default/name`.
+            let fq = qname(key_str.trim_start_matches("collection:"));
+            let mut config: CollectionConfig =
                 serde_json::from_slice(&value).map_err(|e| EngineError::Rocks(e.to_string()))?;
-            self.get_or_create_state(&name, config);
+            // Make sure the in-memory config reflects the FQN we just derived
+            // even when the persisted JSON predates the `database` field.
+            let (db_seg, name_seg) = split_fq(&fq);
+            if config.database.is_empty() {
+                config.database = db_seg.to_string();
+            }
+            if config.name.is_empty() {
+                config.name = name_seg.to_string();
+            }
+            self.get_or_create_state(&fq, config);
         }
         Ok(())
     }
 
-    pub fn create_collection(&self, config: CollectionConfig) -> Result<()> {
-        let key = format!("collection:{}", config.name);
+    pub fn create_collection(&self, mut config: CollectionConfig) -> Result<()> {
+        if config.database.is_empty() {
+            config.database = DEFAULT_DATABASE.to_string();
+        }
+        check_simple_name(&config.name)?;
+        if !self.database_exists(&config.database) {
+            return Err(EngineError::DatabaseNotFound(config.database.clone()));
+        }
+        let fq = format!("{}/{}", config.database, config.name);
+        let key = format!("collection:{fq}");
         if self
             .meta_db
             .read()
@@ -568,11 +858,10 @@ impl CollectionEngine {
     }
 
     pub fn delete_collection(&self, name: &str) -> Result<()> {
-        let entry = WalEntry::DeleteCollection {
-            name: name.to_string(),
-        };
+        let fq = qname(name);
+        let entry = WalEntry::DeleteCollection { name: fq.clone() };
         self.wal.write().append(&entry)?;
-        self.apply_delete_collection(name)
+        self.apply_delete_collection(&fq)
     }
 
     /// Durably append and apply (Raft commit path).
@@ -585,7 +874,7 @@ impl CollectionEngine {
     pub fn apply_entry(&self, entry: &WalEntry) -> Result<()> {
         match entry {
             WalEntry::CreateCollection { config } => self.apply_create_collection(config.clone()),
-            WalEntry::DeleteCollection { name } => self.apply_delete_collection(name),
+            WalEntry::DeleteCollection { name } => self.apply_delete_collection(&qname(name)),
             WalEntry::Upsert {
                 collection,
                 id,
@@ -593,9 +882,10 @@ impl CollectionEngine {
                 payload,
                 sparse,
             } => {
-                self.ensure_collection_loaded(collection)?;
+                let fq = qname(collection);
+                self.ensure_collection_loaded(&fq)?;
                 self.apply_upsert(
-                    collection,
+                    &fq,
                     id.clone(),
                     vector.clone(),
                     payload.clone(),
@@ -603,14 +893,16 @@ impl CollectionEngine {
                 )
             }
             WalEntry::Delete { collection, id } => {
-                self.ensure_collection_loaded(collection)?;
-                self.apply_delete(collection, id)
+                let fq = qname(collection);
+                self.ensure_collection_loaded(&fq)?;
+                self.apply_delete(&fq, id)
             }
             WalEntry::BulkUpsert { collection, points } => {
-                self.ensure_collection_loaded(collection)?;
+                let fq = qname(collection);
+                self.ensure_collection_loaded(&fq)?;
                 for p in points {
                     self.apply_upsert(
-                        collection,
+                        &fq,
                         p.id.clone(),
                         p.vector.clone(),
                         p.payload.clone(),
@@ -627,37 +919,56 @@ impl CollectionEngine {
 
     /// Idempotent apply (used by WAL replay and Raft followers): persist config
     /// to RocksDB and ensure the in-memory state exists.
-    fn apply_create_collection(&self, config: CollectionConfig) -> Result<()> {
+    fn apply_create_collection(&self, mut config: CollectionConfig) -> Result<()> {
+        if config.database.is_empty() {
+            config.database = DEFAULT_DATABASE.to_string();
+        }
         config.validate().map_err(EngineError::Core)?;
-        let key = format!("collection:{}", config.name);
+        let fq = format!("{}/{}", config.database, config.name);
+        let key = format!("collection:{fq}");
         let json = serde_json::to_vec(&config).map_err(|e| EngineError::Rocks(e.to_string()))?;
         self.meta_db
             .read()
             .put(key, json)
             .map_err(|e| EngineError::Rocks(e.to_string()))?;
-        let name = config.name.clone();
-        self.get_or_create_state(&name, config);
+        self.get_or_create_state(&fq, config);
         Ok(())
     }
 
-    fn apply_delete_collection(&self, name: &str) -> Result<()> {
-        let key = format!("collection:{name}");
+    /// Delete by FQ name (`db/name`). Bare callers should pre-qualify.
+    fn apply_delete_collection(&self, fq: &str) -> Result<()> {
+        let key = format!("collection:{fq}");
         self.meta_db
             .read()
             .delete(key)
             .map_err(|e| EngineError::Rocks(e.to_string()))?;
-        self.collections.write().remove(name);
+        self.collections.write().remove(fq);
         Ok(())
     }
 
+    /// Every collection in the cluster, as fully-qualified names (`db/name`).
     pub fn list_collections(&self) -> Vec<String> {
         self.collections.read().keys().cloned().collect()
     }
 
+    /// Simple collection names that belong to `database`.
+    pub fn list_collections_in_database(&self, database: &str) -> Vec<String> {
+        let prefix = format!("{database}/");
+        let mut names: Vec<String> = self
+            .collections
+            .read()
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix).map(|s| s.to_string()))
+            .collect();
+        names.sort();
+        names
+    }
+
     pub fn describe_collection(&self, name: &str) -> Result<CollectionConfig> {
+        let fq = self.resolve_alias(name);
         let collections = self.collections.read();
         collections
-            .get(name)
+            .get(&fq)
             .map(|s| s.config.clone())
             .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))
     }
@@ -670,9 +981,10 @@ impl CollectionEngine {
         payload: Option<Vec<u8>>,
         sparse: Option<SparseVector>,
     ) -> Result<()> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         let entry = WalEntry::Upsert {
-            collection: collection.to_string(),
+            collection: fq,
             id: id.clone(),
             vector: vector.clone(),
             payload: payload.clone(),
@@ -682,9 +994,10 @@ impl CollectionEngine {
     }
 
     pub fn delete(&self, collection: &str, id: &str) -> Result<()> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         let entry = WalEntry::Delete {
-            collection: collection.to_string(),
+            collection: fq,
             id: id.to_string(),
         };
         self.commit_entry(&entry)
@@ -697,7 +1010,8 @@ impl CollectionEngine {
         points: Vec<BulkPoint>,
         chunk_size: usize,
     ) -> Result<u64> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         if points.is_empty() {
             return Ok(0);
         }
@@ -705,7 +1019,7 @@ impl CollectionEngine {
         let mut total = 0u64;
         for chunk in points.chunks(chunk_size) {
             let entry = WalEntry::BulkUpsert {
-                collection: collection.to_string(),
+                collection: fq.clone(),
                 points: chunk.to_vec(),
             };
             self.commit_entry(&entry)?;
@@ -741,11 +1055,12 @@ impl CollectionEngine {
 
     /// Rebuild HNSW from stored vectors (online reindex).
     pub fn reindex_collection(&self, name: &str) -> Result<u64> {
-        self.ensure_collection_loaded(name)?;
+        let fq = self.resolve_alias(name);
+        self.ensure_collection_loaded(&fq)?;
         let (config, points) = {
             let collections = self.collections.read();
             let state = collections
-                .get(name)
+                .get(&fq)
                 .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))?;
             let points = state.index.iter_points();
             (state.config.clone(), points)
@@ -763,7 +1078,7 @@ impl CollectionEngine {
         let n = points.len() as u64;
         let mut collections = self.collections.write();
         let state = collections
-            .get_mut(name)
+            .get_mut(&fq)
             .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))?;
         state.index = new_index;
         Ok(n)
@@ -825,10 +1140,11 @@ impl CollectionEngine {
         k: usize,
         output: OutputOptions,
     ) -> Result<Vec<ScoredPoint>> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         let collections = self.collections.read();
         let state = collections
-            .get(collection)
+            .get(&fq)
             .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
         let mut hits = crate::search::hybrid_search(state, k, params).map_err(EngineError::Core)?;
         crate::output::attach_outputs(state, &mut hits, &output);
@@ -845,10 +1161,11 @@ impl CollectionEngine {
         offset: usize,
         output: OutputOptions,
     ) -> Result<Vec<ScoredPoint>> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         let collections = self.collections.read();
         let state = collections
-            .get(collection)
+            .get(&fq)
             .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
         let limit = limit.max(1);
         let mut candidates: Vec<String> = if ids.is_empty() {
@@ -895,10 +1212,11 @@ impl CollectionEngine {
         collection: &str,
         id: &str,
     ) -> Result<Option<(Vector, Option<Value>)>> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         let collections = self.collections.read();
         let state = collections
-            .get(collection)
+            .get(&fq)
             .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
         let vector = state.index.get_vector(id);
         let payload = state.payloads.get(id).cloned();
@@ -914,10 +1232,11 @@ impl CollectionEngine {
         cursor: &str,
         limit: usize,
     ) -> Result<(Vec<(String, Vector, Option<Value>)>, String)> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         let collections = self.collections.read();
         let state = collections
-            .get(collection)
+            .get(&fq)
             .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
         let mut all = state.index.iter_points();
         all.sort_by(|a, b| a.0.cmp(&b.0));
@@ -945,10 +1264,11 @@ impl CollectionEngine {
     }
 
     pub fn stats(&self, collection: &str) -> Result<CollectionStats> {
-        self.ensure_collection_loaded(collection)?;
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
         let collections = self.collections.read();
         let state = collections
-            .get(collection)
+            .get(&fq)
             .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
         Ok(CollectionStats {
             name: collection.to_string(),
@@ -974,26 +1294,35 @@ impl CollectionEngine {
             let (key, _) = item.map_err(|e| EngineError::Rocks(e.to_string()))?;
             let key_str = String::from_utf8_lossy(&key);
             if let Some(name) = key_str.strip_prefix("collection:") {
-                self.ensure_collection_loaded(name)?;
+                let fq = qname(name);
+                self.ensure_collection_loaded(&fq)?;
             }
         }
         Ok(())
     }
 
-    fn ensure_collection_loaded(&self, name: &str) -> Result<()> {
-        if self.collections.read().contains_key(name) {
+    /// `fq` must already be fully qualified (`db/name`).
+    fn ensure_collection_loaded(&self, fq: &str) -> Result<()> {
+        if self.collections.read().contains_key(fq) {
             return Ok(());
         }
-        let key = format!("collection:{name}");
+        let key = format!("collection:{fq}");
         let raw = self
             .meta_db
             .read()
             .get(key)
             .map_err(|e| EngineError::Rocks(e.to_string()))?
-            .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))?;
-        let config: CollectionConfig =
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.to_string()))?;
+        let mut config: CollectionConfig =
             serde_json::from_slice(&raw).map_err(|e| EngineError::Rocks(e.to_string()))?;
-        self.get_or_create_state(name, config);
+        let (db_seg, name_seg) = split_fq(fq);
+        if config.database.is_empty() {
+            config.database = db_seg.to_string();
+        }
+        if config.name.is_empty() {
+            config.name = name_seg.to_string();
+        }
+        self.get_or_create_state(fq, config);
         Ok(())
     }
 
@@ -1100,6 +1429,21 @@ impl CollectionEngine {
         }
         Ok(())
     }
+}
+
+/// Reject simple names that would collide with the FQN parser (database/name
+/// separator) or that are otherwise empty. Applied to user-supplied
+/// collection / alias / database names, never to FQNs.
+fn check_simple_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(EngineError::InvalidMeta("empty name".into()));
+    }
+    if name.contains('/') {
+        return Err(EngineError::InvalidMeta(format!(
+            "name {name:?} must not contain '/' (used as database separator)"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_payload(bytes: &[u8]) -> Result<Value> {
@@ -1243,6 +1587,220 @@ mod m4_tests {
             cursor = next;
         }
         assert_eq!(seen.len(), 100);
+    }
+
+    // ---- Database management (Milvus parity) ------------------------------
+
+    #[test]
+    fn default_database_is_seeded_on_open() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let names = engine.list_databases();
+        assert_eq!(names, vec!["default".to_string()]);
+        let cfg = engine.describe_database("default").unwrap();
+        assert_eq!(cfg.name, "default");
+    }
+
+    #[test]
+    fn create_describe_drop_database() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+
+        // Create with one property.
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("replica.number".to_string(), "2".to_string());
+        engine
+            .commit_meta(MetaOp::CreateDatabase {
+                name: "analytics".into(),
+                properties: props,
+                created_at_ms: 42,
+            })
+            .unwrap();
+
+        // List and describe.
+        let dbs = engine.list_databases();
+        assert!(dbs.contains(&"analytics".to_string()));
+        let cfg = engine.describe_database("analytics").unwrap();
+        assert_eq!(cfg.properties.get("replica.number"), Some(&"2".to_string()));
+        assert_eq!(cfg.created_at_ms, 42);
+
+        // Drop.
+        engine
+            .commit_meta(MetaOp::DropDatabase {
+                name: "analytics".into(),
+                force: false,
+            })
+            .unwrap();
+        assert!(engine.describe_database("analytics").is_err());
+    }
+
+    #[test]
+    fn cannot_drop_default_database() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let err = engine
+            .commit_meta(MetaOp::DropDatabase {
+                name: "default".into(),
+                force: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidMeta(_)));
+    }
+
+    #[test]
+    fn drop_database_requires_force_when_non_empty() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine
+            .commit_meta(MetaOp::CreateDatabase {
+                name: "ws".into(),
+                properties: Default::default(),
+                created_at_ms: 0,
+            })
+            .unwrap();
+        let mut cfg = test_config("docs");
+        cfg.database = "ws".into();
+        engine.create_collection(cfg).unwrap();
+
+        let err = engine
+            .commit_meta(MetaOp::DropDatabase {
+                name: "ws".into(),
+                force: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::DatabaseNotEmpty(_)));
+
+        engine
+            .commit_meta(MetaOp::DropDatabase {
+                name: "ws".into(),
+                force: true,
+            })
+            .unwrap();
+        // Cascade should have removed the collection too.
+        assert!(!engine
+            .list_collections()
+            .iter()
+            .any(|n| n.starts_with("ws/")));
+    }
+
+    #[test]
+    fn collections_are_per_database() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine
+            .commit_meta(MetaOp::CreateDatabase {
+                name: "team_a".into(),
+                properties: Default::default(),
+                created_at_ms: 0,
+            })
+            .unwrap();
+        engine
+            .commit_meta(MetaOp::CreateDatabase {
+                name: "team_b".into(),
+                properties: Default::default(),
+                created_at_ms: 0,
+            })
+            .unwrap();
+
+        // Same simple name in two databases.
+        let mut a = test_config("articles");
+        a.database = "team_a".into();
+        let mut b = test_config("articles");
+        b.database = "team_b".into();
+        engine.create_collection(a).unwrap();
+        engine.create_collection(b).unwrap();
+
+        assert_eq!(
+            engine.list_collections_in_database("team_a"),
+            vec!["articles".to_string()]
+        );
+        assert_eq!(
+            engine.list_collections_in_database("team_b"),
+            vec!["articles".to_string()]
+        );
+
+        // Upserts target the FQN; engine writes into the correct namespace.
+        engine
+            .upsert(
+                "team_a/articles",
+                "x".into(),
+                Vector::new(vec![1.0, 0.0, 0.0, 0.0]),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(engine.stats("team_a/articles").unwrap().vector_count, 1);
+        assert_eq!(engine.stats("team_b/articles").unwrap().vector_count, 0);
+    }
+
+    #[test]
+    fn alter_and_drop_database_properties() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine
+            .commit_meta(MetaOp::CreateDatabase {
+                name: "billing".into(),
+                properties: Default::default(),
+                created_at_ms: 0,
+            })
+            .unwrap();
+
+        let mut set = std::collections::BTreeMap::new();
+        set.insert("ttl".into(), "30d".into());
+        set.insert("tier".into(), "hot".into());
+        engine
+            .commit_meta(MetaOp::AlterDatabaseProperties {
+                name: "billing".into(),
+                set,
+                unset: vec![],
+            })
+            .unwrap();
+        let cfg = engine.describe_database("billing").unwrap();
+        assert_eq!(cfg.properties.get("ttl"), Some(&"30d".to_string()));
+        assert_eq!(cfg.properties.get("tier"), Some(&"hot".to_string()));
+
+        engine
+            .commit_meta(MetaOp::AlterDatabaseProperties {
+                name: "billing".into(),
+                set: Default::default(),
+                unset: vec!["tier".into()],
+            })
+            .unwrap();
+        let cfg = engine.describe_database("billing").unwrap();
+        assert_eq!(cfg.properties.get("ttl"), Some(&"30d".to_string()));
+        assert!(cfg.properties.get("tier").is_none());
+    }
+
+    #[test]
+    fn legacy_bare_collection_is_loaded_into_default_db() {
+        // Verify backward-compat: collections persisted before the database
+        // refactor used `collection:<name>` keys; the engine should resurrect
+        // them under the implicit `default` database.
+        let dir = tempdir().unwrap();
+        {
+            // Hand-write a legacy key directly into the meta DB so we don't
+            // depend on a pre-database engine binary being available.
+            let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+            let cfg = serde_json::to_vec(&serde_json::json!({
+                "name": "legacy",
+                "dimension": 4,
+                "metric": "cosine",
+                "m": 16,
+                "ef_construction": 200,
+                "ef_search": 64,
+            }))
+            .unwrap();
+            // Reach into the internal rocksdb handle. The intent is to
+            // simulate an old key format; we drop the engine right after.
+            engine
+                .meta_db
+                .read()
+                .put(b"collection:legacy", &cfg)
+                .unwrap();
+        }
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let listed = engine.list_collections_in_database("default");
+        assert!(listed.contains(&"legacy".to_string()));
     }
 
     #[test]

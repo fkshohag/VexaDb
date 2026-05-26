@@ -43,6 +43,16 @@ service VectorService {
   // Read-side helpers.
   rpc ListAliases(ListAliasesRequest) returns (ListAliasesResponse);
   rpc DescribeAlias(DescribeAliasRequest) returns (DescribeAliasResponse);
+
+  // ---- Database management (Milvus parity) -------------------------------
+  // Mutations are routed through Raft via op_json (CreateDatabase /
+  // DropDatabase / AlterDatabaseProperties variants of MetaOp). The read-side
+  // RPCs are direct.
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
+  rpc DescribeDatabase(DescribeDatabaseRequest) returns (DescribeDatabaseResponse);
+  rpc AlterDatabase(AlterDatabaseRequest) returns (AlterDatabaseResponse);
 }
 
 message ApplyRbacRequest {
@@ -132,6 +142,8 @@ message CollectionSpec {
   bool scalar_quantization = 10;
   // User-defined opaque properties (TTL, mmap.enabled, ...).
   map<string, string> properties = 11;
+  // Parent database. Empty defaults to "default" server-side.
+  string database = 12;
 }
 
 message SparseVector {
@@ -428,4 +440,46 @@ message ReindexCollectionRequest {
 
 message ReindexCollectionResponse {
   uint64 vectors_reindexed = 1;
+}
+
+// ---- Database management messages (Milvus v2 parity) ---------------------
+//
+// Mutations are encoded as JSON `MetaOp` payloads on the wire — same pattern
+// used by RBAC and collection-meta. This keeps the RPC surface stable as new
+// fields land in MetaOp.
+
+message DatabaseInfo {
+  string name = 1;
+  map<string, string> properties = 2;
+  uint64 created_at_ms = 3;
+}
+
+message CreateDatabaseRequest {
+  // JSON-encoded MetaOp::CreateDatabase { name, properties, created_at_ms }.
+  bytes op_json = 1;
+}
+message CreateDatabaseResponse {}
+
+message DropDatabaseRequest {
+  // JSON-encoded MetaOp::DropDatabase { name, force }.
+  bytes op_json = 1;
+}
+message DropDatabaseResponse {}
+
+message AlterDatabaseRequest {
+  // JSON-encoded MetaOp::AlterDatabaseProperties { name, set, unset }.
+  bytes op_json = 1;
+}
+message AlterDatabaseResponse {}
+
+message ListDatabasesRequest {}
+message ListDatabasesResponse {
+  repeated string names = 1;
+}
+
+message DescribeDatabaseRequest {
+  string name = 1;
+}
+message DescribeDatabaseResponse {
+  DatabaseInfo info = 1;
 }

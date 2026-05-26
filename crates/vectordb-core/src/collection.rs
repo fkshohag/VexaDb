@@ -42,10 +42,48 @@ pub struct PayloadFieldIndex {
     pub kind: PayloadIndexKind,
 }
 
+/// Name of the implicit default database every cluster starts with.
+/// Mirrors Milvus's `default` semantic so existing callers keep working.
+pub const DEFAULT_DATABASE: &str = "default";
+
+fn default_database() -> String {
+    DEFAULT_DATABASE.to_string()
+}
+
+/// Logical database — a namespace that owns collections.
+///
+/// Collection names are unique *within* a database, not globally; multiple
+/// databases can hold collections with the same simple name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    pub name: String,
+    /// User-defined properties. Stored as opaque strings; the server may
+    /// interpret a small set of well-known keys (e.g. `database.replica.number`).
+    #[serde(default)]
+    pub properties: std::collections::BTreeMap<String, String>,
+    /// Milliseconds since epoch when the database was created.
+    #[serde(default)]
+    pub created_at_ms: u64,
+}
+
+impl DatabaseConfig {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            properties: std::collections::BTreeMap::new(),
+            created_at_ms: 0,
+        }
+    }
+}
+
 /// Configuration for a logical vector collection (namespace).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionConfig {
     pub name: String,
+    /// Parent database. Defaults to [`DEFAULT_DATABASE`] for back-compat with
+    /// pre-database persisted collections.
+    #[serde(default = "default_database")]
+    pub database: String,
     pub dimension: usize,
     pub metric: DistanceMetric,
     /// HNSW graph degree (M parameter).
@@ -111,6 +149,7 @@ impl CollectionConfig {
     pub fn new(name: impl Into<String>, dimension: usize, metric: DistanceMetric) -> Self {
         Self {
             name: name.into(),
+            database: default_database(),
             dimension,
             metric,
             m: 16,
@@ -122,6 +161,12 @@ impl CollectionConfig {
             quantization: None,
             properties: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Set the parent database. Builder helper used by the gateway / SDK.
+    pub fn with_database(mut self, db: impl Into<String>) -> Self {
+        self.database = db.into();
+        self
     }
 
     pub fn with_index(mut self, field: impl Into<String>, kind: PayloadIndexKind) -> Self {

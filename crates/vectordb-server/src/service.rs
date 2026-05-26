@@ -7,20 +7,23 @@ use vectordb_core::{
     QuantizationConfig, ScoredPoint, SearchMode, SparseVector,
 };
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, AliasEntry, ApplyRbacRequest, ApplyRbacResponse,
-    BulkUpsertRequest, BulkUpsertResponse, ClusterStatusRequest, ClusterStatusResponse,
-    CollectionSpec, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
-    CreateCollectionResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
-    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse,
-    DescribeCollectionRequest, DescribeCollectionResponse, DistanceMetric as ProtoMetric,
-    GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest,
-    HealthResponse, ImportChunk, ImportStreamResponse, ListAliasesRequest, ListAliasesResponse,
-    ListCollectionsRequest, ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    vector_service_server::VectorService, AliasEntry, AlterDatabaseRequest, AlterDatabaseResponse,
+    ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest, BulkUpsertResponse,
+    ClusterStatusRequest, ClusterStatusResponse, CollectionSpec, CompactWalRequest,
+    CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+    DatabaseInfo, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
+    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest,
+    DescribeAliasResponse, DescribeCollectionRequest, DescribeCollectionResponse,
+    DescribeDatabaseRequest, DescribeDatabaseResponse, DistanceMetric as ProtoMetric,
+    DropDatabaseRequest, DropDatabaseResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse,
+    GetRequest, GetResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
+    ListAliasesRequest, ListAliasesResponse, ListCollectionsRequest, ListCollectionsResponse,
+    ListDatabasesRequest, ListDatabasesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     MutateCollectionMetaRequest, MutateCollectionMetaResponse,
-    PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, RebalanceRequest,
-    RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse, RegisterNodeRequest,
-    RegisterNodeResponse, QueryRequest, QueryResponse, ReindexCollectionRequest,
+    PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, QueryRequest,
+    QueryResponse, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
+    RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest,
     ReindexCollectionResponse, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
     SnapshotInfo, StatsRequest, StatsResponse, UpsertRequest, UpsertResponse, VectorPoint,
 };
@@ -434,23 +437,41 @@ impl VectorService for VectorServiceImpl {
         let op: vectordb_storage::MetaOp = serde_json::from_slice(&request.get_ref().op_json)
             .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))?;
         // Authorize based on the affected collection. Aliases use their target.
+        // The RBAC privilege check uses the fully-qualified `db/name` so that
+        // grants on a specific (database, collection) don't accidentally cover
+        // a same-named collection in another database.
         let (target, priv_kind) = match &op {
-            vectordb_storage::MetaOp::RenameCollection { old, .. } => {
-                (old.clone(), Privilege::AlterCollection)
+            vectordb_storage::MetaOp::RenameCollection { old, database, .. } => {
+                (format!("{database}/{old}"), Privilege::AlterCollection)
             }
-            vectordb_storage::MetaOp::CreateAlias { collection, .. }
-            | vectordb_storage::MetaOp::AlterAlias { collection, .. } => {
-                (collection.clone(), Privilege::AlterAlias)
+            vectordb_storage::MetaOp::CreateAlias {
+                collection, database, ..
             }
-            vectordb_storage::MetaOp::DropAlias { alias } => {
+            | vectordb_storage::MetaOp::AlterAlias {
+                collection, database, ..
+            } => (
+                format!("{database}/{collection}"),
+                Privilege::AlterAlias,
+            ),
+            vectordb_storage::MetaOp::DropAlias { alias, database } => {
+                let fq_alias = format!("{database}/{alias}");
                 let coll = self
                     .engine
-                    .describe_alias(alias)
-                    .unwrap_or_else(|_| alias.clone());
+                    .describe_alias(&fq_alias)
+                    .unwrap_or(fq_alias);
                 (coll, Privilege::AlterAlias)
             }
-            vectordb_storage::MetaOp::AlterCollectionProperties { name, .. } => {
-                (name.clone(), Privilege::AlterCollection)
+            vectordb_storage::MetaOp::AlterCollectionProperties { name, database, .. } => {
+                (format!("{database}/{name}"), Privilege::AlterCollection)
+            }
+            // Database management ops belong on the dedicated RPCs; reject
+            // them here so a misbehaving client can't bypass the per-RPC RBAC.
+            vectordb_storage::MetaOp::CreateDatabase { .. }
+            | vectordb_storage::MetaOp::DropDatabase { .. }
+            | vectordb_storage::MetaOp::AlterDatabaseProperties { .. } => {
+                return Err(Status::invalid_argument(
+                    "database management ops must use the CreateDatabase / DropDatabase / AlterDatabase RPCs",
+                ));
             }
         };
         require_collection(&self.rbac, &request, &target, priv_kind)?;
@@ -789,6 +810,82 @@ impl VectorService for VectorServiceImpl {
         }))
     }
 
+    // ---- Database management (Milvus parity) ------------------------------
+
+    async fn create_database(
+        &self,
+        request: Request<CreateDatabaseRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        let op = parse_database_meta_op(&request.get_ref().op_json)?;
+        ensure_create_database(&op)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(CreateDatabaseResponse {}))
+    }
+
+    async fn drop_database(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        let op = parse_database_meta_op(&request.get_ref().op_json)?;
+        ensure_drop_database(&op)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(DropDatabaseResponse {}))
+    }
+
+    async fn alter_database(
+        &self,
+        request: Request<AlterDatabaseRequest>,
+    ) -> Result<Response<AlterDatabaseResponse>, Status> {
+        let op = parse_database_meta_op(&request.get_ref().op_json)?;
+        ensure_alter_database(&op)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(AlterDatabaseResponse {}))
+    }
+
+    async fn list_databases(
+        &self,
+        _request: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesResponse>, Status> {
+        let names = self.engine.list_databases();
+        Ok(Response::new(ListDatabasesResponse { names }))
+    }
+
+    async fn describe_database(
+        &self,
+        request: Request<DescribeDatabaseRequest>,
+    ) -> Result<Response<DescribeDatabaseResponse>, Status> {
+        let name = request.into_inner().name;
+        let cfg = self
+            .engine
+            .describe_database(&name)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(DescribeDatabaseResponse {
+            info: Some(DatabaseInfo {
+                name: cfg.name,
+                properties: cfg.properties.into_iter().collect(),
+                created_at_ms: cfg.created_at_ms,
+            }),
+        }))
+    }
+
     async fn register_node(
         &self,
         _request: Request<RegisterNodeRequest>,
@@ -937,11 +1034,50 @@ fn proto_points_to_bulk(
     Ok(out)
 }
 
+/// Parse a MetaOp JSON payload destined for one of the database-management
+/// RPCs. Rejects ops that are not database-scoped so a misbehaving client
+/// can't reuse the same endpoint to mutate collections.
+fn parse_database_meta_op(bytes: &[u8]) -> Result<vectordb_storage::MetaOp, Status> {
+    serde_json::from_slice::<vectordb_storage::MetaOp>(bytes)
+        .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))
+}
+
+fn ensure_create_database(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::CreateDatabase { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "expected MetaOp::CreateDatabase",
+        ))
+    }
+}
+
+fn ensure_drop_database(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::DropDatabase { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument("expected MetaOp::DropDatabase"))
+    }
+}
+
+fn ensure_alter_database(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::AlterDatabaseProperties { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "expected MetaOp::AlterDatabaseProperties",
+        ))
+    }
+}
+
 fn spec_to_config(spec: CollectionSpec) -> Result<CollectionConfig, Status> {
     let metric = proto_metric_to_core(
         ProtoMetric::try_from(spec.metric).unwrap_or(ProtoMetric::Unspecified),
     );
     let mut cfg = CollectionConfig::new(spec.name, spec.dimension as usize, metric);
+    if !spec.database.is_empty() {
+        cfg.database = spec.database;
+    }
     if spec.m > 0 {
         cfg.m = spec.m as usize;
     }
@@ -990,6 +1126,7 @@ fn config_to_spec(cfg: CollectionConfig) -> CollectionSpec {
         bm25_text_field: cfg.bm25_text_field.clone().unwrap_or_default(),
         scalar_quantization: cfg.quantization.as_ref().map(|q| q.scalar).unwrap_or(false),
         properties: cfg.properties.into_iter().collect(),
+        database: cfg.database,
     }
 }
 
@@ -1050,6 +1187,11 @@ fn map_engine_err(e: EngineError) -> Status {
         EngineError::CollectionExists(n) => Status::already_exists(n),
         EngineError::AliasNotFound(n) => Status::not_found(format!("alias not found: {n}")),
         EngineError::AliasExists(n) => Status::already_exists(format!("alias exists: {n}")),
+        EngineError::DatabaseNotFound(n) => Status::not_found(format!("database not found: {n}")),
+        EngineError::DatabaseExists(n) => Status::already_exists(format!("database exists: {n}")),
+        EngineError::DatabaseNotEmpty(n) => Status::failed_precondition(format!(
+            "database {n} is not empty (use force=true to cascade drop)"
+        )),
         EngineError::InvalidMeta(m) => Status::invalid_argument(m),
         EngineError::Core(c) => Status::invalid_argument(c.to_string()),
         other => Status::internal(other.to_string()),

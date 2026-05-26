@@ -6,22 +6,24 @@ use futures::future::join_all;
 use vectordb_cluster::{merge_top_k, ClusterConfig};
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, AliasEntry, ApplyRbacRequest, ApplyRbacResponse,
-    BulkUpsertRequest, BulkUpsertResponse, CollectionSpec, ClusterStatusRequest,
-    ClusterStatusResponse, ClusterNodeStatus, CompactWalRequest, CompactWalResponse,
-    CreateCollectionRequest, CreateCollectionResponse, CreateSnapshotRequest,
-    CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
+    vector_service_server::VectorService, AliasEntry, AlterDatabaseRequest, AlterDatabaseResponse,
+    ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest, BulkUpsertResponse,
+    ClusterNodeStatus, ClusterStatusRequest, ClusterStatusResponse, CollectionSpec,
+    CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreateSnapshotRequest, CreateSnapshotResponse,
+    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
     DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest,
     DescribeAliasResponse, DescribeCollectionRequest, DescribeCollectionResponse,
+    DescribeDatabaseRequest, DescribeDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
     GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest,
     HealthResponse, ImportChunk, ImportStreamResponse, ListAliasesRequest, ListAliasesResponse,
-    ListCollectionsRequest, ListCollectionsResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, MutateCollectionMetaRequest, MutateCollectionMetaResponse,
-    RebalanceCollectionReport, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
-    RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse,
-    QueryRequest, QueryResponse, ReindexCollectionRequest, ReindexCollectionResponse,
-    ScrollRequest, ScrollResponse, SearchRequest, SearchResponse, StatsRequest, StatsResponse,
-    UpsertRequest, UpsertResponse, VectorPoint,
+    ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, MutateCollectionMetaRequest,
+    MutateCollectionMetaResponse, QueryRequest, QueryResponse, RebalanceCollectionReport,
+    RebalanceRequest, RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse,
+    RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest,
+    ReindexCollectionResponse, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
+    StatsRequest, StatsResponse, UpsertRequest, UpsertResponse, VectorPoint,
 };
 
 use crate::pool::ClientPool;
@@ -173,6 +175,37 @@ impl RouterService {
             .get(&ep)
             .await
             .map_err(|e| Status::unavailable(e.to_string()))
+    }
+
+    /// Fan a database management `MetaOp` payload to every shard. Mirrors the
+    /// fan-out logic used by `mutate_collection_meta` so the per-shard meta
+    /// DB stays consistent.
+    async fn fanout_database_op(
+        &self,
+        op_json: &[u8],
+        rpc: &'static str,
+    ) -> Result<(), Status> {
+        let bytes = op_json.to_vec();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            let bytes = bytes.clone();
+            let res = match rpc {
+                "create_database" => client.create_database(bytes).await,
+                "drop_database" => client.drop_database(bytes).await,
+                "alter_database" => client.alter_database(bytes).await,
+                _ => unreachable!(),
+            };
+            match res {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable(format!("no shard accepted {rpc}"))));
+        }
+        Ok(())
     }
 }
 
@@ -687,18 +720,27 @@ impl VectorService for RouterService {
         let op: vectordb_storage::MetaOp = serde_json::from_slice(&request.get_ref().op_json)
             .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))?;
         let (target, priv_kind) = match &op {
-            vectordb_storage::MetaOp::RenameCollection { old, .. } => {
-                (old.clone(), Privilege::AlterCollection)
+            vectordb_storage::MetaOp::RenameCollection { old, database, .. } => {
+                (format!("{database}/{old}"), Privilege::AlterCollection)
             }
-            vectordb_storage::MetaOp::CreateAlias { collection, .. }
-            | vectordb_storage::MetaOp::AlterAlias { collection, .. } => {
-                (collection.clone(), Privilege::AlterAlias)
+            vectordb_storage::MetaOp::CreateAlias {
+                collection, database, ..
             }
-            vectordb_storage::MetaOp::DropAlias { alias } => {
-                (alias.clone(), Privilege::AlterAlias)
+            | vectordb_storage::MetaOp::AlterAlias {
+                collection, database, ..
+            } => (format!("{database}/{collection}"), Privilege::AlterAlias),
+            vectordb_storage::MetaOp::DropAlias { alias, database } => {
+                (format!("{database}/{alias}"), Privilege::AlterAlias)
             }
-            vectordb_storage::MetaOp::AlterCollectionProperties { name, .. } => {
-                (name.clone(), Privilege::AlterCollection)
+            vectordb_storage::MetaOp::AlterCollectionProperties { name, database, .. } => {
+                (format!("{database}/{name}"), Privilege::AlterCollection)
+            }
+            vectordb_storage::MetaOp::CreateDatabase { .. }
+            | vectordb_storage::MetaOp::DropDatabase { .. }
+            | vectordb_storage::MetaOp::AlterDatabaseProperties { .. } => {
+                return Err(Status::invalid_argument(
+                    "database management ops must use the CreateDatabase / DropDatabase / AlterDatabase RPCs",
+                ));
             }
         };
         require_collection(&self.rbac, &request, &target, priv_kind)?;
@@ -759,6 +801,79 @@ impl VectorService for RouterService {
         }
         Err(Status::not_found(format!(
             "alias not found: {alias} ({})",
+            last_err.unwrap_or_else(|| "no shards reachable".into())
+        )))
+    }
+
+    // ---- Database management (Milvus parity) -----------------------------
+    //
+    // Databases are Raft-replicated metadata so a single shard's response is
+    // authoritative for reads. Mutations fan out to every shard for the same
+    // reason `mutate_collection_meta` does: each shard maintains its own
+    // local meta-DB.
+
+    async fn create_database(
+        &self,
+        request: Request<CreateDatabaseRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        self.fanout_database_op(&request.get_ref().op_json, "create_database")
+            .await?;
+        Ok(Response::new(CreateDatabaseResponse {}))
+    }
+
+    async fn drop_database(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        self.fanout_database_op(&request.get_ref().op_json, "drop_database")
+            .await?;
+        Ok(Response::new(DropDatabaseResponse {}))
+    }
+
+    async fn alter_database(
+        &self,
+        request: Request<AlterDatabaseRequest>,
+    ) -> Result<Response<AlterDatabaseResponse>, Status> {
+        self.fanout_database_op(&request.get_ref().op_json, "alter_database")
+            .await?;
+        Ok(Response::new(AlterDatabaseResponse {}))
+    }
+
+    async fn list_databases(
+        &self,
+        _request: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesResponse>, Status> {
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, mut client) in clients {
+            if let Ok(names) = client.list_databases().await {
+                merged.extend(names.into_iter());
+            }
+        }
+        Ok(Response::new(ListDatabasesResponse {
+            names: merged.into_iter().collect(),
+        }))
+    }
+
+    async fn describe_database(
+        &self,
+        request: Request<DescribeDatabaseRequest>,
+    ) -> Result<Response<DescribeDatabaseResponse>, Status> {
+        let name = request.into_inner().name;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut last_err: Option<String> = None;
+        for (_, mut client) in clients {
+            match client.describe_database(&name).await {
+                Ok(info) => {
+                    return Ok(Response::new(DescribeDatabaseResponse {
+                        info: Some(info),
+                    }))
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        Err(Status::not_found(format!(
+            "database not found: {name} ({})",
             last_err.unwrap_or_else(|| "no shards reachable".into())
         )))
     }
