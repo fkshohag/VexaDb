@@ -333,6 +333,210 @@ _ = cli.TransferReplica(ctx,
 - `DescribeReplica` with an **empty** collection name still falls back to
   the legacy cluster-status derivation (backward compatible).
 
+## Vector module (Milvus v2.6 parity)
+
+The SDK mirrors Milvus's
+[`Vector` namespace](milvus-sdk-go/v2.6.x/Vector) — Insert / Upsert /
+Delete / Get / Query / Search / HybridSearch / QueryIterator /
+SearchIterator / RunAnalyzer. Every operation accepts the same option
+shape as Milvus, with one or two VexaDb-specific notes called out below.
+
+### Insert / Upsert
+
+```go
+res, err := cli.Upsert(ctx,
+    vexaclient.NewColumnBasedInsertOption("docs").
+        WithIDs([]string{"a", "b"}).
+        WithFloatVectorColumn("vector", 4, [][]float32{{1, 0, 0, 0}, {0, 1, 0, 0}}).
+        WithVarcharColumn("color", []string{"red", "blue"}).
+        WithPartition("hot").
+        WithPartialUpdate(true))
+fmt.Println(res.Upserted, res.IDs)
+```
+
+Supported column builders (all map to VexaDb's single dense float32
+storage on the server side):
+
+| Method | Notes |
+|--------|-------|
+| `WithVarcharColumn` / `WithInt64Column` / `WithFloatColumn` / `WithBoolColumn` | Stored verbatim as JSON payload values |
+| `WithInt8Column` / `WithInt16Column` / `WithInt32Column` | Widened to int64 in the payload |
+| `WithFloatVectorColumn(name, dim, data)` | Primary dense vector path |
+| `WithFloat16VectorColumn` / `WithBFloat16VectorColumn` | Accept float32 representations (Milvus parity; VexaDb stores float32 internally) |
+| `WithBinaryVectorColumn` | One bit per dimension expanded to `0.0/1.0` floats |
+| `WithInt8VectorColumn` | Widened element-wise to float32 |
+| `WithSparseColumn` | Per-row optional `*entity.SparseVector` |
+| `WithPartition(name)` | Tags every point's payload with `_partition: <name>` |
+| `WithPartialUpdate(true)` | Honored by `Upsert` (no-op on `Insert`) |
+
+### Delete
+
+```go
+del, err := cli.Delete(ctx,
+    vexaclient.NewDeleteOption("docs").
+        WithExpr("color == 'red'").
+        WithPartition("hot"))
+fmt.Println(del.DeleteCount)
+
+// Or by typed IDs:
+cli.Delete(ctx, vexaclient.NewDeleteOption("docs").
+    WithInt64IDs("id", []int64{1, 2, 3}))
+```
+
+Delete supports the union of `IDs`, `WithExpr`, and `WithPartition`. The
+gateway parses the expression into a `Filter` and walks the local index,
+emitting one WAL `Delete` per matching point so replication and
+snapshots stay consistent.
+
+### Get / Query
+
+`Get` is now a thin wrapper around `Query` with primary-key lookup:
+
+```go
+rs, err := cli.Get(ctx,
+    vexaclient.NewQueryOption("docs").
+        WithStringIDs("id", []string{"a", "b"}).
+        WithOutputFields("color"))
+
+// Or by filter:
+rs2, err := cli.Query(ctx,
+    vexaclient.NewQueryOption("docs").
+        WithFilter("color == 'red'").
+        WithLimit(50).
+        WithPartitions("hot").
+        WithConsistencyLevel("Strong").
+        WithTemplateParam("c", "red"))
+```
+
+### Search
+
+Single-vector ANN with the full Milvus option surface:
+
+```go
+hits, err := cli.Search(ctx,
+    vexaclient.NewSearchOption("docs", 10, []entity.Vector{entity.FloatVector{1, 0, 0, 0}}).
+        WithFilter("color == 'red'").
+        WithOutputFields("color").
+        WithPayload(true).
+        WithPartitions("hot").
+        WithConsistencyLevel("Strong").
+        WithOffset(10).
+        WithGroupByField("color").
+        WithGroupSize(2).
+        WithAnnParam(map[string]any{"ef": 64}).
+        WithSearchParam("metric_type", "L2").
+        WithFunctionReranker("cosine_rerank"))
+```
+
+### HybridSearch (multi-AnnRequest + reranker)
+
+```go
+dense := entity.FloatVector{0.3, -0.6, 0.1, 0.9}
+sparse, _ := entity.NewSliceSparseEmbedding([]uint32{1, 21}, []float32{0.1, 0.2})
+rss, err := cli.HybridSearch(ctx,
+    vexaclient.NewHybridSearchOption("docs", 3,
+        vexaclient.NewAnnRequest("vector", 10, dense).WithFilter("color == 'red'"),
+        vexaclient.NewAnnRequest("sparse", 10, sparse),
+        vexaclient.NewAnnRequest("text", 10, "hello world"),
+    ).WithReranker(vexaclient.NewWeightedReranker(0.5, 0.3, 0.2)).
+      WithPartitions("hot").
+      WithOutputFields("color"))
+```
+
+Rerankers:
+
+| Constructor | Behavior |
+|-------------|----------|
+| `NewRRFReranker()` | Reciprocal Rank Fusion (default) |
+| `NewWeightedReranker(w1, w2, …)` | Per-leg min-max normalize + weighted sum |
+| `NewFunctionReranker(name)` | Pass-through dedup by best per-leg score (name forwarded but not executed) |
+
+### Iterators (server-side cursor)
+
+```go
+it, _ := cli.QueryIterator(ctx,
+    vexaclient.NewQueryIteratorOption("docs").
+        WithBatchSize(100).
+        WithFilter("color == 'red'").
+        WithOutputFields("id", "color"))
+defer it.Close()
+for {
+    rs, err := it.Next(ctx)
+    if err == io.EOF { break }
+    if err != nil { log.Fatal(err) }
+    ids, _ := rs.IDs()
+    fmt.Println(ids)
+}
+```
+
+`SearchIterator` walks ANN search results page-by-page by widening the
+top-k window each call:
+
+```go
+sit, _ := cli.SearchIterator(ctx,
+    vexaclient.NewSearchIteratorOption("docs", entity.FloatVector{1, 0, 0, 0}).
+        WithBatchSize(50).
+        WithOutputFields("color"))
+defer sit.Close()
+for {
+    rs, err := sit.Next(ctx)
+    if err == io.EOF { break }
+    // …
+}
+```
+
+### RunAnalyzer
+
+```go
+res, err := cli.RunAnalyzer(ctx,
+    vexaclient.NewRunAnalyzerOption("Hello world, hello again!").
+        WithAnalyzerParams(map[string]any{
+            "tokenizer": "standard",
+            "filter": []any{map[string]any{"type": "stop", "stop_words": []string{"hello"}}},
+        }))
+for _, t := range res[0].Tokens {
+    fmt.Println(t.Text, t.StartOffset, t.EndOffset, t.Position, t.Hash)
+}
+```
+
+VexaDb uses the same BM25 tokenizer that powers `bm25_text_field` search:
+lowercase + alphanumeric split + optional stopword filtering.
+
+### Mapping notes
+
+| Milvus API | VexaDb behavior |
+|------------|-----------------|
+| `Insert` / `Upsert` | One WAL record per chunk; `_partition` tag injected when `WithPartition` is set |
+| `WithPartialUpdate(true)` | Honored by `Upsert` (existing payload fields preserved); ignored on `Insert` |
+| `Delete` with `WithExpr` | Engine resolves matching IDs and writes one WAL `Delete` per point |
+| `Delete` with `WithPartition` | Restricts the scan to points tagged for that partition (and untagged points when partition == `_default`) |
+| `Get` | Aliased to `Query.WithIDs` (returns a `ResultSet`); legacy `GetByID` returns the original `map[string]any` shape |
+| `Search.WithGroupByField` / `WithIgnoreGrowing` | Forwarded but the server has no growing segments so they round-trip as a normal search |
+| `Search.WithAnnParam` / `WithSearchParam` | Forwarded as `ann_param` / `search_params` map in the request body |
+| `HybridSearch` | Router fans out to every shard with `2*limit` headroom, then re-reranks server-side with the requested strategy |
+| `QueryIterator` | Backed by the new `POST /v1/collections/:name/scroll` endpoint; cursor format is `<shard_idx>|<per_shard_cursor>` |
+| `SearchIterator` | SDK-side paging via progressively wider `Search.WithOffset` calls |
+| `RunAnalyzer` | `POST /v1/admin/analyze`; reuses the BM25 tokenizer + optional stopword filter |
+
+REST routes added in this module:
+
+- `POST /v1/collections/:name/hybrid-search`
+- `POST /v1/collections/:name/scroll`
+- `POST /v1/admin/analyze`
+- Existing `DELETE /v1/collections/:name/points` now accepts
+  `{ids?, filter?, partition?}`
+- Existing `POST /v1/collections/:name/upsert` now accepts an optional
+  `partition` body field
+
+RBAC privileges:
+
+| Endpoint | Privilege | Scope |
+|----------|-----------|-------|
+| `/hybrid-search` | `Search` | Collection |
+| `/scroll` | `Query` | Collection |
+| `/admin/analyze` | `Query` | Global |
+| `DELETE /points` | `Delete` | Collection |
+
 ## Client management
 
 `New` accepts a `ClientConfig` modeled after Milvus's
