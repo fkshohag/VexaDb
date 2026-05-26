@@ -211,6 +211,18 @@ run-server: ## Run vectordb-server with example.toml (single node).
 run-gateway: ## Run the REST gateway pointed at the local router/server.
 	VECTORDB_GRPC=$(ROUTER_GRPC) cargo run -p vectordb-gateway
 
+.PHONY: run-single
+run-single: ## Build + run server+gateway as raw binaries (1 shard, RF=1, no Docker). Ctrl-C to stop.
+	./scripts/run-single.sh
+
+.PHONY: run-single-release
+run-single-release: ## Same as run-single but with --release binaries.
+	MODE=release ./scripts/run-single.sh
+
+.PHONY: run-single-clean
+run-single-clean: ## run-single with a wiped data dir (fresh start).
+	./scripts/run-single.sh --clean
+
 .PHONY: run-shard-0 run-shard-1 run-router
 run-shard-0: ## Run shard-0 locally (config/node-0.toml).
 	cargo run -p vectordb-server -- --config config/node-0.toml
