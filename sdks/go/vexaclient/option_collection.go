@@ -308,10 +308,21 @@ func NewListAliasesOption(collection string) *ListAliasesOption {
 	return &ListAliasesOption{Collection: collection}
 }
 
-// DescribeReplicaOption — Milvus parity (VexaDb derives this from the
-// cluster status; pass an empty Collection to list all replicas).
-type DescribeReplicaOption struct{ Collection string }
+// DescribeReplicaOption — Milvus parity. When `Collection` is set the SDK
+// calls the new `/v1/collections/:name/replicas` endpoint and returns one
+// `ReplicaInfo` with rich shard-to-node placement. When empty, the SDK
+// falls back to deriving replicas from the cluster status endpoint.
+type DescribeReplicaOption struct {
+	Collection string
+	DBName     string
+}
 
 func NewDescribeReplicaOption(collection string) *DescribeReplicaOption {
 	return &DescribeReplicaOption{Collection: collection}
+}
+
+// WithDBName scopes the call to a specific database (Milvus parity).
+func (o *DescribeReplicaOption) WithDBName(db string) *DescribeReplicaOption {
+	o.DBName = db
+	return o
 }

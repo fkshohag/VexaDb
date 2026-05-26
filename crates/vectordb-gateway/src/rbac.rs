@@ -352,6 +352,14 @@ pub fn route_priv(method: &str, path: &str) -> Option<RoutePriv> {
         ("GET", ["v1", "collections", _, "partitions", _, "stats"]) => {
             c(GetPartitionStatistics, 2)
         }
+        // Resource groups (Milvus parity, global).
+        ("GET", ["v1", "resource-groups"]) => g(ListResourceGroups),
+        ("POST", ["v1", "resource-groups"]) => g(CreateResourceGroup),
+        ("GET", ["v1", "resource-groups", _]) => g(DescribeResourceGroup),
+        ("PATCH", ["v1", "resource-groups", _]) => g(UpdateResourceGroup),
+        ("DELETE", ["v1", "resource-groups", _]) => g(DropResourceGroup),
+        ("GET", ["v1", "collections", _, "replicas"]) => g(DescribeReplica),
+        ("POST", ["v1", "admin", "transfer-replica"]) => g(TransferReplica),
         // RBAC management (everything under /v1/auth, /v1/users, /v1/roles,
         // /v1/privilege-groups, /v1/admin/rbac).
         ("POST", ["v1", "auth", "tokens"])

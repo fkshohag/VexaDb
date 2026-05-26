@@ -148,9 +148,26 @@ impl RbacState {
             "DescribePartition",
             "ShowPartitions",
             "GetPartitionStatistics",
+            // Resource groups — Milvus parity, global.
+            "CreateResourceGroup",
+            "DropResourceGroup",
+            "DescribeResourceGroup",
+            "ListResourceGroups",
+            "UpdateResourceGroup",
+            "TransferReplica",
+            "DescribeReplica",
         ] {
             let obj = match p {
-                "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,
+                "ListCollections"
+                | "ListDatabases"
+                | "DescribeDatabase"
+                | "CreateResourceGroup"
+                | "DropResourceGroup"
+                | "DescribeResourceGroup"
+                | "ListResourceGroups"
+                | "UpdateResourceGroup"
+                | "TransferReplica"
+                | "DescribeReplica" => ObjectType::Global,
                 _ => ObjectType::Collection,
             };
             rw.insert(GrantItem::new(obj, "*", p));
@@ -175,9 +192,18 @@ impl RbacState {
             "DescribePartition",
             "ShowPartitions",
             "GetPartitionStatistics",
+            // Resource groups — read-side only.
+            "DescribeResourceGroup",
+            "ListResourceGroups",
+            "DescribeReplica",
         ] {
             let obj = match p {
-                "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,
+                "ListCollections"
+                | "ListDatabases"
+                | "DescribeDatabase"
+                | "DescribeResourceGroup"
+                | "ListResourceGroups"
+                | "DescribeReplica" => ObjectType::Global,
                 _ => ObjectType::Collection,
             };
             ro.insert(GrantItem::new(obj, "*", p));

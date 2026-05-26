@@ -13,27 +13,35 @@ use vectordb_proto::vectordb::v1::{
     CollectionSpec, CompactCollectionRequest, CompactCollectionResponse,
     CompactionState as ProtoCompactionState, CompactWalRequest, CompactWalResponse,
     CreateCollectionRequest, CreateCollectionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, CreatePartitionRequest, CreatePartitionResponse, CreateSnapshotRequest,
+    CreateDatabaseResponse, CreatePartitionRequest, CreatePartitionResponse,
+    CreateResourceGroupRequest, CreateResourceGroupResponse, CreateSnapshotRequest,
     CreateSnapshotResponse, DatabaseInfo, DeleteCollectionRequest, DeleteCollectionResponse,
     DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
     DescribeAliasRequest, DescribeAliasResponse, DescribeCollectionRequest,
     DescribeCollectionResponse, DescribeDatabaseRequest, DescribeDatabaseResponse,
-    DistanceMetric as ProtoMetric, DropDatabaseRequest, DropDatabaseResponse, DropPartitionRequest,
-    DropPartitionResponse, DropPayloadIndexRequest, DropPayloadIndexResponse,
+    DescribeReplicaRequest, DescribeReplicaResponse, DescribeResourceGroupRequest,
+    DescribeResourceGroupResponse, DistanceMetric as ProtoMetric, DropDatabaseRequest,
+    DropDatabaseResponse, DropPartitionRequest, DropPartitionResponse, DropPayloadIndexRequest,
+    DropPayloadIndexResponse, DropResourceGroupRequest, DropResourceGroupResponse,
     FlushCollectionRequest, FlushCollectionResponse, GetCompactionStateRequest,
     GetCompactionStateResponse, GetPartitionStatsRequest, GetPartitionStatsResponse,
     GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HasPartitionRequest,
     HasPartitionResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
     ListAliasesRequest, ListAliasesResponse, ListCollectionsRequest, ListCollectionsResponse,
     ListDatabasesRequest, ListDatabasesResponse, ListPartitionsRequest, ListPartitionsResponse,
-    ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, MutateCollectionMetaRequest, MutateCollectionMetaResponse,
+    ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListResourceGroupsRequest,
+    ListResourceGroupsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    MutateCollectionMetaRequest, MutateCollectionMetaResponse,
     PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, QueryRequest,
     QueryResponse, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
     RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest,
-    ReindexCollectionResponse, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
-    SegmentEntry, SegmentState as ProtoSegmentState, SnapshotInfo, StatsRequest, StatsResponse,
-    UpsertRequest, UpsertResponse, VectorPoint,
+    ReindexCollectionResponse, ResourceGroupConfig as ProtoRgConfig,
+    ResourceGroupInfo as ProtoRgInfo, ResourceGroupLimit as ProtoRgLimit,
+    ResourceGroupNodeFilter as ProtoRgNodeFilter, ResourceGroupTransfer as ProtoRgTransfer,
+    ScrollRequest, ScrollResponse, SearchRequest, SearchResponse, SegmentEntry,
+    SegmentState as ProtoSegmentState, SnapshotInfo, StatsRequest, StatsResponse,
+    TransferReplicaRequest, TransferReplicaResponse, UpdateResourceGroupRequest,
+    UpdateResourceGroupResponse, UpsertRequest, UpsertResponse, VectorPoint,
 };
 use vectordb_replication::RaftNode;
 use vectordb_storage::search::SearchParams;
@@ -493,6 +501,13 @@ impl VectorService for VectorServiceImpl {
             | vectordb_storage::MetaOp::DropPartition { .. } => {
                 return Err(Status::invalid_argument(
                     "partition ops must use the CreatePartition / DropPartition RPCs",
+                ));
+            }
+            vectordb_storage::MetaOp::CreateResourceGroup { .. }
+            | vectordb_storage::MetaOp::DropResourceGroup { .. }
+            | vectordb_storage::MetaOp::UpdateResourceGroup { .. } => {
+                return Err(Status::invalid_argument(
+                    "resource-group ops must use the CreateResourceGroup / DropResourceGroup / UpdateResourceGroup RPCs",
                 ));
             }
         };
@@ -1098,6 +1113,114 @@ impl VectorService for VectorServiceImpl {
         }))
     }
 
+    // ---- Resource groups (Milvus parity) ------------------------------------
+
+    async fn create_resource_group(
+        &self,
+        request: Request<CreateResourceGroupRequest>,
+    ) -> Result<Response<CreateResourceGroupResponse>, Status> {
+        let op = parse_rg_meta_op(&request.get_ref().op_json)?;
+        ensure_create_resource_group(&op)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(CreateResourceGroupResponse {}))
+    }
+
+    async fn drop_resource_group(
+        &self,
+        request: Request<DropResourceGroupRequest>,
+    ) -> Result<Response<DropResourceGroupResponse>, Status> {
+        let op = parse_rg_meta_op(&request.get_ref().op_json)?;
+        ensure_drop_resource_group(&op)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(DropResourceGroupResponse {}))
+    }
+
+    async fn update_resource_group(
+        &self,
+        request: Request<UpdateResourceGroupRequest>,
+    ) -> Result<Response<UpdateResourceGroupResponse>, Status> {
+        let op = parse_rg_meta_op(&request.get_ref().op_json)?;
+        ensure_update_resource_group(&op)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(UpdateResourceGroupResponse {}))
+    }
+
+    async fn list_resource_groups(
+        &self,
+        _request: Request<ListResourceGroupsRequest>,
+    ) -> Result<Response<ListResourceGroupsResponse>, Status> {
+        Ok(Response::new(ListResourceGroupsResponse {
+            names: self.engine.list_resource_groups(),
+        }))
+    }
+
+    async fn describe_resource_group(
+        &self,
+        request: Request<DescribeResourceGroupRequest>,
+    ) -> Result<Response<DescribeResourceGroupResponse>, Status> {
+        let name = request.into_inner().name;
+        let info = self
+            .engine
+            .describe_resource_group(&name)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(DescribeResourceGroupResponse {
+            info: Some(rg_info_to_proto(info)),
+        }))
+    }
+
+    async fn describe_replica(
+        &self,
+        request: Request<DescribeReplicaRequest>,
+    ) -> Result<Response<DescribeReplicaResponse>, Status> {
+        // VexaDb does not yet expose a logical "replica" view on per-node
+        // shards, so the data-node handler returns the empty list and lets
+        // the router synthesize a single-replica view from topology.
+        let _ = request.into_inner().collection;
+        Ok(Response::new(DescribeReplicaResponse { replicas: vec![] }))
+    }
+
+    async fn transfer_replica(
+        &self,
+        request: Request<TransferReplicaRequest>,
+    ) -> Result<Response<TransferReplicaResponse>, Status> {
+        // Registry-only mode: replica assignments are not tracked per RG, so
+        // we treat this as a no-op success after validating both groups
+        // exist. This matches Milvus's contract: callers can rely on a
+        // successful return value but should not assume nodes actually
+        // moved.
+        let req = request.into_inner();
+        for g in [&req.source_group, &req.target_group] {
+            self.engine
+                .describe_resource_group(g)
+                .map_err(map_engine_err)?;
+        }
+        tracing::info!(
+            collection = %req.collection,
+            source = %req.source_group,
+            target = %req.target_group,
+            "transfer_replica acknowledged (registry-only)"
+        );
+        Ok(Response::new(TransferReplicaResponse {}))
+    }
+
     async fn register_node(
         &self,
         _request: Request<RegisterNodeRequest>,
@@ -1364,6 +1487,82 @@ fn partition_op_target(op: &vectordb_storage::MetaOp) -> String {
     }
 }
 
+/// Parse a MetaOp JSON payload destined for the resource-group RPCs.
+fn parse_rg_meta_op(bytes: &[u8]) -> Result<vectordb_storage::MetaOp, Status> {
+    serde_json::from_slice::<vectordb_storage::MetaOp>(bytes)
+        .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))
+}
+
+fn ensure_create_resource_group(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::CreateResourceGroup { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "expected MetaOp::CreateResourceGroup",
+        ))
+    }
+}
+
+fn ensure_drop_resource_group(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::DropResourceGroup { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "expected MetaOp::DropResourceGroup",
+        ))
+    }
+}
+
+fn ensure_update_resource_group(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::UpdateResourceGroup { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "expected MetaOp::UpdateResourceGroup",
+        ))
+    }
+}
+
+fn rg_info_to_proto(info: vectordb_core::ResourceGroupInfo) -> ProtoRgInfo {
+    ProtoRgInfo {
+        name: info.name,
+        config: Some(rg_config_to_proto(info.config)),
+        num_available_node: info.num_available_node,
+        num_loaded_replica: info.num_loaded_replica.into_iter().collect(),
+        num_incoming_node: info.num_incoming_node.into_iter().collect(),
+        num_outgoing_node: info.num_outgoing_node.into_iter().collect(),
+        created_at_ms: info.created_at_ms,
+    }
+}
+
+fn rg_config_to_proto(cfg: vectordb_core::ResourceGroupConfig) -> ProtoRgConfig {
+    ProtoRgConfig {
+        requests: Some(ProtoRgLimit {
+            node_num: cfg.requests.node_num,
+        }),
+        limits: Some(ProtoRgLimit {
+            node_num: cfg.limits.node_num,
+        }),
+        transfer_from: cfg
+            .transfer_from
+            .into_iter()
+            .map(|t| ProtoRgTransfer {
+                resource_group: t.resource_group,
+            })
+            .collect(),
+        transfer_to: cfg
+            .transfer_to
+            .into_iter()
+            .map(|t| ProtoRgTransfer {
+                resource_group: t.resource_group,
+            })
+            .collect(),
+        node_filter: Some(ProtoRgNodeFilter {
+            node_labels: cfg.node_filter.node_labels.into_iter().collect(),
+        }),
+    }
+}
+
 fn core_compaction_state_to_proto(
     s: vectordb_storage::CompactionStateCode,
 ) -> ProtoCompactionState {
@@ -1509,6 +1708,12 @@ fn map_engine_err(e: EngineError) -> Status {
         }
         EngineError::PartitionExists(n) => {
             Status::already_exists(format!("partition exists: {n}"))
+        }
+        EngineError::ResourceGroupNotFound(n) => {
+            Status::not_found(format!("resource group not found: {n}"))
+        }
+        EngineError::ResourceGroupExists(n) => {
+            Status::already_exists(format!("resource group exists: {n}"))
         }
         EngineError::InvalidMeta(m) => Status::invalid_argument(m),
         EngineError::Core(c) => Status::invalid_argument(c.to_string()),

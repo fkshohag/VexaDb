@@ -16,7 +16,9 @@ pub mod types;
 pub use bm25::{tokenize, Bm25Index};
 pub use collection::{
     CollectionConfig, DatabaseConfig, DistanceMetric, PayloadFieldIndex, PayloadIndexKind,
-    QuantizationConfig, SearchMode, DEFAULT_DATABASE, DEFAULT_PARTITION, PARTITION_PAYLOAD_FIELD,
+    QuantizationConfig, ResourceGroupConfig, ResourceGroupInfo, ResourceGroupLimit,
+    ResourceGroupNodeFilter, ResourceGroupTransfer, SearchMode, DEFAULT_DATABASE,
+    DEFAULT_PARTITION, DEFAULT_RESOURCE_GROUP, PARTITION_PAYLOAD_FIELD,
 };
 pub use distance::Distance;
 pub use error::{Error, Result};

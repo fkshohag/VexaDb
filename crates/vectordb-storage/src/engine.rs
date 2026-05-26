@@ -82,6 +82,10 @@ pub enum EngineError {
     PartitionNotFound(String),
     #[error("partition exists: {0}")]
     PartitionExists(String),
+    #[error("resource group not found: {0}")]
+    ResourceGroupNotFound(String),
+    #[error("resource group exists: {0}")]
+    ResourceGroupExists(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -144,6 +148,25 @@ pub struct CollectionEngine {
     /// `now_ms()` so IDs sort roughly chronologically and are unique
     /// across short engine restarts.
     compaction_seq: std::sync::atomic::AtomicU64,
+    /// Resource group registry: name -> (config, created_at_ms). The
+    /// built-in `__default_resource_group` is auto-seeded on first open.
+    /// Persisted under `rg:<name>` keys.
+    resource_groups: RwLock<HashMap<String, ResourceGroupEntry>>,
+}
+
+/// In-memory record for one resource group. Kept private; callers see
+/// [`vectordb_core::ResourceGroupInfo`] instead.
+#[derive(Debug, Clone)]
+pub(crate) struct ResourceGroupEntry {
+    pub config: vectordb_core::ResourceGroupConfig,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ResourceGroupPersisted {
+    config: vectordb_core::ResourceGroupConfig,
+    #[serde(default)]
+    created_at_ms: u64,
 }
 
 pub(crate) const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
@@ -176,14 +199,17 @@ impl CollectionEngine {
             databases: RwLock::new(HashMap::new()),
             compactions: RwLock::new(HashMap::new()),
             compaction_seq: std::sync::atomic::AtomicU64::new(seq_seed),
+            resource_groups: RwLock::new(HashMap::new()),
         };
 
         engine.load_rbac_from_meta()?;
         engine.load_databases_from_meta()?;
+        engine.load_resource_groups_from_meta()?;
         engine.replay_wal()?;
         engine.load_collections_from_meta()?;
         engine.load_aliases_from_meta()?;
         engine.ensure_default_database()?;
+        engine.ensure_default_resource_group()?;
         Ok(engine)
     }
 
@@ -301,6 +327,140 @@ impl CollectionEngine {
     /// True iff `db` currently exists.
     pub fn database_exists(&self, db: &str) -> bool {
         self.databases.read().contains_key(db)
+    }
+
+    // ---- Resource group registry (Milvus parity) -------------------------
+
+    fn load_resource_groups_from_meta(&self) -> Result<()> {
+        let meta = self.meta_db.read();
+        let iter = meta.iterator(rocksdb::IteratorMode::Start);
+        let mut rgs = self.resource_groups.write();
+        for item in iter {
+            let (key, value) = item.map_err(|e| EngineError::Rocks(e.to_string()))?;
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(name) = key_str.strip_prefix("rg:") {
+                let entry: ResourceGroupPersisted = serde_json::from_slice(&value)
+                    .map_err(|e| EngineError::Rocks(format!("decode rg {name}: {e}")))?;
+                rgs.insert(
+                    name.to_string(),
+                    ResourceGroupEntry {
+                        config: entry.config,
+                        created_at_ms: entry.created_at_ms,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_default_resource_group(&self) -> Result<()> {
+        use vectordb_core::DEFAULT_RESOURCE_GROUP;
+        if self
+            .resource_groups
+            .read()
+            .contains_key(DEFAULT_RESOURCE_GROUP)
+        {
+            return Ok(());
+        }
+        let entry = ResourceGroupEntry {
+            config: vectordb_core::ResourceGroupConfig::default(),
+            created_at_ms: 0,
+        };
+        self.persist_resource_group(DEFAULT_RESOURCE_GROUP, &entry)?;
+        self.resource_groups
+            .write()
+            .insert(DEFAULT_RESOURCE_GROUP.to_string(), entry);
+        Ok(())
+    }
+
+    fn persist_resource_group(&self, name: &str, entry: &ResourceGroupEntry) -> Result<()> {
+        let persisted = ResourceGroupPersisted {
+            config: entry.config.clone(),
+            created_at_ms: entry.created_at_ms,
+        };
+        let key = format!("rg:{name}");
+        let bytes =
+            serde_json::to_vec(&persisted).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(key, bytes)
+            .map_err(|e| EngineError::Rocks(e.to_string()))
+    }
+
+    fn delete_resource_group_meta(&self, name: &str) -> Result<()> {
+        let key = format!("rg:{name}");
+        self.meta_db
+            .read()
+            .delete(key)
+            .map_err(|e| EngineError::Rocks(e.to_string()))
+    }
+
+    /// Names of every resource group (sorted for stable output). Always
+    /// contains [`vectordb_core::DEFAULT_RESOURCE_GROUP`].
+    pub fn list_resource_groups(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.resource_groups.read().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Full info for a resource group. Returns `ResourceGroupNotFound` if
+    /// the group has never been created.
+    pub fn describe_resource_group(
+        &self,
+        name: &str,
+    ) -> Result<vectordb_core::ResourceGroupInfo> {
+        let rgs = self.resource_groups.read();
+        let entry = rgs
+            .get(name)
+            .ok_or_else(|| EngineError::ResourceGroupNotFound(name.to_string()))?;
+        Ok(vectordb_core::ResourceGroupInfo {
+            name: name.to_string(),
+            config: entry.config.clone(),
+            num_available_node: 0,
+            num_loaded_replica: Default::default(),
+            num_incoming_node: Default::default(),
+            num_outgoing_node: Default::default(),
+            created_at_ms: entry.created_at_ms,
+        })
+    }
+
+    fn apply_create_resource_group(
+        &self,
+        name: &str,
+        config: vectordb_core::ResourceGroupConfig,
+        created_at_ms: u64,
+    ) -> Result<()> {
+        let entry = ResourceGroupEntry {
+            config,
+            created_at_ms,
+        };
+        self.persist_resource_group(name, &entry)?;
+        self.resource_groups
+            .write()
+            .insert(name.to_string(), entry);
+        Ok(())
+    }
+
+    fn apply_drop_resource_group(&self, name: &str) -> Result<()> {
+        self.delete_resource_group_meta(name)?;
+        self.resource_groups.write().remove(name);
+        Ok(())
+    }
+
+    fn apply_update_resource_group(
+        &self,
+        name: &str,
+        config: vectordb_core::ResourceGroupConfig,
+    ) -> Result<()> {
+        let mut rgs = self.resource_groups.write();
+        let entry = rgs
+            .get_mut(name)
+            .ok_or_else(|| EngineError::ResourceGroupNotFound(name.to_string()))?;
+        entry.config = config;
+        let snapshot = entry.clone();
+        drop(rgs);
+        self.persist_resource_group(name, &snapshot)?;
+        Ok(())
     }
 
     // ---- Aliases / rename / properties (Milvus parity) --------------------
@@ -509,6 +669,28 @@ impl CollectionEngine {
                     return Err(EngineError::PartitionNotFound(partition.clone()));
                 }
             }
+            MetaOp::CreateResourceGroup { name, .. } => {
+                check_simple_name(name)?;
+                if self.resource_groups.read().contains_key(name) {
+                    return Err(EngineError::ResourceGroupExists(name.clone()));
+                }
+            }
+            MetaOp::DropResourceGroup { name } => {
+                if name == vectordb_core::DEFAULT_RESOURCE_GROUP {
+                    return Err(EngineError::InvalidMeta(format!(
+                        "the built-in `{}` resource group cannot be dropped",
+                        vectordb_core::DEFAULT_RESOURCE_GROUP
+                    )));
+                }
+                if !self.resource_groups.read().contains_key(name) {
+                    return Err(EngineError::ResourceGroupNotFound(name.clone()));
+                }
+            }
+            MetaOp::UpdateResourceGroup { name, .. } => {
+                if !self.resource_groups.read().contains_key(name) {
+                    return Err(EngineError::ResourceGroupNotFound(name.clone()));
+                }
+            }
         }
         Ok(())
     }
@@ -592,6 +774,15 @@ impl CollectionEngine {
             } => {
                 let fq = format!("{database}/{collection}");
                 self.apply_drop_partition(&fq, partition)
+            }
+            MetaOp::CreateResourceGroup {
+                name,
+                config,
+                created_at_ms,
+            } => self.apply_create_resource_group(name, config.clone(), *created_at_ms),
+            MetaOp::DropResourceGroup { name } => self.apply_drop_resource_group(name),
+            MetaOp::UpdateResourceGroup { name, config } => {
+                self.apply_update_resource_group(name, config.clone())
             }
         }
     }
@@ -2721,5 +2912,98 @@ mod m4_tests {
             )
             .unwrap_err();
         assert!(matches!(err, EngineError::PartitionNotFound(_)));
+    }
+
+    // ---- Resource group management (Milvus parity) ------------------------
+
+    #[test]
+    fn default_resource_group_is_seeded_on_open() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let names = engine.list_resource_groups();
+        assert_eq!(
+            names,
+            vec![vectordb_core::DEFAULT_RESOURCE_GROUP.to_string()]
+        );
+        let info = engine
+            .describe_resource_group(vectordb_core::DEFAULT_RESOURCE_GROUP)
+            .unwrap();
+        assert_eq!(info.name, vectordb_core::DEFAULT_RESOURCE_GROUP);
+    }
+
+    #[test]
+    fn create_describe_update_drop_resource_group() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let mut cfg = vectordb_core::ResourceGroupConfig::default();
+        cfg.requests = vectordb_core::ResourceGroupLimit { node_num: 2 };
+        cfg.limits = vectordb_core::ResourceGroupLimit { node_num: 4 };
+        engine
+            .commit_meta(MetaOp::CreateResourceGroup {
+                name: "hot".into(),
+                config: cfg.clone(),
+                created_at_ms: 12345,
+            })
+            .unwrap();
+
+        // Duplicate create fails.
+        let err = engine
+            .commit_meta(MetaOp::CreateResourceGroup {
+                name: "hot".into(),
+                config: cfg.clone(),
+                created_at_ms: 12345,
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ResourceGroupExists(_)));
+
+        let names = engine.list_resource_groups();
+        assert!(names.contains(&"hot".to_string()));
+
+        let info = engine.describe_resource_group("hot").unwrap();
+        assert_eq!(info.config.requests.node_num, 2);
+        assert_eq!(info.config.limits.node_num, 4);
+        assert_eq!(info.created_at_ms, 12345);
+
+        let mut cfg2 = cfg.clone();
+        cfg2.limits = vectordb_core::ResourceGroupLimit { node_num: 8 };
+        engine
+            .commit_meta(MetaOp::UpdateResourceGroup {
+                name: "hot".into(),
+                config: cfg2,
+            })
+            .unwrap();
+        let info2 = engine.describe_resource_group("hot").unwrap();
+        assert_eq!(info2.config.limits.node_num, 8);
+
+        engine
+            .commit_meta(MetaOp::DropResourceGroup {
+                name: "hot".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            engine.describe_resource_group("hot").unwrap_err(),
+            EngineError::ResourceGroupNotFound(_)
+        ));
+
+        // Cannot drop default.
+        let err = engine
+            .commit_meta(MetaOp::DropResourceGroup {
+                name: vectordb_core::DEFAULT_RESOURCE_GROUP.into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidMeta(_)));
+    }
+
+    #[test]
+    fn update_unknown_resource_group_errors() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let err = engine
+            .commit_meta(MetaOp::UpdateResourceGroup {
+                name: "ghost".into(),
+                config: vectordb_core::ResourceGroupConfig::default(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ResourceGroupNotFound(_)));
     }
 }

@@ -332,6 +332,22 @@ async fn main() -> anyhow::Result<()> {
             "/v1/collections/:name/partitions/:partition/stats",
             get(get_partition_stats_route),
         )
+        // ---- Resource groups (Milvus parity) ------------------------------
+        .route(
+            "/v1/resource-groups",
+            get(list_resource_groups_route).post(create_resource_group_route),
+        )
+        .route(
+            "/v1/resource-groups/:name",
+            get(describe_resource_group_route)
+                .patch(update_resource_group_route)
+                .delete(drop_resource_group_route),
+        )
+        .route(
+            "/v1/collections/:name/replicas",
+            get(describe_replica_route),
+        )
+        .route("/v1/admin/transfer-replica", post(transfer_replica_route))
         .route("/v1/admin/compact-wal", post(compact_wal))
         .route("/v1/admin/rebalance", post(trigger_rebalance).get(rebalance_status))
         .route("/v1/admin/cluster", get(cluster_status))
@@ -1519,6 +1535,196 @@ async fn get_partition_stats_route(
         .map(|(k, v)| (k, Value::String(v)))
         .collect();
     Ok(Json(Value::Object(map)))
+}
+
+// ---- Resource groups (Milvus parity) -----------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct ResourceGroupBody {
+    name: Option<String>,
+    #[serde(default)]
+    config: serde_json::Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TransferReplicaBody {
+    collection: String,
+    source_group: String,
+    target_group: String,
+    #[serde(default)]
+    replica_num: i64,
+    #[serde(default)]
+    database: Option<String>,
+}
+
+async fn list_resource_groups_route(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let names = client
+        .list_resource_groups()
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "resource_groups": names })))
+}
+
+async fn create_resource_group_route(
+    State(state): State<AppState>,
+    Json(body): Json<ResourceGroupBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let name = body.name.ok_or(StatusCode::BAD_REQUEST)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Pass the user-supplied config through verbatim — the engine validates
+    // it via serde during MetaOp parsing.
+    let op = serde_json::json!({
+        "CreateResourceGroup": {
+            "name": name,
+            "config": body.config,
+            "created_at_ms": now_ms,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .create_resource_group(bytes)
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn drop_resource_group_route(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let op = serde_json::json!({ "DropResourceGroup": { "name": name } });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .drop_resource_group(bytes)
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn update_resource_group_route(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<ResourceGroupBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let op = serde_json::json!({
+        "UpdateResourceGroup": {
+            "name": name,
+            "config": body.config,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .update_resource_group(bytes)
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn describe_resource_group_route(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let resp = client
+        .describe_resource_group(&name)
+        .await
+        .map_err(map_index_grpc_err)?;
+    let info = resp.info.ok_or(StatusCode::NOT_FOUND)?;
+    let config = info.config.unwrap_or_default();
+    let req_nodes = config.requests.as_ref().map(|l| l.node_num).unwrap_or(0);
+    let lim_nodes = config.limits.as_ref().map(|l| l.node_num).unwrap_or(0);
+    let node_labels: serde_json::Map<String, Value> = config
+        .node_filter
+        .as_ref()
+        .map(|f| {
+            f.node_labels
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "name": info.name,
+        "requests": { "node_num": req_nodes },
+        "limits":   { "node_num": lim_nodes },
+        "transfer_from": config
+            .transfer_from
+            .iter()
+            .map(|t| t.resource_group.clone())
+            .collect::<Vec<_>>(),
+        "transfer_to": config
+            .transfer_to
+            .iter()
+            .map(|t| t.resource_group.clone())
+            .collect::<Vec<_>>(),
+        "node_filter": { "node_labels": Value::Object(node_labels) },
+        "num_available_node": info.num_available_node,
+        "num_loaded_replica": info.num_loaded_replica,
+        "num_incoming_node": info.num_incoming_node,
+        "num_outgoing_node": info.num_outgoing_node,
+        "created_at_ms": info.created_at_ms,
+    })))
+}
+
+async fn describe_replica_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let resp = client
+        .describe_replica(&fqn)
+        .await
+        .map_err(map_index_grpc_err)?;
+    let replicas: Vec<Value> = resp
+        .replicas
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "replica_id": r.replica_id,
+                "collection": r.collection,
+                "resource_group": r.resource_group,
+                "shards": r.shards.into_iter().map(|s| serde_json::json!({
+                    "shard_id": s.shard_id,
+                    "node_id": s.node_id,
+                    "node_address": s.node_address,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "replicas": replicas })))
+}
+
+async fn transfer_replica_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<TransferReplicaBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = body.database.unwrap_or_else(|| current_db(&headers));
+    let fqn = fq(&db, &body.collection);
+    let mut client = state.client.lock().await;
+    client
+        .transfer_replica(
+            &fqn,
+            &body.source_group,
+            &body.target_group,
+            body.replica_num,
+            &db,
+        )
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }
 
 fn map_index_grpc_err(e: anyhow::Error) -> StatusCode {

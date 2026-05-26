@@ -12,24 +12,29 @@ use vectordb_proto::vectordb::v1::{
     ClusterStatusResponse, CollectionSpec, CompactCollectionRequest, CompactCollectionResponse,
     CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
     CreateDatabaseRequest, CreateDatabaseResponse, CreatePartitionRequest, CreatePartitionResponse,
-    CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest,
-    DeleteCollectionResponse, DeleteRequest, DeleteResponse, DeleteSnapshotRequest,
-    DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse, DescribeCollectionRequest,
-    DescribeCollectionResponse, DescribeDatabaseRequest, DescribeDatabaseResponse,
+    CreateResourceGroupRequest, CreateResourceGroupResponse, CreateSnapshotRequest,
+    CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
+    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest,
+    DescribeAliasResponse, DescribeCollectionRequest, DescribeCollectionResponse,
+    DescribeDatabaseRequest, DescribeDatabaseResponse, DescribeReplicaRequest,
+    DescribeReplicaResponse, DescribeResourceGroupRequest, DescribeResourceGroupResponse,
     DropDatabaseRequest, DropDatabaseResponse, DropPartitionRequest, DropPartitionResponse,
-    DropPayloadIndexRequest, DropPayloadIndexResponse, FlushCollectionRequest,
-    FlushCollectionResponse, GetCompactionStateRequest, GetCompactionStateResponse,
-    GetPartitionStatsRequest, GetPartitionStatsResponse, GetRbacSnapshotRequest,
-    GetRbacSnapshotResponse, GetRequest, GetResponse, HasPartitionRequest, HasPartitionResponse,
-    HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse, ListAliasesRequest,
-    ListAliasesResponse, ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest,
-    ListDatabasesResponse, ListPartitionsRequest, ListPartitionsResponse,
-    ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, MutateCollectionMetaRequest, MutateCollectionMetaResponse, QueryRequest,
-    QueryResponse, RebalanceCollectionReport, RebalanceRequest, RebalanceResponse,
-    RebalanceStatusRequest, RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse,
-    ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest, ScrollResponse,
-    SearchRequest, SearchResponse, StatsRequest, StatsResponse, UpsertRequest, UpsertResponse,
+    DropPayloadIndexRequest, DropPayloadIndexResponse, DropResourceGroupRequest,
+    DropResourceGroupResponse, FlushCollectionRequest, FlushCollectionResponse,
+    GetCompactionStateRequest, GetCompactionStateResponse, GetPartitionStatsRequest,
+    GetPartitionStatsResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest,
+    GetResponse, HasPartitionRequest, HasPartitionResponse, HealthRequest, HealthResponse,
+    ImportChunk, ImportStreamResponse, ListAliasesRequest, ListAliasesResponse,
+    ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
+    ListPartitionsRequest, ListPartitionsResponse, ListPersistentSegmentsRequest,
+    ListPersistentSegmentsResponse, ListResourceGroupsRequest, ListResourceGroupsResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, MutateCollectionMetaRequest,
+    MutateCollectionMetaResponse, QueryRequest, QueryResponse, RebalanceCollectionReport,
+    RebalanceRequest, RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse,
+    RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest, ReindexCollectionResponse,
+    ReplicaInfo, ReplicaShard, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
+    StatsRequest, StatsResponse, TransferReplicaRequest, TransferReplicaResponse,
+    UpdateResourceGroupRequest, UpdateResourceGroupResponse, UpsertRequest, UpsertResponse,
     VectorPoint,
 };
 
@@ -761,6 +766,13 @@ impl VectorService for RouterService {
                     "partition ops must use the CreatePartition / DropPartition RPCs",
                 ));
             }
+            vectordb_storage::MetaOp::CreateResourceGroup { .. }
+            | vectordb_storage::MetaOp::DropResourceGroup { .. }
+            | vectordb_storage::MetaOp::UpdateResourceGroup { .. } => {
+                return Err(Status::invalid_argument(
+                    "resource-group ops must use the CreateResourceGroup / DropResourceGroup / UpdateResourceGroup RPCs",
+                ));
+            }
         };
         require_collection(&self.rbac, &request, &target, priv_kind)?;
         let req = request.into_inner();
@@ -1148,6 +1160,160 @@ impl VectorService for RouterService {
         }
         merged.insert("row_count".into(), total_rows.to_string());
         Ok(Response::new(GetPartitionStatsResponse { stats: merged }))
+    }
+
+    // ---- Resource groups (Milvus parity) ------------------------------------
+
+    async fn create_resource_group(
+        &self,
+        request: Request<CreateResourceGroupRequest>,
+    ) -> Result<Response<CreateResourceGroupResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.create_resource_group(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted create_resource_group")));
+        }
+        Ok(Response::new(CreateResourceGroupResponse {}))
+    }
+
+    async fn drop_resource_group(
+        &self,
+        request: Request<DropResourceGroupRequest>,
+    ) -> Result<Response<DropResourceGroupResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.drop_resource_group(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted drop_resource_group")));
+        }
+        Ok(Response::new(DropResourceGroupResponse {}))
+    }
+
+    async fn update_resource_group(
+        &self,
+        request: Request<UpdateResourceGroupRequest>,
+    ) -> Result<Response<UpdateResourceGroupResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.update_resource_group(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted update_resource_group")));
+        }
+        Ok(Response::new(UpdateResourceGroupResponse {}))
+    }
+
+    async fn list_resource_groups(
+        &self,
+        _request: Request<ListResourceGroupsRequest>,
+    ) -> Result<Response<ListResourceGroupsResponse>, Status> {
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.list_resource_groups().await {
+                Ok(names) => return Ok(Response::new(ListResourceGroupsResponse { names })),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| Status::unavailable("no shard accepted list_resource_groups")))
+    }
+
+    async fn describe_resource_group(
+        &self,
+        request: Request<DescribeResourceGroupRequest>,
+    ) -> Result<Response<DescribeResourceGroupResponse>, Status> {
+        let name = request.into_inner().name;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.describe_resource_group(&name).await {
+                Ok(resp) => return Ok(Response::new(resp)),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::not_found(format!("resource group {name}"))))
+    }
+
+    async fn describe_replica(
+        &self,
+        request: Request<DescribeReplicaRequest>,
+    ) -> Result<Response<DescribeReplicaResponse>, Status> {
+        // Registry-only model: VexaDb has a single logical replica per
+        // collection composed of every shard's primary node. We synthesize
+        // that view from topology so callers get a useful layout even
+        // without per-RG enforcement.
+        let collection = request.into_inner().collection;
+        let st = self.topology.status();
+        let mut shards: Vec<ReplicaShard> = Vec::new();
+        for node in st.nodes {
+            for shard_id in &node.primary_for_shards {
+                shards.push(ReplicaShard {
+                    shard_id: *shard_id,
+                    node_id: node.id.clone(),
+                    node_address: node.grpc.clone(),
+                });
+            }
+        }
+        shards.sort_by_key(|s| s.shard_id);
+        let replica = ReplicaInfo {
+            replica_id: 0,
+            collection,
+            // Mirror `vectordb_core::DEFAULT_RESOURCE_GROUP`; inlined to
+            // avoid pulling the core crate into the router.
+            resource_group: "__default_resource_group".to_string(),
+            shards,
+        };
+        Ok(Response::new(DescribeReplicaResponse {
+            replicas: vec![replica],
+        }))
+    }
+
+    async fn transfer_replica(
+        &self,
+        request: Request<TransferReplicaRequest>,
+    ) -> Result<Response<TransferReplicaResponse>, Status> {
+        let req = request.into_inner();
+        // Forward to the first reachable shard so RBAC + validation runs
+        // server-side. The server treats this as a no-op success in
+        // registry-only mode.
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client
+                .transfer_replica(
+                    &req.collection,
+                    &req.source_group,
+                    &req.target_group,
+                    req.replica_num,
+                    &req.database,
+                )
+                .await
+            {
+                Ok(()) => return Ok(Response::new(TransferReplicaResponse {})),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| Status::unavailable("no shard accepted transfer_replica")))
     }
 
     async fn delete(

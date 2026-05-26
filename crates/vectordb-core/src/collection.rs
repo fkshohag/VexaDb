@@ -76,6 +76,82 @@ impl DatabaseConfig {
     }
 }
 
+/// Built-in resource group present on every cluster. Mirrors Milvus's
+/// `__default_resource_group` — cannot be dropped.
+pub const DEFAULT_RESOURCE_GROUP: &str = "__default_resource_group";
+
+/// Configuration for a logical resource group: a named pool of compute
+/// nodes addressable by name. Mirrors Milvus's `ResourceGroupConfig`
+/// shape so the Go SDK round-trips JSON cleanly.
+///
+/// VexaDb persists the registry but does not currently enforce node
+/// scheduling against `Requests`/`Limits`; the values are stored verbatim
+/// and surfaced through `DescribeResourceGroup` for tooling.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceGroupConfig {
+    /// Soft lower-bound on the number of nodes assigned to this group.
+    #[serde(default)]
+    pub requests: ResourceGroupLimit,
+    /// Hard upper-bound on the number of nodes.
+    #[serde(default)]
+    pub limits: ResourceGroupLimit,
+    /// Optional list of other groups that can lend nodes to this one.
+    #[serde(default)]
+    pub transfer_from: Vec<ResourceGroupTransfer>,
+    /// Optional list of other groups this one can lend nodes to.
+    #[serde(default)]
+    pub transfer_to: Vec<ResourceGroupTransfer>,
+    /// Filter expression selecting nodes by their topology labels.
+    #[serde(default)]
+    pub node_filter: ResourceGroupNodeFilter,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ResourceGroupLimit {
+    /// Target node count. `0` means "unspecified".
+    #[serde(default)]
+    pub node_num: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceGroupTransfer {
+    pub resource_group: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceGroupNodeFilter {
+    /// Free-form node labels (`label_key -> required_value`). Matching is
+    /// done by the topology layer when picking nodes for a group; not
+    /// enforced in `registry_only` mode.
+    #[serde(default)]
+    pub node_labels: std::collections::BTreeMap<String, String>,
+}
+
+/// Full description returned by `DescribeResourceGroup`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceGroupInfo {
+    pub name: String,
+    pub config: ResourceGroupConfig,
+    /// Number of nodes currently bound to this group (best-effort, may be
+    /// zero until topology reporting wires this up).
+    #[serde(default)]
+    pub num_available_node: i32,
+    /// Per-collection replica counts (`collection_name -> replica_num`).
+    #[serde(default)]
+    pub num_loaded_replica: std::collections::BTreeMap<String, i32>,
+    /// Replica counts of collections in the middle of being transferred to
+    /// this RG. Always empty in `registry_only` mode.
+    #[serde(default)]
+    pub num_incoming_node: std::collections::BTreeMap<String, i32>,
+    /// Replica counts of collections in the middle of being transferred
+    /// out. Always empty in `registry_only` mode.
+    #[serde(default)]
+    pub num_outgoing_node: std::collections::BTreeMap<String, i32>,
+    /// Milliseconds since epoch when the resource group was created.
+    #[serde(default)]
+    pub created_at_ms: u64,
+}
+
 /// Configuration for a logical vector collection (namespace).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionConfig {

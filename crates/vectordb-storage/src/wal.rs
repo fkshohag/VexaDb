@@ -168,6 +168,24 @@ pub enum MetaOp {
         database: String,
         partition: String,
     },
+    // ---- Resource group management (Milvus-parity) ----------------------
+    /// Create a new resource group. Names are unique cluster-wide; the
+    /// built-in `__default_resource_group` cannot be re-created.
+    CreateResourceGroup {
+        name: String,
+        #[serde(default)]
+        config: vectordb_core::ResourceGroupConfig,
+        #[serde(default)]
+        created_at_ms: u64,
+    },
+    /// Drop a resource group. Rejected for the built-in default group.
+    DropResourceGroup { name: String },
+    /// Replace the config of an existing resource group. The previous
+    /// config is overwritten in full (Milvus semantics).
+    UpdateResourceGroup {
+        name: String,
+        config: vectordb_core::ResourceGroupConfig,
+    },
 }
 
 fn default_database() -> String {

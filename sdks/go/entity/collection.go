@@ -28,19 +28,35 @@ type Alias struct {
 	Collection string `json:"collection"`
 }
 
-// Shard / ReplicaInfo mirror Milvus's [entity.Shard] / [entity.ReplicaInfo].
-// VexaDb has one logical replica per shard (Raft group), so these are
-// derived from the cluster status endpoint by the SDK.
+// Shard mirrors Milvus's [entity.Shard]. VexaDb has one logical replica per
+// shard (Raft group), so this is derived from the cluster status endpoint
+// by the SDK.
 type Shard struct {
 	ChannelName string  `json:"channel_name"`
 	ShardNodes  []int64 `json:"shard_nodes"`
 	ShardLeader int64   `json:"shard_leader"`
 }
 
+// ReplicaInfo mirrors Milvus's [entity.ReplicaInfo]. Returned by
+// `Client.DescribeReplica` (Milvus parity); also produced by the legacy
+// `Client.GetReplicas` helper, which derives one entry per shard from the
+// cluster status endpoint.
+//
+// The struct intentionally carries both the Milvus-shaped fields and the
+// richer per-shard placement (`Placement`) so callers that only care about
+// the legacy `(ReplicaID, Shards, Nodes)` triple keep compiling, while
+// `DescribeResourceGroup`/`DescribeReplica` consumers get full
+// shard-to-node detail.
 type ReplicaInfo struct {
 	ReplicaID         int64            `json:"replica_id"`
-	Shards            []*Shard         `json:"shards"`
-	Nodes             []int64          `json:"nodes"`
+	Shards            []*Shard         `json:"shards,omitempty"`
+	Nodes             []int64          `json:"nodes,omitempty"`
 	ResourceGroupName string           `json:"resource_group_name,omitempty"`
 	NumOutboundNode   map[string]int32 `json:"num_outbound_node,omitempty"`
+
+	// Below fields are populated by `Client.DescribeReplica` (Milvus
+	// parity). Older callers can ignore them.
+	Collection string         `json:"collection,omitempty"`
+	Placement  []ReplicaShard `json:"placement,omitempty"`
+	NodeIDs    []string       `json:"node_ids,omitempty"`
 }

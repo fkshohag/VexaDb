@@ -8,17 +8,20 @@ use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
     AddPayloadIndexRequest, AlterDatabaseRequest, ApplyRbacRequest, BulkUpsertRequest,
     CollectionSpec, CompactCollectionRequest, CompactWalRequest, CompactWalResponse,
-    CreateCollectionRequest, CreateDatabaseRequest, CreatePartitionRequest, CreateSnapshotRequest,
-    DatabaseInfo, DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest,
-    DescribeAliasRequest, DescribeCollectionRequest, DescribeDatabaseRequest, DistanceMetric,
-    DropDatabaseRequest, DropPartitionRequest, DropPayloadIndexRequest, FlushCollectionRequest,
-    FlushCollectionResponse, GetCompactionStateRequest, GetCompactionStateResponse,
-    GetPartitionStatsRequest, GetRbacSnapshotRequest, GetRequest, HasPartitionRequest,
-    HealthRequest, HealthResponse, ImportChunk, ListAliasesRequest, ListCollectionsRequest,
-    ListDatabasesRequest, ListPartitionsRequest, ListPersistentSegmentsRequest,
-    ListPersistentSegmentsResponse, ListSnapshotsRequest, MutateCollectionMetaRequest,
-    QueryRequest, QueryResponse, ReindexCollectionRequest, ReindexCollectionResponse,
-    SearchRequest, SnapshotInfo, StatsRequest, StatsResponse, UpsertRequest, VectorPoint,
+    CreateCollectionRequest, CreateDatabaseRequest, CreatePartitionRequest,
+    CreateResourceGroupRequest, CreateSnapshotRequest, DatabaseInfo, DeleteCollectionRequest,
+    DeleteRequest, DeleteSnapshotRequest, DescribeAliasRequest, DescribeCollectionRequest,
+    DescribeDatabaseRequest, DescribeReplicaRequest, DescribeReplicaResponse,
+    DescribeResourceGroupRequest, DescribeResourceGroupResponse, DistanceMetric,
+    DropDatabaseRequest, DropPartitionRequest, DropPayloadIndexRequest, DropResourceGroupRequest,
+    FlushCollectionRequest, FlushCollectionResponse, GetCompactionStateRequest,
+    GetCompactionStateResponse, GetPartitionStatsRequest, GetRbacSnapshotRequest, GetRequest,
+    HasPartitionRequest, HealthRequest, HealthResponse, ImportChunk, ListAliasesRequest,
+    ListCollectionsRequest, ListDatabasesRequest, ListPartitionsRequest,
+    ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListResourceGroupsRequest,
+    ListSnapshotsRequest, MutateCollectionMetaRequest, QueryRequest, QueryResponse,
+    ReindexCollectionRequest, ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest,
+    StatsResponse, TransferReplicaRequest, UpdateResourceGroupRequest, UpsertRequest, VectorPoint,
 };
 use vectordb_proto::VectorServiceClient;
 
@@ -382,6 +385,88 @@ impl VectorDbClient {
             .await?
             .into_inner();
         Ok(resp.stats)
+    }
+
+    // ---- Resource groups (Milvus parity) ------------------------------------
+
+    /// Create a resource group via a JSON-encoded `MetaOp::CreateResourceGroup`.
+    pub async fn create_resource_group(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .create_resource_group(self.authed(CreateResourceGroupRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a resource group via a JSON-encoded `MetaOp::DropResourceGroup`.
+    pub async fn drop_resource_group(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_resource_group(self.authed(DropResourceGroupRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_resource_group(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .update_resource_group(self.authed(UpdateResourceGroupRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_resource_groups(&mut self) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .inner
+            .list_resource_groups(self.authed(ListResourceGroupsRequest {}))
+            .await?
+            .into_inner();
+        Ok(resp.names)
+    }
+
+    pub async fn describe_resource_group(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<DescribeResourceGroupResponse> {
+        let resp = self
+            .inner
+            .describe_resource_group(self.authed(DescribeResourceGroupRequest {
+                name: name.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn describe_replica(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<DescribeReplicaResponse> {
+        let resp = self
+            .inner
+            .describe_replica(self.authed(DescribeReplicaRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn transfer_replica(
+        &mut self,
+        collection: &str,
+        source_group: &str,
+        target_group: &str,
+        replica_num: i64,
+        database: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .transfer_replica(self.authed(TransferReplicaRequest {
+                collection: collection.to_string(),
+                source_group: source_group.to_string(),
+                target_group: target_group.to_string(),
+                replica_num,
+                database: database.to_string(),
+            }))
+            .await?;
+        Ok(())
     }
 
     pub async fn upsert(

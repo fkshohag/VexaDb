@@ -42,6 +42,12 @@ type mgmtStubGateway struct {
 	lastAlterPropsBody   atomic.Pointer[map[string]any]
 	lastDropPropsBody    atomic.Pointer[map[string]any]
 	nextCompaction       atomic.Uint64
+	resourceGroups       map[string]map[string]any // name -> config snapshot
+	rgCreateCalls        atomic.Int32
+	rgDropCalls          atomic.Int32
+	rgUpdateCalls        atomic.Int32
+	transferReplicaCalls atomic.Int32
+	lastTransferBody     atomic.Pointer[map[string]any]
 }
 
 type storedIndex struct {
@@ -69,6 +75,13 @@ func newMgmtStub() *mgmtStubGateway {
 		compactions:      map[uint64]storedCompaction{},
 		partitions:       map[string][]string{"docs": {"_default"}},
 		partitionRows:    map[string]map[string]int{"docs": {"_default": 0}},
+		resourceGroups: map[string]map[string]any{
+			"__default_resource_group": {
+				"requests":    map[string]any{"node_num": 0},
+				"limits":      map[string]any{"node_num": 0},
+				"node_filter": map[string]any{"node_labels": map[string]any{}},
+			},
+		},
 	}
 	s.nextCompaction.Store(1)
 	return s
@@ -93,6 +106,9 @@ func (s *mgmtStubGateway) server(t *testing.T) *httptest.Server {
 
 	mux.HandleFunc("/v1/collections/", s.handleCollection)
 	mux.HandleFunc("/v1/compactions/", s.handleCompaction)
+	mux.HandleFunc("/v1/resource-groups", s.handleResourceGroupRoot)
+	mux.HandleFunc("/v1/resource-groups/", s.handleResourceGroupNamed)
+	mux.HandleFunc("/v1/admin/transfer-replica", s.handleTransferReplica)
 
 	return httptest.NewServer(mux)
 }
@@ -120,6 +136,24 @@ func (s *mgmtStubGateway) handleCollection(w http.ResponseWriter, r *http.Reques
 		s.handleIndexes(w, r, name, rest)
 	case "partitions":
 		s.handlePartitions(w, r, name, rest)
+	case "replicas":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"replicas": []map[string]any{
+				{
+					"replica_id":     0,
+					"collection":     "default/" + name,
+					"resource_group": "__default_resource_group",
+					"shards": []map[string]any{
+						{"shard_id": 0, "node_id": "node-a", "node_address": "127.0.0.1:51001"},
+						{"shard_id": 1, "node_id": "node-b", "node_address": "127.0.0.1:51002"},
+					},
+				},
+			},
+		})
 	case "load":
 		if r.Method == http.MethodPost {
 			s.loadCalls.Add(1)
@@ -406,6 +440,136 @@ func (s *mgmtStubGateway) handleCompaction(w http.ResponseWriter, r *http.Reques
 		"finished_ms":    c.finishedMs,
 		"error":          nil,
 	})
+}
+
+// ---- Resource group handlers --------------------------------------------
+
+func (s *mgmtStubGateway) handleResourceGroupRoot(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.Lock()
+		names := make([]string, 0, len(s.resourceGroups))
+		for n := range s.resourceGroups {
+			names = append(names, n)
+		}
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"resource_groups": names})
+	case http.MethodPost:
+		var body struct {
+			Name   string         `json:"name"`
+			Config map[string]any `json:"config"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.rgCreateCalls.Add(1)
+		s.mu.Lock()
+		if _, exists := s.resourceGroups[body.Name]; exists {
+			s.mu.Unlock()
+			http.Error(w, "exists", http.StatusConflict)
+			return
+		}
+		if body.Config == nil {
+			body.Config = map[string]any{}
+		}
+		s.resourceGroups[body.Name] = body.Config
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *mgmtStubGateway) handleResourceGroupNamed(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimPrefix(r.URL.Path, "/v1/resource-groups/")
+	if name == "" {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		s.mu.Lock()
+		cfg, ok := s.resourceGroups[name]
+		s.mu.Unlock()
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		req := map[string]any{"node_num": 0}
+		lim := map[string]any{"node_num": 0}
+		if v, ok := cfg["requests"].(map[string]any); ok {
+			req = v
+		}
+		if v, ok := cfg["limits"].(map[string]any); ok {
+			lim = v
+		}
+		nodeLabels := map[string]any{}
+		if nf, ok := cfg["node_filter"].(map[string]any); ok {
+			if nl, ok := nf["node_labels"].(map[string]any); ok {
+				nodeLabels = nl
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"name":                name,
+			"requests":            req,
+			"limits":              lim,
+			"transfer_from":       []string{},
+			"transfer_to":         []string{},
+			"node_filter":         map[string]any{"node_labels": nodeLabels},
+			"num_available_node":  0,
+			"num_loaded_replica":  map[string]int32{},
+			"num_incoming_node":   map[string]int32{},
+			"num_outgoing_node":   map[string]int32{},
+			"created_at_ms":       0,
+		})
+	case http.MethodPatch:
+		var body struct {
+			Name   string         `json:"name"`
+			Config map[string]any `json:"config"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.rgUpdateCalls.Add(1)
+		s.mu.Lock()
+		if _, ok := s.resourceGroups[name]; !ok {
+			s.mu.Unlock()
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		s.resourceGroups[name] = body.Config
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	case http.MethodDelete:
+		s.rgDropCalls.Add(1)
+		if name == "__default_resource_group" {
+			http.Error(w, "cannot drop default", http.StatusBadRequest)
+			return
+		}
+		s.mu.Lock()
+		delete(s.resourceGroups, name)
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *mgmtStubGateway) handleTransferReplica(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.transferReplicaCalls.Add(1)
+	s.lastTransferBody.Store(&body)
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 }
 
 func newMgmtTestClient(t *testing.T, stub *mgmtStubGateway) (*Client, *httptest.Server) {
@@ -812,5 +976,179 @@ func TestPartitionOptionValidation(t *testing.T) {
 	}
 	if _, err := cli.ListPartitions(ctx, &ListPartitionsOption{}); err == nil {
 		t.Fatal("expected error on empty collection for ListPartitions")
+	}
+}
+
+// ---- Resource group ------------------------------------------------------
+
+func TestResourceGroupLifecycle(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+
+	cfg := &entity.ResourceGroupConfig{
+		Requests: entity.ResourceGroupLimit{NodeNum: 2},
+		Limits:   entity.ResourceGroupLimit{NodeNum: 4},
+		NodeFilter: entity.ResourceGroupNodeFilter{
+			NodeLabels: map[string]string{"zone": "a"},
+		},
+	}
+	if err := cli.CreateResourceGroup(ctx, NewCreateResourceGroupOption("hot").WithConfig(cfg)); err != nil {
+		t.Fatalf("CreateResourceGroup: %v", err)
+	}
+	if stub.rgCreateCalls.Load() != 1 {
+		t.Fatalf("CreateResourceGroup not called once, got %d", stub.rgCreateCalls.Load())
+	}
+
+	names, err := cli.ListResourceGroups(ctx, NewListResourceGroupsOption())
+	if err != nil {
+		t.Fatalf("ListResourceGroups: %v", err)
+	}
+	var sawHot, sawDefault bool
+	for _, n := range names {
+		if n == "hot" {
+			sawHot = true
+		}
+		if n == entity.DefaultResourceGroupName {
+			sawDefault = true
+		}
+	}
+	if !sawHot || !sawDefault {
+		t.Fatalf("ListResourceGroups missing entries: %v", names)
+	}
+
+	rg, err := cli.DescribeResourceGroup(ctx, NewDescribeResourceGroupOption("hot"))
+	if err != nil {
+		t.Fatalf("DescribeResourceGroup: %v", err)
+	}
+	if rg.Name != "hot" {
+		t.Fatalf("DescribeResourceGroup.Name = %q", rg.Name)
+	}
+	if rg.Config.Requests.NodeNum != 2 || rg.Config.Limits.NodeNum != 4 {
+		t.Fatalf("DescribeResourceGroup limits = %+v", rg.Config)
+	}
+	if rg.Config.NodeFilter.NodeLabels["zone"] != "a" {
+		t.Fatalf("DescribeResourceGroup node_labels = %+v", rg.Config.NodeFilter.NodeLabels)
+	}
+
+	cfg2 := &entity.ResourceGroupConfig{
+		Requests: entity.ResourceGroupLimit{NodeNum: 8},
+		Limits:   entity.ResourceGroupLimit{NodeNum: 16},
+	}
+	if err := cli.UpdateResourceGroup(ctx, NewUpdateResourceGroupOption("hot", cfg2)); err != nil {
+		t.Fatalf("UpdateResourceGroup: %v", err)
+	}
+	if stub.rgUpdateCalls.Load() != 1 {
+		t.Fatalf("UpdateResourceGroup not called once, got %d", stub.rgUpdateCalls.Load())
+	}
+
+	if err := cli.DropResourceGroup(ctx, NewDropResourceGroupOption("hot")); err != nil {
+		t.Fatalf("DropResourceGroup: %v", err)
+	}
+}
+
+func TestResourceGroupShortcutOptions(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+
+	opt := NewCreateResourceGroupOption("compact").
+		WithNodeRequest(1).
+		WithNodeLimit(3)
+	if err := cli.CreateResourceGroup(ctx, opt); err != nil {
+		t.Fatalf("CreateResourceGroup: %v", err)
+	}
+	rg, err := cli.DescribeResourceGroup(ctx, NewDescribeResourceGroupOption("compact"))
+	if err != nil {
+		t.Fatalf("DescribeResourceGroup: %v", err)
+	}
+	if rg.Config.Requests.NodeNum != 1 || rg.Config.Limits.NodeNum != 3 {
+		t.Fatalf("shortcut options not honored: %+v", rg.Config)
+	}
+}
+
+func TestTransferReplicaSendsRequest(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+
+	if err := cli.CreateResourceGroup(ctx, NewCreateResourceGroupOption("src")); err != nil {
+		t.Fatalf("CreateResourceGroup src: %v", err)
+	}
+	if err := cli.CreateResourceGroup(ctx, NewCreateResourceGroupOption("dst")); err != nil {
+		t.Fatalf("CreateResourceGroup dst: %v", err)
+	}
+	err := cli.TransferReplica(ctx, NewTransferReplicaOption("docs", "src", "dst", 1).WithDBName("default"))
+	if err != nil {
+		t.Fatalf("TransferReplica: %v", err)
+	}
+	if stub.transferReplicaCalls.Load() != 1 {
+		t.Fatalf("TransferReplica not called once, got %d", stub.transferReplicaCalls.Load())
+	}
+	got := stub.lastTransferBody.Load()
+	if got == nil {
+		t.Fatal("TransferReplica body not captured")
+	}
+	if (*got)["collection"] != "docs" {
+		t.Fatalf("body.collection = %v", (*got)["collection"])
+	}
+	if (*got)["database"] != "default" {
+		t.Fatalf("body.database = %v", (*got)["database"])
+	}
+}
+
+func TestDescribeReplicaUsesRESTEndpoint(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+
+	replicas, err := cli.DescribeReplica(ctx, NewDescribeReplicaOption("docs"))
+	if err != nil {
+		t.Fatalf("DescribeReplica: %v", err)
+	}
+	if len(replicas) != 1 {
+		t.Fatalf("DescribeReplica replicas = %d", len(replicas))
+	}
+	r := replicas[0]
+	if r.ResourceGroupName != entity.DefaultResourceGroupName {
+		t.Fatalf("resource_group = %q", r.ResourceGroupName)
+	}
+	if len(r.Placement) != 2 {
+		t.Fatalf("placement = %d", len(r.Placement))
+	}
+	if r.Placement[0].NodeID != "node-a" || r.Placement[1].NodeID != "node-b" {
+		t.Fatalf("placement nodes = %+v", r.Placement)
+	}
+	if len(r.NodeIDs) != 2 || r.NodeIDs[0] != "node-a" || r.NodeIDs[1] != "node-b" {
+		t.Fatalf("node_ids = %v", r.NodeIDs)
+	}
+}
+
+func TestResourceGroupOptionValidation(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+	if err := cli.CreateResourceGroup(ctx, NewCreateResourceGroupOption("")); err == nil {
+		t.Fatal("expected error on empty name for CreateResourceGroup")
+	}
+	if err := cli.DropResourceGroup(ctx, NewDropResourceGroupOption("")); err == nil {
+		t.Fatal("expected error on empty name for DropResourceGroup")
+	}
+	if _, err := cli.DescribeResourceGroup(ctx, NewDescribeResourceGroupOption("")); err == nil {
+		t.Fatal("expected error on empty name for DescribeResourceGroup")
+	}
+	if err := cli.UpdateResourceGroup(ctx, NewUpdateResourceGroupOption("", nil)); err == nil {
+		t.Fatal("expected error on empty name for UpdateResourceGroup")
+	}
+	if err := cli.TransferReplica(ctx, NewTransferReplicaOption("", "a", "b", 1)); err == nil {
+		t.Fatal("expected error on empty collection for TransferReplica")
+	}
+	if err := cli.TransferReplica(ctx, NewTransferReplicaOption("docs", "", "b", 1)); err == nil {
+		t.Fatal("expected error on empty source group for TransferReplica")
 	}
 }

@@ -265,11 +265,16 @@ func (c *Client) ListAliases(ctx context.Context, opt *ListAliasesOption) ([]str
 
 // DescribeReplica returns shard / replica information for a collection.
 //
-// VexaDb keeps a single replica per shard (Raft group), so the response
-// contains one ReplicaInfo with one Shard per logical shard. When
-// `opt.Collection` is empty, returns cluster-wide replica information.
+// When `opt.Collection` is set the SDK calls
+// `GET /v1/collections/:name/replicas`, which returns a single
+// `entity.ReplicaInfo` with rich shard-to-node placement
+// (`Placement[].ShardID`, `NodeID`, `NodeAddress`). When empty, the SDK
+// falls back to deriving a single replica from the cluster status endpoint
+// (Milvus source compatibility — no breaking change for older callers).
 func (c *Client) DescribeReplica(ctx context.Context, opt *DescribeReplicaOption) ([]*entity.ReplicaInfo, error) {
-	_ = opt // VexaDb's cluster topology is collection-agnostic today.
+	if opt != nil && opt.Collection != "" {
+		return c.describeReplicaByCollection(ctx, opt.Collection, opt.DBName)
+	}
 	status, err := c.ClusterStatus(ctx)
 	if err != nil {
 		return nil, err

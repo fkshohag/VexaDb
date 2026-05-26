@@ -157,6 +157,14 @@ pub fn method_priv(method: &str) -> Option<MethodPriv> {
         "HasPartition" => p(DescribePartition, false),
         "ListPartitions" => p(ShowPartitions, false),
         "GetPartitionStats" => p(GetPartitionStatistics, false),
+        // Resource groups (Milvus parity, all global).
+        "CreateResourceGroup" => p(CreateResourceGroup, true),
+        "DropResourceGroup" => p(DropResourceGroup, true),
+        "UpdateResourceGroup" => p(UpdateResourceGroup, true),
+        "ListResourceGroups" => p(ListResourceGroups, true),
+        "DescribeResourceGroup" => p(DescribeResourceGroup, true),
+        "DescribeReplica" => p(DescribeReplica, true),
+        "TransferReplica" => p(TransferReplica, true),
         _ => None,
     }
 }

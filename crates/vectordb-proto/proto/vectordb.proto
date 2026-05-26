@@ -71,6 +71,15 @@ service VectorService {
   rpc HasPartition(HasPartitionRequest) returns (HasPartitionResponse);
   rpc ListPartitions(ListPartitionsRequest) returns (ListPartitionsResponse);
   rpc GetPartitionStats(GetPartitionStatsRequest) returns (GetPartitionStatsResponse);
+  // Resource groups (Milvus parity, registry-only on VexaDb).
+  rpc CreateResourceGroup(CreateResourceGroupRequest) returns (CreateResourceGroupResponse);
+  rpc DropResourceGroup(DropResourceGroupRequest) returns (DropResourceGroupResponse);
+  rpc UpdateResourceGroup(UpdateResourceGroupRequest) returns (UpdateResourceGroupResponse);
+  rpc ListResourceGroups(ListResourceGroupsRequest) returns (ListResourceGroupsResponse);
+  rpc DescribeResourceGroup(DescribeResourceGroupRequest) returns (DescribeResourceGroupResponse);
+  // Replica info (collection-level introspection used by ResourceGroup tooling).
+  rpc DescribeReplica(DescribeReplicaRequest) returns (DescribeReplicaResponse);
+  rpc TransferReplica(TransferReplicaRequest) returns (TransferReplicaResponse);
 }
 
 message ApplyRbacRequest {
@@ -619,3 +628,96 @@ message GetPartitionStatsResponse {
   // Free-form key/value stats: at minimum {row_count, partition_name, collection}.
   map<string, string> stats = 1;
 }
+
+// ---- Resource groups (Milvus parity) --------------------------------------
+
+message ResourceGroupLimit {
+  int32 node_num = 1;
+}
+
+message ResourceGroupTransfer {
+  string resource_group = 1;
+}
+
+message ResourceGroupNodeFilter {
+  map<string, string> node_labels = 1;
+}
+
+message ResourceGroupConfig {
+  ResourceGroupLimit requests = 1;
+  ResourceGroupLimit limits = 2;
+  repeated ResourceGroupTransfer transfer_from = 3;
+  repeated ResourceGroupTransfer transfer_to = 4;
+  ResourceGroupNodeFilter node_filter = 5;
+}
+
+message ResourceGroupInfo {
+  string name = 1;
+  ResourceGroupConfig config = 2;
+  int32 num_available_node = 3;
+  map<string, int32> num_loaded_replica = 4;
+  map<string, int32> num_incoming_node = 5;
+  map<string, int32> num_outgoing_node = 6;
+  uint64 created_at_ms = 7;
+}
+
+message CreateResourceGroupRequest {
+  // JSON-encoded MetaOp::CreateResourceGroup { name, config, created_at_ms }.
+  bytes op_json = 1;
+}
+message CreateResourceGroupResponse {}
+
+message DropResourceGroupRequest {
+  // JSON-encoded MetaOp::DropResourceGroup { name }.
+  bytes op_json = 1;
+}
+message DropResourceGroupResponse {}
+
+message UpdateResourceGroupRequest {
+  // JSON-encoded MetaOp::UpdateResourceGroup { name, config }.
+  bytes op_json = 1;
+}
+message UpdateResourceGroupResponse {}
+
+message ListResourceGroupsRequest {}
+message ListResourceGroupsResponse {
+  repeated string names = 1;
+}
+
+message DescribeResourceGroupRequest {
+  string name = 1;
+}
+message DescribeResourceGroupResponse {
+  ResourceGroupInfo info = 1;
+}
+
+// ---- Replica introspection (Milvus parity) -------------------------------
+
+message ReplicaShard {
+  uint32 shard_id = 1;
+  string node_id = 2;
+  string node_address = 3;
+}
+
+message ReplicaInfo {
+  uint64 replica_id = 1;
+  string collection = 2;
+  string resource_group = 3;
+  repeated ReplicaShard shards = 4;
+}
+
+message DescribeReplicaRequest {
+  string collection = 1;
+}
+message DescribeReplicaResponse {
+  repeated ReplicaInfo replicas = 1;
+}
+
+message TransferReplicaRequest {
+  string collection = 1;
+  string source_group = 2;
+  string target_group = 3;
+  int64 replica_num = 4;
+  string database = 5;
+}
+message TransferReplicaResponse {}
