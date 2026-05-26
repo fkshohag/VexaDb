@@ -140,6 +140,16 @@ pub fn method_priv(method: &str) -> Option<MethodPriv> {
         "ListDatabases" => p(ListDatabases, true),
         "DescribeDatabase" => p(DescribeDatabase, true),
         "AlterDatabase" => p(AlterDatabase, true),
+        // Management: indexes / flush / compact / segments (Milvus parity).
+        // Index ops do per-collection RBAC checks in the server handler
+        // since the affected collection is encoded inside the MetaOp JSON.
+        "AddPayloadIndex" | "DropPayloadIndex" => None,
+        "FlushCollection" => p(Flush, false),
+        "CompactCollection" => p(Compact, false),
+        // GetCompactionState targets a job ID (not a collection), so the
+        // privilege is global to mirror CompactWal.
+        "GetCompactionState" => p(GetCompactionState, true),
+        "ListPersistentSegments" => p(GetPersistentSegmentInfo, false),
         _ => None,
     }
 }

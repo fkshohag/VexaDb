@@ -6,15 +6,18 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
-    AlterDatabaseRequest, ApplyRbacRequest, BulkUpsertRequest, CollectionSpec, CompactWalRequest,
-    CompactWalResponse, CreateCollectionRequest, CreateDatabaseRequest, CreateSnapshotRequest,
-    DatabaseInfo, DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest, DescribeAliasRequest,
+    AddPayloadIndexRequest, AlterDatabaseRequest, ApplyRbacRequest, BulkUpsertRequest,
+    CollectionSpec, CompactCollectionRequest, CompactWalRequest, CompactWalResponse,
+    CreateCollectionRequest, CreateDatabaseRequest, CreateSnapshotRequest, DatabaseInfo,
+    DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest, DescribeAliasRequest,
     DescribeCollectionRequest, DescribeDatabaseRequest, DistanceMetric, DropDatabaseRequest,
-    GetRbacSnapshotRequest, GetRequest, HealthRequest, HealthResponse, ImportChunk,
-    ListAliasesRequest, ListCollectionsRequest, ListDatabasesRequest, ListSnapshotsRequest,
-    MutateCollectionMetaRequest, QueryRequest, QueryResponse, ReindexCollectionRequest,
-    ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest, StatsResponse,
-    UpsertRequest, VectorPoint,
+    DropPayloadIndexRequest, FlushCollectionRequest, FlushCollectionResponse,
+    GetCompactionStateRequest, GetCompactionStateResponse, GetRbacSnapshotRequest, GetRequest,
+    HealthRequest, HealthResponse, ImportChunk, ListAliasesRequest, ListCollectionsRequest,
+    ListDatabasesRequest, ListPersistentSegmentsRequest, ListPersistentSegmentsResponse,
+    ListSnapshotsRequest, MutateCollectionMetaRequest, QueryRequest, QueryResponse,
+    ReindexCollectionRequest, ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest,
+    StatsResponse, UpsertRequest, VectorPoint,
 };
 use vectordb_proto::VectorServiceClient;
 
@@ -243,6 +246,79 @@ impl VectorDbClient {
             .await?
             .into_inner();
         resp.info.context("missing database info")
+    }
+
+    // ---- Management (Milvus v2 parity) ------------------------------------
+
+    /// Add a payload (scalar) index via `MetaOp::AddPayloadIndex`.
+    pub async fn add_payload_index(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .add_payload_index(self.authed(AddPayloadIndexRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a payload (scalar) index via `MetaOp::DropPayloadIndex`.
+    pub async fn drop_payload_index(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_payload_index(self.authed(DropPayloadIndexRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Flush a collection's pending writes — Milvus parity.
+    pub async fn flush_collection(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<FlushCollectionResponse> {
+        let resp = self
+            .inner
+            .flush_collection(self.authed(FlushCollectionRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// Trigger collection-scoped compaction and return the job ID.
+    pub async fn compact_collection(&mut self, collection: &str) -> anyhow::Result<u64> {
+        let resp = self
+            .inner
+            .compact_collection(self.authed(CompactCollectionRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.compaction_id)
+    }
+
+    /// Poll the state of a compaction job minted by [`Self::compact_collection`].
+    pub async fn get_compaction_state(
+        &mut self,
+        compaction_id: u64,
+    ) -> anyhow::Result<GetCompactionStateResponse> {
+        let resp = self
+            .inner
+            .get_compaction_state(self.authed(GetCompactionStateRequest { compaction_id }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// List persistent segments for a collection.
+    pub async fn list_persistent_segments(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<ListPersistentSegmentsResponse> {
+        let resp = self
+            .inner
+            .list_persistent_segments(self.authed(ListPersistentSegmentsRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
     }
 
     pub async fn upsert(

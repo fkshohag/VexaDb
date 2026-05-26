@@ -7,25 +7,31 @@ use vectordb_core::{
     QuantizationConfig, ScoredPoint, SearchMode, SparseVector,
 };
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, AliasEntry, AlterDatabaseRequest, AlterDatabaseResponse,
-    ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest, BulkUpsertResponse,
-    ClusterStatusRequest, ClusterStatusResponse, CollectionSpec, CompactWalRequest,
-    CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DatabaseInfo, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
-    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest,
-    DescribeAliasResponse, DescribeCollectionRequest, DescribeCollectionResponse,
-    DescribeDatabaseRequest, DescribeDatabaseResponse, DistanceMetric as ProtoMetric,
-    DropDatabaseRequest, DropDatabaseResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse,
-    GetRequest, GetResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
+    vector_service_server::VectorService, AddPayloadIndexRequest, AddPayloadIndexResponse,
+    AliasEntry, AlterDatabaseRequest, AlterDatabaseResponse, ApplyRbacRequest, ApplyRbacResponse,
+    BulkUpsertRequest, BulkUpsertResponse, ClusterStatusRequest, ClusterStatusResponse,
+    CollectionSpec, CompactCollectionRequest, CompactCollectionResponse,
+    CompactionState as ProtoCompactionState, CompactWalRequest, CompactWalResponse,
+    CreateCollectionRequest, CreateCollectionResponse, CreateDatabaseRequest,
+    CreateDatabaseResponse, CreateSnapshotRequest, CreateSnapshotResponse, DatabaseInfo,
+    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
+    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse,
+    DescribeCollectionRequest, DescribeCollectionResponse, DescribeDatabaseRequest,
+    DescribeDatabaseResponse, DistanceMetric as ProtoMetric, DropDatabaseRequest,
+    DropDatabaseResponse, DropPayloadIndexRequest, DropPayloadIndexResponse,
+    FlushCollectionRequest, FlushCollectionResponse, GetCompactionStateRequest,
+    GetCompactionStateResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest,
+    GetResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
     ListAliasesRequest, ListAliasesResponse, ListCollectionsRequest, ListCollectionsResponse,
-    ListDatabasesRequest, ListDatabasesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    ListDatabasesRequest, ListDatabasesResponse, ListPersistentSegmentsRequest,
+    ListPersistentSegmentsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     MutateCollectionMetaRequest, MutateCollectionMetaResponse,
     PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, QueryRequest,
     QueryResponse, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
     RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest,
     ReindexCollectionResponse, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
-    SnapshotInfo, StatsRequest, StatsResponse, UpsertRequest, UpsertResponse, VectorPoint,
+    SegmentEntry, SegmentState as ProtoSegmentState, SnapshotInfo, StatsRequest, StatsResponse,
+    UpsertRequest, UpsertResponse, VectorPoint,
 };
 use vectordb_replication::RaftNode;
 use vectordb_storage::search::SearchParams;
@@ -473,6 +479,13 @@ impl VectorService for VectorServiceImpl {
                     "database management ops must use the CreateDatabase / DropDatabase / AlterDatabase RPCs",
                 ));
             }
+            // Index management ops belong on AddPayloadIndex / DropPayloadIndex.
+            vectordb_storage::MetaOp::AddPayloadIndex { .. }
+            | vectordb_storage::MetaOp::DropPayloadIndex { .. } => {
+                return Err(Status::invalid_argument(
+                    "payload-index ops must use the AddPayloadIndex / DropPayloadIndex RPCs",
+                ));
+            }
         };
         require_collection(&self.rbac, &request, &target, priv_kind)?;
         if let Some(rep) = &self.replicated {
@@ -886,6 +899,120 @@ impl VectorService for VectorServiceImpl {
         }))
     }
 
+    // ---- Management: indexes / flush / compact / segments (Milvus parity) -
+
+    async fn add_payload_index(
+        &self,
+        request: Request<AddPayloadIndexRequest>,
+    ) -> Result<Response<AddPayloadIndexResponse>, Status> {
+        let op = parse_index_meta_op(&request.get_ref().op_json)?;
+        ensure_add_payload_index(&op)?;
+        let target = index_op_target(&op);
+        require_collection(&self.rbac, &request, &target, Privilege::CreateIndex)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(AddPayloadIndexResponse {}))
+    }
+
+    async fn drop_payload_index(
+        &self,
+        request: Request<DropPayloadIndexRequest>,
+    ) -> Result<Response<DropPayloadIndexResponse>, Status> {
+        let op = parse_index_meta_op(&request.get_ref().op_json)?;
+        ensure_drop_payload_index(&op)?;
+        let target = index_op_target(&op);
+        require_collection(&self.rbac, &request, &target, Privilege::DropIndex)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(DropPayloadIndexResponse {}))
+    }
+
+    async fn flush_collection(
+        &self,
+        request: Request<FlushCollectionRequest>,
+    ) -> Result<Response<FlushCollectionResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let info = self
+            .engine
+            .flush_collection(&collection)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(FlushCollectionResponse {
+            collection: info.collection,
+            flush_ts_ms: info.flush_ts_ms,
+            segment_ids: info.segment_ids,
+            flushed_segment_ids: info.flushed_segment_ids,
+            wal_entries: info.wal_entries as u64,
+        }))
+    }
+
+    async fn compact_collection(
+        &self,
+        request: Request<CompactCollectionRequest>,
+    ) -> Result<Response<CompactCollectionResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let id = self
+            .engine
+            .compact_collection(&collection)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(CompactCollectionResponse {
+            compaction_id: id,
+        }))
+    }
+
+    async fn get_compaction_state(
+        &self,
+        request: Request<GetCompactionStateRequest>,
+    ) -> Result<Response<GetCompactionStateResponse>, Status> {
+        let id = request.into_inner().compaction_id;
+        let s = self
+            .engine
+            .compaction_state(id)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(GetCompactionStateResponse {
+            compaction_id: s.id,
+            collection: s.collection,
+            state: core_compaction_state_to_proto(s.state) as i32,
+            entries_before: s.entries_before as u64,
+            entries_after: s.entries_after as u64,
+            started_ms: s.started_ms,
+            finished_ms: s.finished_ms,
+            error: s.error.unwrap_or_default(),
+        }))
+    }
+
+    async fn list_persistent_segments(
+        &self,
+        request: Request<ListPersistentSegmentsRequest>,
+    ) -> Result<Response<ListPersistentSegmentsResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let segs = self
+            .engine
+            .persistent_segments(&collection)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(ListPersistentSegmentsResponse {
+            segments: segs
+                .into_iter()
+                .map(|s| SegmentEntry {
+                    id: s.id,
+                    collection: s.collection,
+                    num_rows: s.num_rows,
+                    state: core_segment_state_to_proto(s.state) as i32,
+                    source: s.source,
+                })
+                .collect(),
+        }))
+    }
+
     async fn register_node(
         &self,
         _request: Request<RegisterNodeRequest>,
@@ -1067,6 +1194,68 @@ fn ensure_alter_database(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
         Err(Status::invalid_argument(
             "expected MetaOp::AlterDatabaseProperties",
         ))
+    }
+}
+
+/// Parse a MetaOp JSON payload destined for the index-management RPCs.
+fn parse_index_meta_op(bytes: &[u8]) -> Result<vectordb_storage::MetaOp, Status> {
+    serde_json::from_slice::<vectordb_storage::MetaOp>(bytes)
+        .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))
+}
+
+fn ensure_add_payload_index(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::AddPayloadIndex { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "expected MetaOp::AddPayloadIndex",
+        ))
+    }
+}
+
+fn ensure_drop_payload_index(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::DropPayloadIndex { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(
+            "expected MetaOp::DropPayloadIndex",
+        ))
+    }
+}
+
+/// FQN of the collection affected by an index MetaOp. Used for per-collection
+/// RBAC checks on the management RPCs.
+fn index_op_target(op: &vectordb_storage::MetaOp) -> String {
+    match op {
+        vectordb_storage::MetaOp::AddPayloadIndex {
+            collection,
+            database,
+            ..
+        }
+        | vectordb_storage::MetaOp::DropPayloadIndex {
+            collection,
+            database,
+            ..
+        } => format!("{database}/{collection}"),
+        _ => "*".into(),
+    }
+}
+
+fn core_compaction_state_to_proto(
+    s: vectordb_storage::CompactionStateCode,
+) -> ProtoCompactionState {
+    match s {
+        vectordb_storage::CompactionStateCode::Running => ProtoCompactionState::Running,
+        vectordb_storage::CompactionStateCode::Completed => ProtoCompactionState::Completed,
+        vectordb_storage::CompactionStateCode::Failed => ProtoCompactionState::Failed,
+    }
+}
+
+fn core_segment_state_to_proto(s: vectordb_storage::SegmentState) -> ProtoSegmentState {
+    match s {
+        vectordb_storage::SegmentState::Growing => ProtoSegmentState::Growing,
+        vectordb_storage::SegmentState::Sealed => ProtoSegmentState::Sealed,
+        vectordb_storage::SegmentState::Flushed => ProtoSegmentState::Flushed,
     }
 }
 

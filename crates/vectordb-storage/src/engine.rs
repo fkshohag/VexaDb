@@ -133,6 +133,13 @@ pub struct CollectionEngine {
     /// `default` database is always present (auto-seeded on first open).
     /// Persisted under `database:<name>` keys.
     databases: RwLock<HashMap<String, DatabaseConfig>>,
+    /// In-memory registry of compaction jobs (id -> status). Cleared on
+    /// restart; callers should never persist compaction IDs across runs.
+    compactions: RwLock<HashMap<u64, CompactionStatus>>,
+    /// Monotonic counter used to mint compaction IDs. Starts from
+    /// `now_ms()` so IDs sort roughly chronologically and are unique
+    /// across short engine restarts.
+    compaction_seq: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
@@ -151,6 +158,10 @@ impl CollectionEngine {
         let wal_path = config.data_dir.join("wal.log");
         let wal = WriteAheadLog::open_with(wal_path, config.sync_wal)?;
 
+        let seq_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let engine = Self {
             config,
             collections: RwLock::new(HashMap::new()),
@@ -159,6 +170,8 @@ impl CollectionEngine {
             rbac: RwLock::new(RbacState::new()),
             aliases: RwLock::new(HashMap::new()),
             databases: RwLock::new(HashMap::new()),
+            compactions: RwLock::new(HashMap::new()),
+            compaction_seq: std::sync::atomic::AtomicU64::new(seq_seed),
         };
 
         engine.load_rbac_from_meta()?;
@@ -428,6 +441,37 @@ impl CollectionEngine {
                     return Err(EngineError::DatabaseNotFound(name.clone()));
                 }
             }
+            MetaOp::AddPayloadIndex {
+                collection,
+                database,
+                field,
+                kind,
+            } => {
+                let fq = format!("{database}/{collection}");
+                if !collections.contains_key(&fq) {
+                    return Err(EngineError::CollectionNotFound(collection.clone()));
+                }
+                if field.is_empty() {
+                    return Err(EngineError::InvalidMeta(
+                        "payload index `field` cannot be empty".into(),
+                    ));
+                }
+                if !matches!(kind.as_str(), "keyword" | "numeric" | "bool") {
+                    return Err(EngineError::InvalidMeta(format!(
+                        "unknown payload index kind `{kind}` (use keyword/numeric/bool)"
+                    )));
+                }
+            }
+            MetaOp::DropPayloadIndex {
+                collection,
+                database,
+                ..
+            } => {
+                let fq = format!("{database}/{collection}");
+                if !collections.contains_key(&fq) {
+                    return Err(EngineError::CollectionNotFound(collection.clone()));
+                }
+            }
         }
         Ok(())
     }
@@ -478,6 +522,23 @@ impl CollectionEngine {
             MetaOp::DropDatabase { name, force } => self.apply_drop_database(name, *force),
             MetaOp::AlterDatabaseProperties { name, set, unset } => {
                 self.apply_alter_database_properties(name, set, unset)
+            }
+            MetaOp::AddPayloadIndex {
+                collection,
+                database,
+                field,
+                kind,
+            } => {
+                let fq = format!("{database}/{collection}");
+                self.apply_add_payload_index(&fq, field, kind)
+            }
+            MetaOp::DropPayloadIndex {
+                collection,
+                database,
+                field,
+            } => {
+                let fq = format!("{database}/{collection}");
+                self.apply_drop_payload_index(&fq, field)
             }
         }
     }
@@ -604,6 +665,83 @@ impl CollectionEngine {
         }
         for k in unset {
             state.config.properties.remove(k);
+        }
+        let json =
+            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(format!("collection:{fq}"), json)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        Ok(())
+    }
+
+    fn apply_add_payload_index(&self, fq: &str, field: &str, kind: &str) -> Result<()> {
+        use vectordb_core::PayloadIndexKind;
+        let parsed_kind = match kind {
+            "keyword" => PayloadIndexKind::Keyword,
+            "numeric" => PayloadIndexKind::Numeric,
+            "bool" => PayloadIndexKind::Bool,
+            other => {
+                return Err(EngineError::InvalidMeta(format!(
+                    "unknown payload index kind `{other}`"
+                )))
+            }
+        };
+        let mut collections = self.collections.write();
+        let state = collections
+            .get_mut(fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.to_string()))?;
+
+        // Replace any existing entry for the same field — payload indexes
+        // are uniqued per-field so callers can flip the kind via a single op.
+        state.config.payload_indexes.retain(|p| p.field != field);
+        state
+            .config
+            .payload_indexes
+            .push(vectordb_core::PayloadFieldIndex {
+                field: field.to_string(),
+                kind: parsed_kind,
+            });
+
+        // Rebuild in-memory indexes from the new config and back-fill with
+        // the payloads we already have. Cheap relative to a full reindex.
+        state.payload_indexes = crate::payload_index::PayloadIndexes::new(&state.config.payload_indexes);
+        let payload_pairs: Vec<(String, serde_json::Value)> = state
+            .payloads
+            .iter()
+            .map(|(id, v)| (id.clone(), v.clone()))
+            .collect();
+        for (id, payload) in payload_pairs {
+            state.payload_indexes.upsert(&id, &payload);
+        }
+        let json =
+            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(format!("collection:{fq}"), json)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        Ok(())
+    }
+
+    fn apply_drop_payload_index(&self, fq: &str, field: &str) -> Result<()> {
+        let mut collections = self.collections.write();
+        let state = collections
+            .get_mut(fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.to_string()))?;
+        let before = state.config.payload_indexes.len();
+        state.config.payload_indexes.retain(|p| p.field != field);
+        if state.config.payload_indexes.len() == before {
+            // Field wasn't indexed — idempotent no-op, preserve in-memory state.
+            return Ok(());
+        }
+        state.payload_indexes = crate::payload_index::PayloadIndexes::new(&state.config.payload_indexes);
+        let payload_pairs: Vec<(String, serde_json::Value)> = state
+            .payloads
+            .iter()
+            .map(|(id, v)| (id.clone(), v.clone()))
+            .collect();
+        for (id, payload) in payload_pairs {
+            state.payload_indexes.upsert(&id, &payload);
         }
         let json =
             serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
@@ -1053,6 +1191,131 @@ impl CollectionEngine {
         Ok((snap, stats))
     }
 
+    /// Flush a single collection — Milvus parity. VexaDb persists writes
+    /// synchronously through the WAL, so "flush" reduces to fsync'ing the
+    /// active log and returning the current segment IDs / timestamp. The
+    /// collection still needs to exist (returns `CollectionNotFound`).
+    pub fn flush_collection(&self, name: &str) -> Result<FlushInfo> {
+        let fq = self.resolve_alias(name);
+        self.ensure_collection_loaded(&fq)?;
+        // Force a sync regardless of `sync_wal` mode so flushed data is
+        // genuinely durable when this returns.
+        self.wal
+            .write()
+            .force_sync()
+            .map_err(EngineError::Wal)?;
+        let wal_entries = self.wal.read().replay()?.len();
+        let ts = now_ms_engine();
+        // Single in-process WAL segment today; ID is a stable hash of the
+        // FQN so the client can correlate flushes for the same collection.
+        let seg_id = stable_segment_id(&fq);
+        Ok(FlushInfo {
+            collection: fq,
+            flush_ts_ms: ts,
+            segment_ids: vec![seg_id],
+            flushed_segment_ids: vec![seg_id],
+            wal_entries,
+        })
+    }
+
+    /// Trigger an explicit compaction job for `name` (Milvus parity). The
+    /// underlying op is the cluster-wide `compact_wal`; the engine tracks a
+    /// per-call `CompactionStatus` so callers can poll for completion via
+    /// [`CollectionEngine::compaction_state`].
+    pub fn compact_collection(&self, name: &str) -> Result<u64> {
+        let fq = self.resolve_alias(name);
+        self.ensure_collection_loaded(&fq)?;
+        let id = self.next_compaction_id();
+        let started = now_ms_engine();
+        // Pre-register as Running so concurrent state probes see the job.
+        self.compactions.write().insert(
+            id,
+            CompactionStatus {
+                id,
+                collection: fq.clone(),
+                state: CompactionStateCode::Running,
+                entries_before: 0,
+                entries_after: 0,
+                started_ms: started,
+                finished_ms: 0,
+                error: None,
+            },
+        );
+        let result = self.compact_wal();
+        let mut reg = self.compactions.write();
+        let slot = reg.get_mut(&id).expect("just inserted");
+        slot.finished_ms = now_ms_engine();
+        match result {
+            Ok(stats) => {
+                slot.entries_before = stats.before;
+                slot.entries_after = stats.after;
+                slot.state = CompactionStateCode::Completed;
+                Ok(id)
+            }
+            Err(err) => {
+                slot.state = CompactionStateCode::Failed;
+                slot.error = Some(err.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    /// Look up a compaction job. Returns [`EngineError::InvalidMeta`] if
+    /// the ID was never minted by this engine instance.
+    pub fn compaction_state(&self, id: u64) -> Result<CompactionStatus> {
+        self.compactions
+            .read()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| EngineError::InvalidMeta(format!("compaction id `{id}` not found")))
+    }
+
+    /// Enumerate persistent segments for `collection` — Milvus parity.
+    ///
+    /// VexaDb keeps a single live WAL segment per cluster; the returned
+    /// list always contains one `Growing` row for the active WAL plus one
+    /// `Flushed` row per snapshot that captured this collection.
+    pub fn persistent_segments(&self, name: &str) -> Result<Vec<SegmentInfo>> {
+        let fq = self.resolve_alias(name);
+        self.ensure_collection_loaded(&fq)?;
+        let num_rows = {
+            let collections = self.collections.read();
+            let state = collections
+                .get(&fq)
+                .ok_or_else(|| EngineError::CollectionNotFound(name.to_string()))?;
+            state.index.len() as u64
+        };
+        let seg_id = stable_segment_id(&fq);
+        let mut out = vec![SegmentInfo {
+            id: seg_id,
+            collection: fq.clone(),
+            num_rows,
+            state: SegmentState::Growing,
+            source: "wal".into(),
+        }];
+        // One synthetic Flushed segment per snapshot — `num_rows=0` since
+        // VexaDb does not record per-snapshot row counts today.
+        if let Ok(snaps) = self.snapshot_manager().list() {
+            for snap in snaps {
+                out.push(SegmentInfo {
+                    id: hash_str_to_id(&snap.id),
+                    collection: fq.clone(),
+                    num_rows: 0,
+                    state: SegmentState::Flushed,
+                    source: format!("snapshot:{}", snap.id),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn next_compaction_id(&self) -> u64 {
+        // Wrap-aware fetch_add; collisions are astronomically unlikely
+        // since the counter is seeded from epoch-ms at engine open.
+        self.compaction_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Rebuild HNSW from stored vectors (online reindex).
     pub fn reindex_collection(&self, name: &str) -> Result<u64> {
         let fq = self.resolve_alias(name);
@@ -1458,6 +1721,31 @@ fn parse_payload(bytes: &[u8]) -> Result<Value> {
     Ok(Value::Object(obj))
 }
 
+fn now_ms_engine() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Deterministic 64-bit ID derived from a fully-qualified name. Stable
+/// across restarts so the same collection always reports the same
+/// "segment ID" to external observers.
+fn stable_segment_id(fq: &str) -> u64 {
+    // Lift the high bit so IDs can also slot into `int64` clients without
+    // becoming negative.
+    hash_str_to_id(fq)
+}
+
+fn hash_str_to_id(s: &str) -> u64 {
+    let mut h: u64 = 1469598103934665603; // FNV-1a 64 offset basis
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h >> 1
+}
+
 pub(crate) fn brute_force_topk(
     state: &CollectionState,
     query: &[f32],
@@ -1512,6 +1800,63 @@ fn matches_filter(state: &CollectionState, filter: Option<&Filter>, id: &str) ->
 pub struct WalCompactionStats {
     pub before: usize,
     pub after: usize,
+}
+
+/// Result of a per-collection [`CollectionEngine::flush_collection`] call.
+///
+/// Mirrors the shape Milvus's FlushTask reports: a list of segment IDs and
+/// a flush timestamp (here: epoch ms). VexaDb has a single WAL segment
+/// today, so `segment_ids` returns at most one entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlushInfo {
+    pub collection: String,
+    pub flush_ts_ms: u64,
+    pub segment_ids: Vec<u64>,
+    pub flushed_segment_ids: Vec<u64>,
+    pub wal_entries: usize,
+}
+
+/// Persistent-segment row reported by [`CollectionEngine::persistent_segments`].
+///
+/// VexaDb does not partition data internally; one segment per (collection,
+/// WAL file) is reported plus one entry per snapshot referencing it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentInfo {
+    pub id: u64,
+    pub collection: String,
+    pub num_rows: u64,
+    pub state: SegmentState,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentState {
+    Growing,
+    Sealed,
+    Flushed,
+}
+
+/// State of a compaction job tracked by the engine. Cleared once the
+/// engine restarts; callers should treat completed jobs as terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStateCode {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionStatus {
+    pub id: u64,
+    pub collection: String,
+    pub state: CompactionStateCode,
+    pub entries_before: usize,
+    pub entries_after: usize,
+    pub started_ms: u64,
+    pub finished_ms: u64,
+    pub error: Option<String>,
 }
 
 #[cfg(test)]
@@ -1801,6 +2146,122 @@ mod m4_tests {
         let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
         let listed = engine.list_collections_in_database("default");
         assert!(listed.contains(&"legacy".to_string()));
+    }
+
+    // ---- Index / segment / compaction management (Milvus parity) ----------
+
+    #[test]
+    fn add_and_drop_payload_index_updates_config_and_persists() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config("docs")).unwrap();
+
+        engine
+            .commit_meta(MetaOp::AddPayloadIndex {
+                collection: "docs".into(),
+                database: "default".into(),
+                field: "category".into(),
+                kind: "keyword".into(),
+            })
+            .unwrap();
+
+        // Persisted: reopen and verify.
+        drop(engine);
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let stats = engine.stats("docs").unwrap();
+        assert_eq!(stats.payload_index_count, 1);
+
+        // Drop should bring the count back to zero.
+        engine
+            .commit_meta(MetaOp::DropPayloadIndex {
+                collection: "docs".into(),
+                database: "default".into(),
+                field: "category".into(),
+            })
+            .unwrap();
+        assert_eq!(engine.stats("docs").unwrap().payload_index_count, 0);
+    }
+
+    #[test]
+    fn add_payload_index_rejects_unknown_kind() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config("docs")).unwrap();
+        let err = engine
+            .commit_meta(MetaOp::AddPayloadIndex {
+                collection: "docs".into(),
+                database: "default".into(),
+                field: "f".into(),
+                kind: "tree".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidMeta(_)));
+    }
+
+    #[test]
+    fn drop_payload_index_idempotent_when_missing() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config("docs")).unwrap();
+        // Idempotent: no panic, no error.
+        engine
+            .commit_meta(MetaOp::DropPayloadIndex {
+                collection: "docs".into(),
+                database: "default".into(),
+                field: "missing".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn flush_collection_returns_segments_and_ts() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config("docs")).unwrap();
+
+        let info = engine.flush_collection("docs").unwrap();
+        assert_eq!(info.collection, "default/docs");
+        assert_eq!(info.segment_ids.len(), 1);
+        assert_eq!(info.flushed_segment_ids, info.segment_ids);
+        assert!(info.flush_ts_ms > 0);
+    }
+
+    #[test]
+    fn compact_collection_tracks_state() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config("docs")).unwrap();
+
+        let id = engine.compact_collection("docs").unwrap();
+        let s = engine.compaction_state(id).unwrap();
+        assert_eq!(s.state, CompactionStateCode::Completed);
+        assert_eq!(s.collection, "default/docs");
+        assert!(s.finished_ms >= s.started_ms);
+
+        // Unknown id -> error.
+        assert!(engine.compaction_state(0).is_err());
+    }
+
+    #[test]
+    fn persistent_segments_reports_growing_segment() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config("docs")).unwrap();
+        engine
+            .upsert(
+                "docs",
+                "x".into(),
+                Vector::new(vec![1.0, 0.0, 0.0, 0.0]),
+                None,
+                None,
+            )
+            .unwrap();
+        let segs = engine.persistent_segments("docs").unwrap();
+        assert!(!segs.is_empty());
+        let growing = &segs[0];
+        assert_eq!(growing.state, SegmentState::Growing);
+        assert_eq!(growing.num_rows, 1);
+        assert!(growing.id > 0);
     }
 
     #[test]

@@ -53,6 +53,17 @@ service VectorService {
   rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
   rpc DescribeDatabase(DescribeDatabaseRequest) returns (DescribeDatabaseResponse);
   rpc AlterDatabase(AlterDatabaseRequest) returns (AlterDatabaseResponse);
+
+  // ---- Management (Milvus parity) ----------------------------------------
+  // Indexes (add/drop go through MetaOp::AddPayloadIndex/DropPayloadIndex
+  // via op_json so the wire stays stable as future field types land).
+  rpc AddPayloadIndex(AddPayloadIndexRequest) returns (AddPayloadIndexResponse);
+  rpc DropPayloadIndex(DropPayloadIndexRequest) returns (DropPayloadIndexResponse);
+  // Flush / compaction tracking / segment introspection.
+  rpc FlushCollection(FlushCollectionRequest) returns (FlushCollectionResponse);
+  rpc CompactCollection(CompactCollectionRequest) returns (CompactCollectionResponse);
+  rpc GetCompactionState(GetCompactionStateRequest) returns (GetCompactionStateResponse);
+  rpc ListPersistentSegments(ListPersistentSegmentsRequest) returns (ListPersistentSegmentsResponse);
 }
 
 message ApplyRbacRequest {
@@ -482,4 +493,84 @@ message DescribeDatabaseRequest {
 }
 message DescribeDatabaseResponse {
   DatabaseInfo info = 1;
+}
+
+// ---- Management messages (Milvus parity) ---------------------------------
+
+message AddPayloadIndexRequest {
+  // JSON-encoded MetaOp::AddPayloadIndex { collection, database, field, kind }.
+  bytes op_json = 1;
+}
+message AddPayloadIndexResponse {}
+
+message DropPayloadIndexRequest {
+  // JSON-encoded MetaOp::DropPayloadIndex { collection, database, field }.
+  bytes op_json = 1;
+}
+message DropPayloadIndexResponse {}
+
+message FlushCollectionRequest {
+  // FQN of the target collection (`db/name`). Empty database = "default".
+  string collection = 1;
+}
+
+message FlushCollectionResponse {
+  string collection = 1;
+  uint64 flush_ts_ms = 2;
+  repeated uint64 segment_ids = 3;
+  repeated uint64 flushed_segment_ids = 4;
+  uint64 wal_entries = 5;
+}
+
+message CompactCollectionRequest {
+  string collection = 1;
+}
+
+message CompactCollectionResponse {
+  uint64 compaction_id = 1;
+}
+
+message GetCompactionStateRequest {
+  uint64 compaction_id = 1;
+}
+
+enum CompactionState {
+  COMPACTION_STATE_UNSPECIFIED = 0;
+  COMPACTION_STATE_RUNNING = 1;
+  COMPACTION_STATE_COMPLETED = 2;
+  COMPACTION_STATE_FAILED = 3;
+}
+
+message GetCompactionStateResponse {
+  uint64 compaction_id = 1;
+  string collection = 2;
+  CompactionState state = 3;
+  uint64 entries_before = 4;
+  uint64 entries_after = 5;
+  uint64 started_ms = 6;
+  uint64 finished_ms = 7;
+  string error = 8;
+}
+
+message ListPersistentSegmentsRequest {
+  string collection = 1;
+}
+
+enum SegmentState {
+  SEGMENT_STATE_UNSPECIFIED = 0;
+  SEGMENT_STATE_GROWING = 1;
+  SEGMENT_STATE_SEALED = 2;
+  SEGMENT_STATE_FLUSHED = 3;
+}
+
+message SegmentEntry {
+  uint64 id = 1;
+  string collection = 2;
+  uint64 num_rows = 3;
+  SegmentState state = 4;
+  string source = 5;
+}
+
+message ListPersistentSegmentsResponse {
+  repeated SegmentEntry segments = 1;
 }

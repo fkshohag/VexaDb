@@ -8,8 +8,9 @@ option-builder pattern (`entity` + `vexaclient`). Reference docs live under
 
 | Package | Purpose |
 |---------|---------|
-| `vexaclient` | REST client (collections, upsert, search, query, admin) |
-| `entity` | Schemas, vectors, metrics, `ResultSet` columns |
+| `vexaclient` | REST client (collections, upsert, search, query, admin, management) |
+| `entity` | Schemas, vectors, metrics, `ResultSet` columns, load/compaction/segment types |
+| `index` | Milvus-parity `index.Index` constructors (`NewHNSWIndex`, `NewInvertedIndex`, …) |
 | `rag` | Chunking, ingest, and retrieval helpers |
 
 ## Install
@@ -99,6 +100,98 @@ Collections are unique per-database. `cli.UseDatabase("analytics")` followed
 by `cli.CreateCollection(ctx, NewSimpleCreateCollectionOption("docs", 128))`
 creates `analytics/docs`; the same call after `UseDatabase("research")`
 creates a separate `research/docs`.
+
+## Management (Milvus v2.6 parity)
+
+The Go SDK mirrors Milvus's `Management/*` surface: index lifecycle,
+load/release, flush, compaction, and persistent-segment introspection.
+VexaDb keeps collections memory-resident, so load/release are no-op
+successes and `GetLoadState` always reports `Loaded`. Flush fsyncs the
+WAL inline; Compact returns a job ID you can poll.
+
+```go
+import (
+    "github.com/vectordb/vectordb/sdks/go/entity"
+    "github.com/vectordb/vectordb/sdks/go/index"
+    "github.com/vectordb/vectordb/sdks/go/vexaclient"
+)
+
+// ---- Index lifecycle ---------------------------------------------------
+
+// Vector index: VexaDb auto-builds HNSW at CreateCollection time. Calling
+// CreateIndex on the vector field rebuilds it (Milvus parity).
+hnsw := index.NewHNSWIndex(index.COSINE, 16, 200)
+task, _ := cli.CreateIndex(ctx,
+    vexaclient.NewCreateIndexOption("docs", "vector", hnsw))
+_ = task.Await(ctx)
+
+// Scalar index: maps to VexaDb's payload-index engine path.
+inv := index.NewInvertedIndex()
+_, _ = cli.CreateIndex(ctx,
+    vexaclient.NewCreateIndexOption("docs", "category", inv).
+        WithIndexName("cat_idx"))
+
+names, _ := cli.ListIndexes(ctx, vexaclient.NewListIndexOption("docs"))
+desc, _  := cli.DescribeIndex(ctx, vexaclient.NewDescribeIndexOption("docs", "cat_idx"))
+_ = desc.State // entity.IndexStateFinished
+
+_ = cli.AlterIndexProperties(ctx,
+    vexaclient.NewAlterIndexPropertiesOption("docs", "cat_idx").
+        WithProperty("mmap.enabled", true))
+_ = cli.DropIndexProperties(ctx,
+    vexaclient.NewDropIndexPropertiesOption("docs", "cat_idx", "mmap.enabled"))
+_ = cli.DropIndex(ctx, vexaclient.NewDropIndexOption("docs", "cat_idx"))
+
+// ---- Load / Release ---------------------------------------------------
+
+load, _ := cli.LoadCollection(ctx,
+    vexaclient.NewLoadCollectionOption("docs").WithReplica(2))
+_ = load.Await(ctx) // Always returns immediately on VexaDb.
+
+state, _ := cli.GetLoadState(ctx, vexaclient.NewGetLoadStateOption("docs"))
+_ = state.State // entity.LoadStateLoaded
+
+// Refresh = trigger reindex so freshly inserted data is searchable.
+refresh, _ := cli.RefreshLoad(ctx, vexaclient.NewRefreshLoadOption("docs"))
+_ = refresh.Await(ctx)
+
+_ = cli.ReleaseCollection(ctx, vexaclient.NewReleaseCollectionOption("docs"))
+
+// LoadPartitions / ReleasePartitions accept partition names for
+// source compatibility but VexaDb operates on the whole collection.
+_, _ = cli.LoadPartitions(ctx, vexaclient.NewLoadPartitionsOption("docs", "p1", "p2"))
+
+// ---- Flush / Compact / Segments ---------------------------------------
+
+flushTask, _ := cli.Flush(ctx, vexaclient.NewFlushOption("docs"))
+_ = flushTask.Await(ctx)
+segIDs, _, flushTs, _ := flushTask.GetFlushStats()
+_ = segIDs; _ = flushTs
+
+id, _ := cli.Compact(ctx, vexaclient.NewCompactOption("docs"))
+info, _ := cli.GetCompactionState(ctx, vexaclient.NewGetCompactionStateOption(id))
+_ = info.State // entity.CompactionStateCompleted
+
+segs, _ := cli.GetPersistentSegmentInfo(ctx,
+    vexaclient.NewGetPersistentSegmentInfoOption("docs"))
+for _, s := range segs {
+    _ = s.Flushed() // true for snapshot-captured segments
+}
+```
+
+### Mapping notes
+
+- **Vector index types**: `HNSW`, `AUTOINDEX`, and `FLAT` map to VexaDb's
+  always-on HNSW. IVF / DiskANN / GPU constructors compile against the
+  SDK but the gateway rejects them with `400 Bad Request`.
+- **Scalar index types**: `INVERTED` / `BITMAP` / `TRIE` → VexaDb's
+  `keyword` payload index; `STL_SORT` → `numeric`; sparse → `sparse`.
+- **Load**: always `Loaded`/`100%` for existing collections.
+- **Partitions**: VexaDb has none. `LoadPartitions`/`ReleasePartitions`
+  alias to the whole-collection variants.
+- **Compaction IDs**: minted from epoch-ms so they sort chronologically;
+  state lookups only resolve on the originating shard (single-shard
+  cluster: always works).
 
 ## Client management
 

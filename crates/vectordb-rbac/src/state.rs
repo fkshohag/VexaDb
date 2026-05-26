@@ -129,6 +129,19 @@ impl RbacState {
             "AlterAlias",
             "ListDatabases",
             "DescribeDatabase",
+            // Management: read_write owns the index/load/flush/compact
+            // surface but NOT cluster-wide GetCompactionState.
+            "CreateIndex",
+            "DropIndex",
+            "DescribeIndex",
+            "ListIndexes",
+            "AlterIndex",
+            "LoadCollection",
+            "ReleaseCollection",
+            "GetLoadState",
+            "Flush",
+            "Compact",
+            "GetPersistentSegmentInfo",
         ] {
             let obj = match p {
                 "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,
@@ -147,6 +160,11 @@ impl RbacState {
             "Get",
             "ListDatabases",
             "DescribeDatabase",
+            // Read-only management surface (no Create/Drop/Alter/Load).
+            "DescribeIndex",
+            "ListIndexes",
+            "GetLoadState",
+            "GetPersistentSegmentInfo",
         ] {
             let obj = match p {
                 "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,

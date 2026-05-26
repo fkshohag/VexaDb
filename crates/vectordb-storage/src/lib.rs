@@ -9,6 +9,9 @@ pub mod snapshot;
 pub mod wal;
 pub mod wal_compact;
 
-pub use engine::{CollectionEngine, CollectionStats, EngineConfig, EngineError, WalCompactionStats};
+pub use engine::{
+    CollectionEngine, CollectionStats, CompactionStateCode, CompactionStatus, EngineConfig,
+    EngineError, FlushInfo, SegmentInfo, SegmentState, WalCompactionStats,
+};
 pub use snapshot::{collect_payload_files, SnapshotManager, SnapshotMeta};
 pub use wal::{BulkPoint, MetaOp, WalEntry};

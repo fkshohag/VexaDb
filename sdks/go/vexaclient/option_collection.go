@@ -22,36 +22,8 @@ type CreateCollectionOption struct {
 	IndexOptions      []*CreateIndexOption // forward-compat
 }
 
-// CreateIndexOption captures Milvus's per-field index hint. VexaDb stores
-// these as opaque properties for now (vector index is auto-managed by
-// HNSW), but the surface keeps API parity.
-type CreateIndexOption struct {
-	Collection string
-	Field      string
-	IndexName  string
-	IndexType  string
-	Metric     entity.MetricType
-	Params     map[string]any
-}
-
-// NewCreateIndexOption — Milvus parity.
-func NewCreateIndexOption(collection, field, indexType string) *CreateIndexOption {
-	return &CreateIndexOption{
-		Collection: collection,
-		Field:      field,
-		IndexType:  indexType,
-	}
-}
-
-func (o *CreateIndexOption) WithIndexName(n string) *CreateIndexOption {
-	o.IndexName = n
-	return o
-}
-
-func (o *CreateIndexOption) WithMetric(m entity.MetricType) *CreateIndexOption {
-	o.Metric = m
-	return o
-}
+// (CreateIndexOption now lives in option_management.go and matches Milvus's
+// `(collection, field, index.Index)` signature.)
 
 // NewCreateCollectionOption builds options from a schema.
 func NewCreateCollectionOption(name string, schema *entity.Schema) *CreateCollectionOption {

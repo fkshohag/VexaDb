@@ -55,6 +55,20 @@ pub enum Privilege {
     ListDatabases,
     DescribeDatabase,
     AlterDatabase,
+    // Management: index lifecycle (Milvus parity, collection-scoped).
+    CreateIndex,
+    DropIndex,
+    DescribeIndex,
+    ListIndexes,
+    AlterIndex,
+    // Management: load / flush / compact / segments (Milvus parity).
+    LoadCollection,
+    ReleaseCollection,
+    GetLoadState,
+    Flush,
+    Compact,
+    GetCompactionState,
+    GetPersistentSegmentInfo,
     // Data plane
     Search,
     Query,
@@ -85,6 +99,18 @@ impl Privilege {
         Privilege::ListDatabases,
         Privilege::DescribeDatabase,
         Privilege::AlterDatabase,
+        Privilege::CreateIndex,
+        Privilege::DropIndex,
+        Privilege::DescribeIndex,
+        Privilege::ListIndexes,
+        Privilege::AlterIndex,
+        Privilege::LoadCollection,
+        Privilege::ReleaseCollection,
+        Privilege::GetLoadState,
+        Privilege::Flush,
+        Privilege::Compact,
+        Privilege::GetCompactionState,
+        Privilege::GetPersistentSegmentInfo,
         Privilege::Search,
         Privilege::Query,
         Privilege::Insert,
@@ -113,6 +139,18 @@ impl Privilege {
             Privilege::ListDatabases => "ListDatabases",
             Privilege::DescribeDatabase => "DescribeDatabase",
             Privilege::AlterDatabase => "AlterDatabase",
+            Privilege::CreateIndex => "CreateIndex",
+            Privilege::DropIndex => "DropIndex",
+            Privilege::DescribeIndex => "DescribeIndex",
+            Privilege::ListIndexes => "ListIndexes",
+            Privilege::AlterIndex => "AlterIndex",
+            Privilege::LoadCollection => "LoadCollection",
+            Privilege::ReleaseCollection => "ReleaseCollection",
+            Privilege::GetLoadState => "GetLoadState",
+            Privilege::Flush => "Flush",
+            Privilege::Compact => "Compact",
+            Privilege::GetCompactionState => "GetCompactionState",
+            Privilege::GetPersistentSegmentInfo => "GetPersistentSegmentInfo",
             Privilege::Search => "Search",
             Privilege::Query => "Query",
             Privilege::Insert => "Insert",
@@ -141,7 +179,20 @@ impl Privilege {
             | Privilege::CollectionStats
             | Privilege::Reindex
             | Privilege::AlterCollection
-            | Privilege::AlterAlias => ObjectType::Collection,
+            | Privilege::AlterAlias
+            // Management privileges are scoped to a collection (Milvus parity).
+            | Privilege::CreateIndex
+            | Privilege::DropIndex
+            | Privilege::DescribeIndex
+            | Privilege::ListIndexes
+            | Privilege::AlterIndex
+            | Privilege::LoadCollection
+            | Privilege::ReleaseCollection
+            | Privilege::GetLoadState
+            | Privilege::Flush
+            | Privilege::Compact
+            | Privilege::GetCompactionState
+            | Privilege::GetPersistentSegmentInfo => ObjectType::Collection,
             _ => ObjectType::Global,
         }
     }

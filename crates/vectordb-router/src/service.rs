@@ -6,24 +6,28 @@ use futures::future::join_all;
 use vectordb_cluster::{merge_top_k, ClusterConfig};
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, AliasEntry, AlterDatabaseRequest, AlterDatabaseResponse,
-    ApplyRbacRequest, ApplyRbacResponse, BulkUpsertRequest, BulkUpsertResponse,
-    ClusterNodeStatus, ClusterStatusRequest, ClusterStatusResponse, CollectionSpec,
+    vector_service_server::VectorService, AddPayloadIndexRequest, AddPayloadIndexResponse,
+    AliasEntry, AlterDatabaseRequest, AlterDatabaseResponse, ApplyRbacRequest, ApplyRbacResponse,
+    BulkUpsertRequest, BulkUpsertResponse, ClusterNodeStatus, ClusterStatusRequest,
+    ClusterStatusResponse, CollectionSpec, CompactCollectionRequest, CompactCollectionResponse,
     CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
     CreateDatabaseRequest, CreateDatabaseResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
-    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest,
-    DescribeAliasResponse, DescribeCollectionRequest, DescribeCollectionResponse,
-    DescribeDatabaseRequest, DescribeDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse,
-    GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest,
-    HealthResponse, ImportChunk, ImportStreamResponse, ListAliasesRequest, ListAliasesResponse,
-    ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, MutateCollectionMetaRequest,
-    MutateCollectionMetaResponse, QueryRequest, QueryResponse, RebalanceCollectionReport,
-    RebalanceRequest, RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse,
-    RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest,
-    ReindexCollectionResponse, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
-    StatsRequest, StatsResponse, UpsertRequest, UpsertResponse, VectorPoint,
+    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
+    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse,
+    DescribeCollectionRequest, DescribeCollectionResponse, DescribeDatabaseRequest,
+    DescribeDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, DropPayloadIndexRequest,
+    DropPayloadIndexResponse, FlushCollectionRequest, FlushCollectionResponse,
+    GetCompactionStateRequest, GetCompactionStateResponse, GetRbacSnapshotRequest,
+    GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest, HealthResponse, ImportChunk,
+    ImportStreamResponse, ListAliasesRequest, ListAliasesResponse, ListCollectionsRequest,
+    ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
+    ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, MutateCollectionMetaRequest, MutateCollectionMetaResponse, QueryRequest,
+    QueryResponse, RebalanceCollectionReport, RebalanceRequest, RebalanceResponse,
+    RebalanceStatusRequest, RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse,
+    ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest, ScrollResponse,
+    SearchRequest, SearchResponse, StatsRequest, StatsResponse, UpsertRequest, UpsertResponse,
+    VectorPoint,
 };
 
 use crate::pool::ClientPool;
@@ -742,6 +746,12 @@ impl VectorService for RouterService {
                     "database management ops must use the CreateDatabase / DropDatabase / AlterDatabase RPCs",
                 ));
             }
+            vectordb_storage::MetaOp::AddPayloadIndex { .. }
+            | vectordb_storage::MetaOp::DropPayloadIndex { .. } => {
+                return Err(Status::invalid_argument(
+                    "payload-index ops must use the AddPayloadIndex / DropPayloadIndex RPCs",
+                ));
+            }
         };
         require_collection(&self.rbac, &request, &target, priv_kind)?;
         let req = request.into_inner();
@@ -876,6 +886,145 @@ impl VectorService for RouterService {
             "database not found: {name} ({})",
             last_err.unwrap_or_else(|| "no shards reachable".into())
         )))
+    }
+
+    // ---- Management RPCs (Milvus parity) ----------------------------------
+
+    async fn add_payload_index(
+        &self,
+        request: Request<AddPayloadIndexRequest>,
+    ) -> Result<Response<AddPayloadIndexResponse>, Status> {
+        let op_json = request.into_inner().op_json;
+        let bytes = op_json.clone();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.add_payload_index(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted add_payload_index")));
+        }
+        Ok(Response::new(AddPayloadIndexResponse {}))
+    }
+
+    async fn drop_payload_index(
+        &self,
+        request: Request<DropPayloadIndexRequest>,
+    ) -> Result<Response<DropPayloadIndexResponse>, Status> {
+        let op_json = request.into_inner().op_json;
+        let bytes = op_json.clone();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.drop_payload_index(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted drop_payload_index")));
+        }
+        Ok(Response::new(DropPayloadIndexResponse {}))
+    }
+
+    async fn flush_collection(
+        &self,
+        request: Request<FlushCollectionRequest>,
+    ) -> Result<Response<FlushCollectionResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let mut merged = FlushCollectionResponse {
+            collection: collection.clone(),
+            flush_ts_ms: 0,
+            segment_ids: vec![],
+            flushed_segment_ids: vec![],
+            wal_entries: 0,
+        };
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.flush_collection(&collection).await {
+                Ok(resp) => {
+                    ok += 1;
+                    if resp.flush_ts_ms > merged.flush_ts_ms {
+                        merged.flush_ts_ms = resp.flush_ts_ms;
+                    }
+                    merged.segment_ids.extend(resp.segment_ids);
+                    merged.flushed_segment_ids.extend(resp.flushed_segment_ids);
+                    merged.wal_entries += resp.wal_entries;
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted flush_collection")));
+        }
+        Ok(Response::new(merged))
+    }
+
+    async fn compact_collection(
+        &self,
+        request: Request<CompactCollectionRequest>,
+    ) -> Result<Response<CompactCollectionResponse>, Status> {
+        // VexaDb's compaction is per-shard. To honour Milvus's
+        // single-ID contract, route to the first reachable shard and
+        // return its compaction ID. Clients should call `get_compaction_state`
+        // on the same router; the router fans out the lookup until it
+        // finds the matching shard.
+        let collection = request.into_inner().collection;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.compact_collection(&collection).await {
+                Ok(id) => return Ok(Response::new(CompactCollectionResponse { compaction_id: id })),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted compact_collection")))
+    }
+
+    async fn get_compaction_state(
+        &self,
+        request: Request<GetCompactionStateRequest>,
+    ) -> Result<Response<GetCompactionStateResponse>, Status> {
+        let id = request.into_inner().compaction_id;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.get_compaction_state(id).await {
+                Ok(resp) => return Ok(Response::new(resp)),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::not_found(format!("compaction {id} not found"))))
+    }
+
+    async fn list_persistent_segments(
+        &self,
+        request: Request<ListPersistentSegmentsRequest>,
+    ) -> Result<Response<ListPersistentSegmentsResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let mut merged: Vec<vectordb_proto::vectordb::v1::SegmentEntry> = vec![];
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.list_persistent_segments(&collection).await {
+                Ok(resp) => {
+                    ok += 1;
+                    merged.extend(resp.segments);
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err.unwrap_or_else(|| {
+                Status::unavailable("no shard accepted list_persistent_segments")
+            }));
+        }
+        Ok(Response::new(ListPersistentSegmentsResponse { segments: merged }))
     }
 
     async fn delete(

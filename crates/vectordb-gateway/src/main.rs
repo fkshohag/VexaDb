@@ -298,6 +298,27 @@ async fn main() -> anyhow::Result<()> {
             "/v1/databases/:name/properties",
             patch(alter_database_properties).delete(drop_database_properties),
         )
+        // ---- Management (Milvus parity) ---------------------------------
+        .route(
+            "/v1/collections/:name/indexes",
+            get(list_indexes).post(create_index),
+        )
+        .route(
+            "/v1/collections/:name/indexes/:field",
+            get(describe_index).delete(drop_index),
+        )
+        .route(
+            "/v1/collections/:name/indexes/:field/properties",
+            patch(alter_index_properties).delete(drop_index_properties),
+        )
+        .route("/v1/collections/:name/load", post(load_collection))
+        .route("/v1/collections/:name/release", post(release_collection))
+        .route("/v1/collections/:name/load-state", get(get_load_state))
+        .route("/v1/collections/:name/refresh-load", post(refresh_load))
+        .route("/v1/collections/:name/flush", post(flush_collection_route))
+        .route("/v1/collections/:name/compact", post(compact_collection_route))
+        .route("/v1/compactions/:id", get(get_compaction_state_route))
+        .route("/v1/collections/:name/segments", get(list_segments_route))
         .route("/v1/admin/compact-wal", post(compact_wal))
         .route("/v1/admin/rebalance", post(trigger_rebalance).get(rebalance_status))
         .route("/v1/admin/cluster", get(cluster_status))
@@ -890,6 +911,533 @@ async fn describe_database(
         properties: info.properties,
         created_at_ms: info.created_at_ms,
     }))
+}
+
+// ---- Management (Milvus parity) ------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateIndexBody {
+    /// Field name to index.
+    field: String,
+    /// One of: keyword | numeric | bool | hnsw (vector — triggers reindex).
+    /// `hnsw` is a Milvus-style shortcut for "rebuild the vector index".
+    #[serde(default = "default_index_kind")]
+    kind: String,
+    /// Optional override for the index name (defaults to the field name).
+    #[serde(default)]
+    index_name: Option<String>,
+    /// Opaque key/value metadata stored alongside the collection.
+    /// `index.<name>.params.<k>` = v. Forward-compatible with Milvus's
+    /// index params surface even though the engine ignores them today.
+    #[serde(default)]
+    params: std::collections::BTreeMap<String, String>,
+    /// Distance metric for the vector index (`cosine|euclidean|dot_product`).
+    /// Ignored for non-vector indexes.
+    #[serde(default)]
+    metric: Option<String>,
+}
+
+fn default_index_kind() -> String {
+    "keyword".into()
+}
+
+async fn create_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<CreateIndexBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let kind = body.kind.to_lowercase();
+    let index_name = body.index_name.clone().unwrap_or_else(|| body.field.clone());
+
+    // Vector index: Milvus's CreateIndex on a vector field is logically
+    // "build the HNSW index". VexaDb auto-builds at create_collection time,
+    // so we trigger a reindex (the only way to refresh in place).
+    if kind == "hnsw" || kind == "auto" || kind == "autoindex" || kind == "vector" {
+        let mut client = state.client.lock().await;
+        client
+            .reindex_collection(&fqn)
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        // Store index params as opaque collection properties for parity.
+        if !body.params.is_empty() || body.metric.is_some() {
+            let mut set = std::collections::BTreeMap::new();
+            for (k, v) in &body.params {
+                set.insert(format!("index.{index_name}.params.{k}"), v.clone());
+            }
+            if let Some(m) = body.metric.clone() {
+                set.insert(format!("index.{index_name}.metric"), m);
+            }
+            set.insert(format!("index.{index_name}.kind"), kind.clone());
+            set.insert(format!("index.{index_name}.field"), body.field.clone());
+            let op = serde_json::json!({
+                "AlterCollectionProperties": {
+                    "name": name,
+                    "database": db,
+                    "set": set,
+                    "unset": [],
+                }
+            });
+            forward_meta_op(&state, op).await?;
+        }
+        return Ok(Json(serde_json::json!({
+            "name": index_name,
+            "field": body.field,
+            "kind": "hnsw",
+            "state": "Finished",
+        })));
+    }
+
+    // Scalar / payload index: route through MetaOp::AddPayloadIndex.
+    let op = serde_json::json!({
+        "AddPayloadIndex": {
+            "collection": name,
+            "database": db,
+            "field": body.field,
+            "kind": kind,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    {
+        let mut client = state.client.lock().await;
+        client
+            .add_payload_index(bytes)
+            .await
+            .map_err(map_index_grpc_err)?;
+    }
+    // Store custom params + index name as collection properties.
+    if body.index_name.is_some() || !body.params.is_empty() {
+        let mut set = std::collections::BTreeMap::new();
+        set.insert(format!("index.{index_name}.field"), body.field.clone());
+        set.insert(format!("index.{index_name}.kind"), kind.clone());
+        for (k, v) in &body.params {
+            set.insert(format!("index.{index_name}.params.{k}"), v.clone());
+        }
+        let alter = serde_json::json!({
+            "AlterCollectionProperties": {
+                "name": name,
+                "database": db,
+                "set": set,
+                "unset": [],
+            }
+        });
+        forward_meta_op(&state, alter).await?;
+    }
+    Ok(Json(serde_json::json!({
+        "name": index_name,
+        "field": body.field,
+        "kind": kind,
+        "state": "Finished",
+    })))
+}
+
+async fn drop_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, field)): Path<(String, String)>,
+) -> Result<StatusCode, StatusCode> {
+    let db = current_db(&headers);
+    // Drop the payload index (no-op when the field has no index).
+    let op = serde_json::json!({
+        "DropPayloadIndex": {
+            "collection": name,
+            "database": db,
+            "field": field,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    {
+        let mut client = state.client.lock().await;
+        client
+            .drop_payload_index(bytes)
+            .await
+            .map_err(map_index_grpc_err)?;
+    }
+    // Also strip the opaque `index.<field>.*` metadata, best-effort.
+    let mut unset = vec![
+        format!("index.{field}.field"),
+        format!("index.{field}.kind"),
+        format!("index.{field}.metric"),
+    ];
+    // Wildcards aren't supported in unset; the explicit keys above cover the
+    // common case. Custom param keys will linger but never leak meaning.
+    unset.sort();
+    unset.dedup();
+    let alter = serde_json::json!({
+        "AlterCollectionProperties": {
+            "name": name,
+            "database": db,
+            "set": {},
+            "unset": unset,
+        }
+    });
+    let _ = forward_meta_op(&state, alter).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_indexes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let (spec, _count) = client
+        .describe_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let mut out: Vec<Value> = spec
+        .payload_indexes
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.field,
+                "field": p.field,
+                "kind": index_kind_to_string(p.kind),
+                "scope": "scalar",
+            })
+        })
+        .collect();
+    out.push(serde_json::json!({
+        "name": "vector",
+        "field": "vector",
+        "kind": "hnsw",
+        "scope": "vector",
+        "metric": metric_to_string(spec.metric),
+        "m": spec.m,
+        "ef_construction": spec.ef_construction,
+        "ef_search": spec.ef_search,
+    }));
+    Ok(Json(serde_json::json!(out)))
+}
+
+async fn describe_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, field)): Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let (spec, vector_count) = client
+        .describe_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let prefix = format!("index.{field}.");
+    let mut params = std::collections::BTreeMap::<String, String>::new();
+    for (k, v) in spec.properties.iter() {
+        if let Some(rest) = k.strip_prefix(&prefix) {
+            params.insert(rest.to_string(), v.clone());
+        }
+    }
+    if field == "vector" {
+        return Ok(Json(serde_json::json!({
+            "name": "vector",
+            "field": "vector",
+            "kind": "hnsw",
+            "scope": "vector",
+            "metric": metric_to_string(spec.metric),
+            "m": spec.m,
+            "ef_construction": spec.ef_construction,
+            "ef_search": spec.ef_search,
+            "params": params,
+            "state": "Finished",
+            "total_rows": vector_count,
+            "indexed_rows": vector_count,
+            "pending_index_rows": 0,
+        })));
+    }
+    let idx = spec
+        .payload_indexes
+        .iter()
+        .find(|p| p.field == field)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "name": field,
+        "field": field,
+        "kind": index_kind_to_string(idx.kind),
+        "scope": "scalar",
+        "params": params,
+        "state": "Finished",
+        "total_rows": vector_count,
+        "indexed_rows": vector_count,
+        "pending_index_rows": 0,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AlterIndexBody {
+    #[serde(default)]
+    set: std::collections::BTreeMap<String, String>,
+}
+
+async fn alter_index_properties(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, field)): Path<(String, String)>,
+    Json(body): Json<AlterIndexBody>,
+) -> Result<StatusCode, StatusCode> {
+    let db = current_db(&headers);
+    // Index properties are stored on the collection as `index.<field>.<key>`
+    // so VexaDb honours Milvus's "settable knob" surface without growing a
+    // dedicated table. Future engine support can swap this without breaking
+    // clients.
+    let prefix = format!("index.{field}.");
+    let mut set = std::collections::BTreeMap::new();
+    for (k, v) in body.set {
+        set.insert(format!("{prefix}{k}"), v);
+    }
+    if set.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let op = serde_json::json!({
+        "AlterCollectionProperties": {
+            "name": name,
+            "database": db,
+            "set": set,
+            "unset": [],
+        }
+    });
+    forward_meta_op(&state, op).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct DropIndexPropsBody {
+    #[serde(default)]
+    keys: Vec<String>,
+}
+
+async fn drop_index_properties(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, field)): Path<(String, String)>,
+    body: Option<Json<DropIndexPropsBody>>,
+) -> Result<StatusCode, StatusCode> {
+    let db = current_db(&headers);
+    let body = body.map(|b| b.0).unwrap_or_else(|| DropIndexPropsBody { keys: vec![] });
+    if body.keys.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    let prefix = format!("index.{field}.");
+    let unset: Vec<String> = body.keys.into_iter().map(|k| format!("{prefix}{k}")).collect();
+    let op = serde_json::json!({
+        "AlterCollectionProperties": {
+            "name": name,
+            "database": db,
+            "set": {},
+            "unset": unset,
+        }
+    });
+    forward_meta_op(&state, op).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- Load / Release / Refresh -----------------------------------------------
+
+async fn load_collection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    // VexaDb keeps every collection resident in memory (HNSW is always
+    // loaded). LoadCollection just verifies the collection exists and
+    // returns success — preserves Milvus's API shape for clients that
+    // call it before every batch.
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let _ = client
+        .describe_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "state": "Loaded",
+        "progress": 100,
+    })))
+}
+
+async fn release_collection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    // ReleaseCollection is a no-op for VexaDb (no manual unload path);
+    // we still validate existence so callers see a consistent 404 on
+    // unknown names.
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let _ = client
+        .describe_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_load_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let _ = client
+        .describe_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "state": "Loaded",
+        "progress": 100,
+    })))
+}
+
+async fn refresh_load(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    // Milvus's RefreshLoad reloads the collection so newly inserted points
+    // become visible. VexaDb writes are already visible on commit, but we
+    // map this to a reindex so callers can force the HNSW to re-balance.
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let resp = client
+        .reindex_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(serde_json::json!({
+        "state": "Loaded",
+        "progress": 100,
+        "vectors_reindexed": resp.vectors_reindexed,
+    })))
+}
+
+// ---- Flush / Compact / Segments ---------------------------------------------
+
+async fn flush_collection_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let resp = client
+        .flush_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(serde_json::json!({
+        "collection": resp.collection,
+        "flush_ts_ms": resp.flush_ts_ms,
+        "segment_ids": resp.segment_ids,
+        "flushed_segment_ids": resp.flushed_segment_ids,
+        "wal_entries": resp.wal_entries,
+    })))
+}
+
+async fn compact_collection_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let id = client
+        .compact_collection(&fqn)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    Ok(Json(serde_json::json!({
+        "compaction_id": id,
+    })))
+}
+
+async fn get_compaction_state_route(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<Json<Value>, StatusCode> {
+    let mut client = state.client.lock().await;
+    let resp = client
+        .get_compaction_state(id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    Ok(Json(serde_json::json!({
+        "compaction_id": resp.compaction_id,
+        "collection": resp.collection,
+        "state": compaction_state_to_string(resp.state),
+        "entries_before": resp.entries_before,
+        "entries_after": resp.entries_after,
+        "started_ms": resp.started_ms,
+        "finished_ms": resp.finished_ms,
+        "error": if resp.error.is_empty() { Value::Null } else { Value::String(resp.error) },
+    })))
+}
+
+async fn list_segments_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let resp = client
+        .list_persistent_segments(&fqn)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let segments: Vec<Value> = resp
+        .segments
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "collection": s.collection,
+                "num_rows": s.num_rows,
+                "state": segment_state_to_string(s.state),
+                "source": s.source,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!(segments)))
+}
+
+fn map_index_grpc_err(e: anyhow::Error) -> StatusCode {
+    let msg = e.to_string();
+    if msg.contains("collection not found") {
+        StatusCode::NOT_FOUND
+    } else if msg.contains("InvalidArgument") || msg.contains("invalid meta") {
+        StatusCode::BAD_REQUEST
+    } else if msg.contains("PermissionDenied") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+fn compaction_state_to_string(s: i32) -> &'static str {
+    use vectordb_proto::vectordb::v1::CompactionState;
+    match CompactionState::try_from(s).unwrap_or(CompactionState::Unspecified) {
+        CompactionState::Running => "Running",
+        CompactionState::Completed => "Completed",
+        CompactionState::Failed => "Failed",
+        CompactionState::Unspecified => "Unspecified",
+    }
+}
+
+fn segment_state_to_string(s: i32) -> &'static str {
+    use vectordb_proto::vectordb::v1::SegmentState;
+    match SegmentState::try_from(s).unwrap_or(SegmentState::Unspecified) {
+        SegmentState::Growing => "Growing",
+        SegmentState::Sealed => "Sealed",
+        SegmentState::Flushed => "Flushed",
+        SegmentState::Unspecified => "Unspecified",
+    }
 }
 
 fn map_db_grpc_err(e: anyhow::Error) -> StatusCode {

@@ -131,6 +131,24 @@ pub enum MetaOp {
         #[serde(default)]
         unset: Vec<String>,
     },
+    // ---- Index management (Milvus-parity) -------------------------------
+    /// Attach a payload (scalar) index to a field. Replaces any existing
+    /// entry for the same field — payload indexes are uniqued per-field.
+    AddPayloadIndex {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        field: String,
+        kind: String,
+    },
+    /// Detach a payload index from a field. No-op when the field has no
+    /// index, so callers can safely retry.
+    DropPayloadIndex {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        field: String,
+    },
 }
 
 fn default_database() -> String {
@@ -247,6 +265,15 @@ impl WriteAheadLog {
         self.append(&WalEntry::Checkpoint {
             snapshot_id: snapshot_id.into(),
         })
+    }
+
+    /// Flush buffered data and force an `fsync` regardless of the
+    /// `fsync_on_append` mode. Used by [`crate::engine::CollectionEngine::flush_collection`]
+    /// to honour Milvus's strict durability contract on Flush.
+    pub fn force_sync(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+        Ok(())
     }
 }
 

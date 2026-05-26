@@ -162,6 +162,18 @@ pub async fn bootstrap(ctx: &RbacContext, root_password: Option<&str>) -> anyhow
                 (ObjectType::Collection, "Upsert"),
                 (ObjectType::Collection, "Delete"),
                 (ObjectType::Collection, "Get"),
+                // Management (Milvus parity).
+                (ObjectType::Collection, "CreateIndex"),
+                (ObjectType::Collection, "DropIndex"),
+                (ObjectType::Collection, "DescribeIndex"),
+                (ObjectType::Collection, "ListIndexes"),
+                (ObjectType::Collection, "AlterIndex"),
+                (ObjectType::Collection, "LoadCollection"),
+                (ObjectType::Collection, "ReleaseCollection"),
+                (ObjectType::Collection, "GetLoadState"),
+                (ObjectType::Collection, "Flush"),
+                (ObjectType::Collection, "Compact"),
+                (ObjectType::Collection, "GetPersistentSegmentInfo"),
             ],
         ).await;
     }
@@ -177,6 +189,10 @@ pub async fn bootstrap(ctx: &RbacContext, root_password: Option<&str>) -> anyhow
                 (ObjectType::Collection, "Search"),
                 (ObjectType::Collection, "Query"),
                 (ObjectType::Collection, "Get"),
+                (ObjectType::Collection, "DescribeIndex"),
+                (ObjectType::Collection, "ListIndexes"),
+                (ObjectType::Collection, "GetLoadState"),
+                (ObjectType::Collection, "GetPersistentSegmentInfo"),
             ],
         ).await;
     }
@@ -303,6 +319,21 @@ pub fn route_priv(method: &str, path: &str) -> Option<RoutePriv> {
         ("GET", ["v1", "admin", "rebalance"]) => g(Rebalance),
         ("POST", ["v1", "admin", "compact-wal"]) => g(CompactWal),
         ("GET", ["v1", "admin", "cluster"]) => g(ClusterStatus),
+        // ---- Management (Milvus parity) ----------------------------------
+        ("GET", ["v1", "collections", _, "indexes"]) => c(ListIndexes, 2),
+        ("POST", ["v1", "collections", _, "indexes"]) => c(CreateIndex, 2),
+        ("GET", ["v1", "collections", _, "indexes", _]) => c(DescribeIndex, 2),
+        ("DELETE", ["v1", "collections", _, "indexes", _]) => c(DropIndex, 2),
+        ("PATCH", ["v1", "collections", _, "indexes", _, "properties"]) => c(AlterIndex, 2),
+        ("DELETE", ["v1", "collections", _, "indexes", _, "properties"]) => c(AlterIndex, 2),
+        ("POST", ["v1", "collections", _, "load"]) => c(LoadCollection, 2),
+        ("POST", ["v1", "collections", _, "release"]) => c(ReleaseCollection, 2),
+        ("GET", ["v1", "collections", _, "load-state"]) => c(GetLoadState, 2),
+        ("POST", ["v1", "collections", _, "refresh-load"]) => c(LoadCollection, 2),
+        ("POST", ["v1", "collections", _, "flush"]) => c(Flush, 2),
+        ("POST", ["v1", "collections", _, "compact"]) => c(Compact, 2),
+        ("GET", ["v1", "compactions", _]) => g(GetCompactionState),
+        ("GET", ["v1", "collections", _, "segments"]) => c(GetPersistentSegmentInfo, 2),
         // RBAC management (everything under /v1/auth, /v1/users, /v1/roles,
         // /v1/privilege-groups, /v1/admin/rbac).
         ("POST", ["v1", "auth", "tokens"])
