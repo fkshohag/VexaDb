@@ -249,6 +249,90 @@ _ = cli.DropPartition(ctx,
   built-in roles `read_write` and `read_only` are already granted the
   appropriate subset.
 
+## Resource groups (Milvus v2.6 parity)
+
+VexaDb implements resource groups as a **persistent cluster-wide registry**:
+each group stores a `ResourceGroupConfig` (node requests/limits, transfer
+policies, node label filters) in RocksDB and replicates changes through
+the WAL/Raft path. The built-in `__default_resource_group` is auto-seeded
+on first open and cannot be dropped.
+
+This is **registry-only** mode: `Requests`/`Limits` are stored verbatim and
+returned by `DescribeResourceGroup`, but the scheduler does **not** yet
+enforce node capacity or move shards between groups. `TransferReplica` is a
+validated no-op success (both groups must exist); `DescribeReplica`
+synthesizes a single logical replica from cluster topology.
+
+```go
+import (
+    "github.com/vectordb/vectordb/sdks/go/entity"
+    "github.com/vectordb/vectordb/sdks/go/vexaclient"
+)
+
+// Create with full config (Milvus parity)
+cfg := &entity.ResourceGroupConfig{
+    Requests: entity.ResourceGroupLimit{NodeNum: 2},
+    Limits:   entity.ResourceGroupLimit{NodeNum: 4},
+    NodeFilter: entity.ResourceGroupNodeFilter{
+        NodeLabels: map[string]string{"zone": "a"},
+    },
+}
+_ = cli.CreateResourceGroup(ctx,
+    vexaclient.NewCreateResourceGroupOption("hot").WithConfig(cfg))
+
+// Or use the shortcut helpers
+_ = cli.CreateResourceGroup(ctx,
+    vexaclient.NewCreateResourceGroupOption("warm").
+        WithNodeRequest(1).WithNodeLimit(3))
+
+names, _ := cli.ListResourceGroups(ctx,
+    vexaclient.NewListResourceGroupsOption())
+// names => ["__default_resource_group", "hot", "warm"]
+
+rg, _ := cli.DescribeResourceGroup(ctx,
+    vexaclient.NewDescribeResourceGroupOption("hot"))
+// rg.Config.Requests.NodeNum, rg.NumAvailableNode, ...
+
+_ = cli.UpdateResourceGroup(ctx,
+    vexaclient.NewUpdateResourceGroupOption("hot", cfg))
+
+_ = cli.DropResourceGroup(ctx,
+    vexaclient.NewDropResourceGroupOption("warm"))
+
+// Replica introspection (collection-scoped REST)
+replicas, _ := cli.DescribeReplica(ctx,
+    vexaclient.NewDescribeReplicaOption("docs"))
+// replicas[0].Placement[] => {ShardID, NodeID, NodeAddress}
+// replicas[0].ResourceGroupName => "__default_resource_group"
+
+// TransferReplica validates both groups exist, then returns success
+_ = cli.TransferReplica(ctx,
+    vexaclient.NewTransferReplicaOption("docs", "hot", "cold", 1).
+        WithDBName("default"))
+```
+
+### Mapping notes
+
+| Milvus API | VexaDb behavior |
+|------------|-----------------|
+| `CreateResourceGroup` | Persists `MetaOp::CreateResourceGroup` via Raft |
+| `DropResourceGroup` | Rejects `__default_resource_group` |
+| `UpdateResourceGroup` | Full config replace (Milvus semantics) |
+| `ListResourceGroups` | Sorted name list; always includes default |
+| `DescribeResourceGroup` | Returns config + counters (`num_available_node` is `0` until topology wiring) |
+| `TransferReplica` | No-op success after validating both RGs exist |
+| `DescribeReplica` | One synthetic replica per collection from shard primaries |
+
+- REST routes: `GET/POST /v1/resource-groups`, `GET/PATCH/DELETE
+  /v1/resource-groups/:name`, `GET /v1/collections/:name/replicas`,
+  `POST /v1/admin/transfer-replica`.
+- RBAC privileges are **global** (`CreateResourceGroup`, `DropResourceGroup`,
+  `DescribeResourceGroup`, `ListResourceGroups`, `UpdateResourceGroup`,
+  `TransferReplica`, `DescribeReplica`). Built-in `read_write` grants all;
+  `read_only` grants describe/list/describe-replica only.
+- `DescribeReplica` with an **empty** collection name still falls back to
+  the legacy cluster-status derivation (backward compatible).
+
 ## Client management
 
 `New` accepts a `ClientConfig` modeled after Milvus's
