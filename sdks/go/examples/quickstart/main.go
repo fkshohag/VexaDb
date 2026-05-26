@@ -129,7 +129,7 @@ func main() {
 		log.Printf("  %s  score=%.4f", h.ID, h.Score)
 	}
 
-	if pt, err := cli.Get(ctx, vexaclient.NewGetOption(collectionName, "doc-000")); err != nil {
+	if pt, err := cli.GetByID(ctx, vexaclient.NewGetOption(collectionName, "doc-000")); err != nil {
 		log.Fatalf("get point: %v", err)
 	} else if pt != nil {
 		log.Printf("get doc-000: payload=%v", pt["payload"])
@@ -140,7 +140,7 @@ func main() {
 			status.ShardCount, status.ReplicationFactor, len(status.Nodes))
 	}
 
-	if del, err := cli.Delete(ctx, vexaclient.NewDeleteOption(collectionName, []string{"doc-000", "doc-001"})); err != nil {
+	if del, err := cli.Delete(ctx, vexaclient.NewDeleteOption(collectionName, "doc-000", "doc-001")); err != nil {
 		log.Fatalf("delete points: %v", err)
 	} else {
 		log.Printf("deleted %d points", del.Deleted)

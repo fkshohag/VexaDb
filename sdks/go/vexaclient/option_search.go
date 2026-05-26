@@ -1,24 +1,74 @@
 package vexaclient
 
-import "github.com/vectordb/vectordb/sdks/go/entity"
+import (
+	"encoding/json"
+	"strconv"
+
+	"github.com/vectordb/vectordb/sdks/go/entity"
+)
+
+// toJSONMap is a permissive helper that converts an arbitrary value into
+// a `map[string]any`. It is used by `WithAnnParam` to accept either a
+// struct, a `map[string]any`, or a JSON string.
+func toJSONMap(v any) map[string]any {
+	if v == nil {
+		return nil
+	}
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil
+	}
+	return out
+}
 
 // SearchOption configures vector ANN search.
 type SearchOption struct {
-	Collection   string
-	Limit        int
-	Vectors      []entity.Vector
-	FilterExpr   string
-	FilterJSON   map[string]any
-	FilterIDs    []string
+	Collection     string
+	Limit          int
+	Vectors        []entity.Vector
+	FilterExpr     string
+	FilterJSON     map[string]any
+	FilterIDs      []string
 	OutputFields   []string
 	IncludePayload bool
 	IncludeVector  bool
-	SparseQuery  *entity.SparseVector
-	TextQuery    string
-	SearchMode   string
-	HybridAlpha  float32
-	ANNSField    string
-	Offset       int
+	SparseQuery    *entity.SparseVector
+	TextQuery      string
+	SearchMode     string
+	HybridAlpha    float32
+	ANNSField      string
+	Offset         int
+	// Milvus parity: partition scope. Empty slice = all partitions.
+	Partitions []string
+	// ConsistencyLevel mirrors Milvus's enum (Strong, Bounded, Session,
+	// Eventually). VexaDb is strongly consistent under Raft replication
+	// today so the field is forwarded but does not change behavior.
+	ConsistencyLevel string
+	// Group-by parameters (Milvus parity). The SDK forwards these to the
+	// gateway; group-by is a no-op on the server today and will round-trip
+	// as the equivalent ungrouped search.
+	GroupByField    string
+	GroupSize       int
+	StrictGroupSize bool
+	// IgnoreGrowing skips growing segments — VexaDb is single-segment so
+	// it has no effect; preserved for source compatibility.
+	IgnoreGrowing bool
+	// AnnParam carries index-specific tuning knobs (ef, nprobe, etc.).
+	AnnParam map[string]any
+	// Custom user search params (Milvus's WithSearchParam).
+	SearchParams map[string]string
+	// FunctionReranker name (Milvus parity). The SDK forwards the name to
+	// the gateway; rerank is best-effort.
+	FunctionReranker string
+	// Template params for expression evaluation (Milvus parity).
+	TemplateParams map[string]any
 }
 
 // NewSearchOption creates a search for one or more query vectors.
@@ -88,17 +138,85 @@ func (o *SearchOption) WithANNSField(field string) *SearchOption {
 	return o
 }
 
+func (o *SearchOption) WithOffset(offset int) *SearchOption {
+	o.Offset = offset
+	return o
+}
+
+func (o *SearchOption) WithPartitions(names ...string) *SearchOption {
+	o.Partitions = names
+	return o
+}
+
+func (o *SearchOption) WithConsistencyLevel(level string) *SearchOption {
+	o.ConsistencyLevel = level
+	return o
+}
+
+func (o *SearchOption) WithGroupByField(field string) *SearchOption {
+	o.GroupByField = field
+	return o
+}
+
+func (o *SearchOption) WithGroupSize(size int) *SearchOption {
+	o.GroupSize = size
+	return o
+}
+
+func (o *SearchOption) WithStrictGroupSize(strict bool) *SearchOption {
+	o.StrictGroupSize = strict
+	return o
+}
+
+func (o *SearchOption) WithIgnoreGrowing(ignore bool) *SearchOption {
+	o.IgnoreGrowing = ignore
+	return o
+}
+
+// WithAnnParam stores index-specific tuning knobs. The underlying object
+// may be any JSON-serializable structure (e.g. a struct returned by
+// NewHNSWAnnParam in Milvus); the SDK turns it into a map at request time.
+func (o *SearchOption) WithAnnParam(ap any) *SearchOption {
+	o.AnnParam = toJSONMap(ap)
+	return o
+}
+
+func (o *SearchOption) WithSearchParam(key, value string) *SearchOption {
+	if o.SearchParams == nil {
+		o.SearchParams = map[string]string{}
+	}
+	o.SearchParams[key] = value
+	return o
+}
+
+func (o *SearchOption) WithFunctionReranker(name string) *SearchOption {
+	o.FunctionReranker = name
+	return o
+}
+
+func (o *SearchOption) WithTemplateParam(key string, val any) *SearchOption {
+	if o.TemplateParams == nil {
+		o.TemplateParams = map[string]any{}
+	}
+	o.TemplateParams[key] = val
+	return o
+}
+
 // QueryOption configures filter-only retrieval.
 type QueryOption struct {
-	Collection   string
-	FilterExpr   string
-	FilterJSON   map[string]any
-	IDs          []string
-	Limit        int
-	Offset       int
+	Collection     string
+	FilterExpr     string
+	FilterJSON     map[string]any
+	IDs            []string
+	Limit          int
+	Offset         int
 	OutputFields   []string
 	IncludePayload bool
 	IncludeVector  bool
+	// Milvus parity additions.
+	Partitions       []string
+	ConsistencyLevel string
+	TemplateParams   map[string]any
 }
 
 // NewQueryOption creates a filter-only query.
@@ -150,14 +268,87 @@ func (o *QueryOption) WithVector(on bool) *QueryOption {
 	return o
 }
 
-// DeleteOption deletes points by ID.
+func (o *QueryOption) WithPartitions(names ...string) *QueryOption {
+	o.Partitions = names
+	return o
+}
+
+func (o *QueryOption) WithConsistencyLevel(level string) *QueryOption {
+	o.ConsistencyLevel = level
+	return o
+}
+
+func (o *QueryOption) WithTemplateParam(key string, val any) *QueryOption {
+	if o.TemplateParams == nil {
+		o.TemplateParams = map[string]any{}
+	}
+	o.TemplateParams[key] = val
+	return o
+}
+
+// WithInt64IDs sets primary keys as int64 IDs (formatted as strings).
+func (o *QueryOption) WithInt64IDs(_field string, ids []int64) *QueryOption {
+	out := make([]string, len(ids))
+	for i, v := range ids {
+		out[i] = strconv.FormatInt(v, 10)
+	}
+	o.IDs = out
+	return o
+}
+
+// WithStringIDs sets primary keys as strings (varchar PK).
+func (o *QueryOption) WithStringIDs(_field string, ids []string) *QueryOption {
+	o.IDs = ids
+	return o
+}
+
+// DeleteOption deletes points by ID, filter expression, or both.
 type DeleteOption struct {
 	Collection string
 	IDs        []string
+	// FilterExpr is a Milvus-style boolean expression. Either or both of
+	// IDs / FilterExpr can be set; the server deletes their union.
+	FilterExpr string
+	// Partition is an optional partition scope (Milvus parity). Empty
+	// string = "all partitions" (legacy behavior).
+	Partition string
 }
 
-func NewDeleteOption(collection string, ids []string) *DeleteOption {
-	return &DeleteOption{Collection: collection, IDs: ids}
+// NewDeleteOption keeps the legacy one-shot constructor that takes a
+// pre-built id list. Prefer the chainable form
+// `NewDeleteOption(coll).WithStringIDs(field, ids)` for new code.
+func NewDeleteOption(collection string, ids ...string) *DeleteOption {
+	// Legacy callers passed `[]string` as the second argument; reroute
+	// that into the variadic so both shapes compile.
+	flat := make([]string, 0, len(ids))
+	for _, x := range ids {
+		flat = append(flat, x)
+	}
+	return &DeleteOption{Collection: collection, IDs: flat}
+}
+
+func (o *DeleteOption) WithExpr(expr string) *DeleteOption {
+	o.FilterExpr = expr
+	return o
+}
+
+func (o *DeleteOption) WithPartition(name string) *DeleteOption {
+	o.Partition = name
+	return o
+}
+
+func (o *DeleteOption) WithInt64IDs(_field string, ids []int64) *DeleteOption {
+	out := make([]string, len(ids))
+	for i, v := range ids {
+		out[i] = strconv.FormatInt(v, 10)
+	}
+	o.IDs = out
+	return o
+}
+
+func (o *DeleteOption) WithStringIDs(_field string, ids []string) *DeleteOption {
+	o.IDs = ids
+	return o
 }
 
 // GetOption fetches one point by ID.

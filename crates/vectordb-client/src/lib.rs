@@ -631,14 +631,33 @@ impl VectorDbClient {
     }
 
     pub async fn delete(&mut self, collection: &str, ids: Vec<String>) -> anyhow::Result<u64> {
+        self.delete_full(collection, ids, String::new(), String::new()).await
+    }
+
+    /// Delete points by ID list, filter expression, partition scope, or any
+    /// combination thereof. Empty fields are no-ops on the server side.
+    pub async fn delete_full(
+        &mut self,
+        collection: &str,
+        ids: Vec<String>,
+        filter: String,
+        partition: String,
+    ) -> anyhow::Result<u64> {
         let collection = collection.to_string();
         self.redirect_on_leader(|mut c| {
             let collection = collection.clone();
             let ids = ids.clone();
+            let filter = filter.clone();
+            let partition = partition.clone();
             async move {
                 let resp = c
                     .inner
-                    .delete(c.authed(DeleteRequest { collection, ids }))
+                    .delete(c.authed(DeleteRequest {
+                        collection,
+                        ids,
+                        filter,
+                        partition,
+                    }))
                     .await?
                     .into_inner();
                 Ok(resp.deleted)
@@ -698,16 +717,60 @@ impl VectorDbClient {
         cursor: &str,
         limit: u32,
     ) -> anyhow::Result<(Vec<VectorPoint>, String)> {
+        self.scroll_filtered(collection, cursor, limit, "", "", &[], true, false).await
+    }
+
+    /// Filter-aware scroll. Used by `QueryIterator` in the SDKs.
+    pub async fn scroll_filtered(
+        &mut self,
+        collection: &str,
+        cursor: &str,
+        limit: u32,
+        filter: &str,
+        partition: &str,
+        output_fields: &[String],
+        with_payload: bool,
+        with_vector: bool,
+    ) -> anyhow::Result<(Vec<VectorPoint>, String)> {
         let resp = self
             .inner
             .scroll(self.authed(vectordb_proto::vectordb::v1::ScrollRequest {
                 collection: collection.into(),
                 cursor: cursor.into(),
                 limit,
+                filter: filter.to_string(),
+                partition: partition.to_string(),
+                output_fields: output_fields.to_vec(),
+                with_payload,
+                with_vector,
             }))
             .await?
             .into_inner();
         Ok((resp.points, resp.next_cursor))
+    }
+
+    /// Multi-leg ANN search (Milvus-parity HybridSearch).
+    pub async fn hybrid_search(
+        &mut self,
+        req: vectordb_proto::vectordb::v1::HybridSearchRequest,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::HybridSearchResponse> {
+        Ok(self
+            .inner
+            .hybrid_search(self.authed(req))
+            .await?
+            .into_inner())
+    }
+
+    /// Run the configured text analyzer over one or more inputs.
+    pub async fn run_analyzer(
+        &mut self,
+        req: vectordb_proto::vectordb::v1::RunAnalyzerRequest,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::RunAnalyzerResponse> {
+        Ok(self
+            .inner
+            .run_analyzer(self.authed(req))
+            .await?
+            .into_inner())
     }
 
     /// Trigger a one-shot rebalance sweep on the router.

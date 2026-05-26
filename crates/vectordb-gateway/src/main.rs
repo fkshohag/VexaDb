@@ -102,6 +102,10 @@ struct PayloadFieldIndexBody {
 #[derive(Deserialize)]
 struct UpsertBody {
     points: Vec<PointBody>,
+    // Optional partition scope (Milvus parity). Each point's payload is
+    // tagged with `_partition: <name>` before being committed to the WAL.
+    #[serde(default)]
+    partition: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -190,9 +194,17 @@ struct SearchHit {
     vector: Option<Vec<f32>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct DeletePointsBody {
+    #[serde(default)]
     ids: Vec<String>,
+    // Milvus-style boolean expression. When set, the engine deletes every
+    // point whose payload satisfies the expression.
+    #[serde(default)]
+    filter: Option<String>,
+    // Optional partition scope; empty / null means "all partitions".
+    #[serde(default)]
+    partition: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -281,8 +293,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/collections/:name/properties", patch(alter_properties))
         .route("/v1/collections/:name/aliases", get(list_aliases_for))
         .route("/v1/collections/:name/search", post(search))
+        .route("/v1/collections/:name/hybrid-search", post(hybrid_search_route))
         .route("/v1/collections/:name/query", post(query_points))
+        .route(
+            "/v1/collections/:name/scroll",
+            post(scroll_route),
+        )
         .route("/v1/collections/:name/stats", get(collection_stats))
+        .route("/v1/admin/analyze", post(run_analyzer_route))
         .route("/v1/aliases", get(list_aliases).post(create_alias))
         .route(
             "/v1/aliases/:alias",
@@ -1820,7 +1838,29 @@ async fn upsert(
     Json(body): Json<UpsertBody>,
 ) -> Result<Json<Value>, StatusCode> {
     let fqn = fq(&current_db(&headers), &name);
-    let points = points_from_body(body.points);
+    let mut points = points_from_body(body.points);
+    // Partition tagging mirrors `engine::upsert_in_partition`: when a
+    // partition is supplied, every point gets a `_partition: <name>` key
+    // injected into its payload (overwriting any caller-provided value).
+    if let Some(part) = body.partition.as_deref() {
+        if !part.is_empty() {
+            for p in &mut points {
+                let mut obj: serde_json::Map<String, Value> = if p.payload.is_empty() {
+                    serde_json::Map::new()
+                } else {
+                    match serde_json::from_slice::<Value>(&p.payload) {
+                        Ok(Value::Object(m)) => m,
+                        _ => serde_json::Map::new(),
+                    }
+                };
+                obj.insert(
+                    vectordb_core::PARTITION_PAYLOAD_FIELD.to_string(),
+                    Value::String(part.to_string()),
+                );
+                p.payload = serde_json::to_vec(&Value::Object(obj)).unwrap_or_default();
+            }
+        }
+    }
     let mut client = state.client.lock().await;
     let n = client
         .upsert(&fqn, points)
@@ -1901,6 +1941,288 @@ async fn search(
             })
             .collect(),
     ))
+}
+
+/// `POST /v1/collections/:name/hybrid-search`
+///
+/// Body shape mirrors Milvus's HybridSearchRequest:
+/// ```json
+/// {
+///   "limit": 10,
+///   "requests": [
+///     {"field": "vector", "limit": 20, "dense": [0.1, 0.2, ...], "filter": "color == 'red'"},
+///     {"field": "sparse", "limit": 20, "sparse": {"indices": [...], "values": [...]}},
+///     {"field": "text", "limit": 20, "text": "hello"}
+///   ],
+///   "reranker": {"kind": "rrf"},          // or {"kind": "weighted", "weights": [0.5, 0.5]}
+///                                         // or {"kind": "function"}
+///   "output_fields": ["color"],
+///   "with_payload": true,
+///   "with_vector": false,
+///   "partitions": ["_default"]
+/// }
+/// ```
+async fn hybrid_search_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Vec<SearchHit>>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
+    let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
+    let reqs_v = body
+        .get("requests")
+        .and_then(|v| v.as_array())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let mut requests = Vec::with_capacity(reqs_v.len());
+    for r in reqs_v {
+        let field = r.get("field").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let per_limit = r.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
+        let filter = r
+            .get("filter")
+            .map(|v| filter_value_to_json(v))
+            .transpose()?
+            .unwrap_or_default();
+        let dense: Vec<f32> = r
+            .get("dense")
+            .or_else(|| r.get("dense_query"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default();
+        let sparse = r
+            .get("sparse")
+            .or_else(|| r.get("sparse_query"))
+            .and_then(|sv| {
+                let idx = sv.get("indices")?.as_array()?;
+                let vals = sv.get("values")?.as_array()?;
+                Some(vectordb_proto::vectordb::v1::SparseVector {
+                    indices: idx.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect(),
+                    values: vals.iter().filter_map(|x| x.as_f64().map(|n| n as f32)).collect(),
+                })
+            });
+        let text = r
+            .get("text")
+            .or_else(|| r.get("text_query"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        requests.push(vectordb_proto::vectordb::v1::AnnRequest {
+            field,
+            limit: per_limit,
+            dense_query: dense,
+            sparse_query: sparse,
+            text_query: text,
+            filter,
+        });
+    }
+    let reranker = body.get("reranker").cloned().unwrap_or(Value::Null);
+    let kind = reranker
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("rrf")
+        .to_string();
+    let weights = reranker
+        .get("weights")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+        .unwrap_or_default();
+    let partitions = body
+        .get("partitions")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let req = vectordb_proto::vectordb::v1::HybridSearchRequest {
+        collection: fqn,
+        limit,
+        requests,
+        reranker_kind: kind,
+        reranker_weights: weights,
+        output_fields: body
+            .get("output_fields")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        with_payload: body
+            .get("with_payload")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        with_vector: body
+            .get("with_vector")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        partitions,
+    };
+    let mut client = state.client.lock().await;
+    let resp = client
+        .hybrid_search(req)
+        .await
+        .map_err(|e| {
+            let s = e.to_string();
+            if s.contains("InvalidArgument") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            }
+        })?;
+    Ok(Json(
+        resp.hits
+            .into_iter()
+            .map(|h| SearchHit {
+                id: h.id,
+                score: h.score,
+                payload: payload_bytes_to_value(&h.payload),
+                vector: if h.vector.is_empty() { None } else { Some(h.vector) },
+            })
+            .collect(),
+    ))
+}
+
+/// `POST /v1/collections/:name/scroll` — used by QueryIterator / SearchIterator.
+async fn scroll_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let fqn = fq(&current_db(&headers), &name);
+    let cursor = body
+        .get("cursor")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+    let filter_json = match body.get("filter") {
+        Some(v) => filter_value_to_json(v)?,
+        None => String::new(),
+    };
+    let partition = body
+        .get("partition")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let output_fields: Vec<String> = body
+        .get("output_fields")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let with_payload = body
+        .get("with_payload")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let with_vector = body
+        .get("with_vector")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut client = state.client.lock().await;
+    let (points, next) = client
+        .scroll_filtered(
+            &fqn, &cursor, limit, &filter_json, &partition, &output_fields, with_payload,
+            with_vector,
+        )
+        .await
+        .map_err(|e| {
+            let s = e.to_string();
+            if s.contains("invalid filter") || s.contains("InvalidArgument") {
+                StatusCode::BAD_REQUEST
+            } else if s.contains("partition not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_GATEWAY
+            }
+        })?;
+    let pts: Vec<Value> = points
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "values": if with_vector && !p.values.is_empty() { Some(p.values) } else { None },
+                "payload": payload_bytes_to_value(&p.payload),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "points": pts,
+        "next_cursor": next,
+    })))
+}
+
+/// `POST /v1/admin/analyze` — Milvus-parity RunAnalyzer endpoint.
+async fn run_analyzer_route(
+    State(state): State<AppState>,
+    _headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    let text: Vec<String> = body
+        .get("text")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .or_else(|| {
+            body.get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| vec![s.to_string()])
+        })
+        .unwrap_or_default();
+    let analyzer_params_json = match body.get("analyzer_params") {
+        Some(v) => v.to_string(),
+        None => body
+            .get("analyzer_params_json")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default(),
+    };
+    let analyzer_name: Vec<String> = body
+        .get("analyzer_name")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let collection = body
+        .get("collection")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let field = body
+        .get("field")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let req = vectordb_proto::vectordb::v1::RunAnalyzerRequest {
+        text,
+        analyzer_params_json,
+        analyzer_name,
+        collection,
+        field,
+        with_detail: body
+            .get("with_detail")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        with_hash: body
+            .get("with_hash")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+    };
+    let mut client = state.client.lock().await;
+    let resp = client.run_analyzer(req).await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let results: Vec<Value> = resp
+        .results
+        .into_iter()
+        .map(|r| {
+            let tokens: Vec<Value> = r
+                .tokens
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "token": t.token,
+                        "start_offset": t.start_offset,
+                        "end_offset": t.end_offset,
+                        "position": t.position,
+                        "hash": t.hash,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "tokens": tokens })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "results": results })))
 }
 
 async fn query_points(
@@ -2144,9 +2466,25 @@ async fn delete_points(
     let fqn = fq(&current_db(&headers), &name);
     let mut client = state.client.lock().await;
     let n = client
-        .delete(&fqn, body.ids)
+        .delete_full(
+            &fqn,
+            body.ids,
+            body.filter.unwrap_or_default(),
+            body.partition.unwrap_or_default(),
+        )
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("invalid filter expression")
+                || msg.contains("InvalidArgument")
+            {
+                StatusCode::BAD_REQUEST
+            } else if msg.contains("partition not found") || msg.contains("PartitionNotFound") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_GATEWAY
+            }
+        })?;
     Ok(Json(serde_json::json!({ "deleted": n })))
 }
 

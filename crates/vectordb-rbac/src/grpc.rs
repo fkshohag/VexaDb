@@ -123,8 +123,9 @@ pub fn method_priv(method: &str) -> Option<MethodPriv> {
         "ReindexCollection" => p(Reindex, false),
         "Upsert" => p(Upsert, false),
         "BulkUpsert" | "ImportStream" => p(Insert, false),
-        "Search" => p(Search, false),
+        "Search" | "HybridSearch" => p(Search, false),
         "Query" | "Scroll" => p(Query, false),
+        "RunAnalyzer" => p(Query, true),
         "Delete" => p(Delete, false),
         "Get" => p(Get, false),
         // Collection-meta RPCs do their own per-op authorization in the
@@ -238,6 +239,29 @@ pub fn require_collection<T>(
         .map_err(|_| {
             Status::permission_denied(format!(
                 "no {} privilege on collection {collection}",
+                privilege.as_str()
+            ))
+        })
+}
+
+/// Authorize a global-scoped action (e.g. `RunAnalyzer`, cluster admin).
+pub fn require_global<T>(
+    cache: &RbacCache,
+    request: &Request<T>,
+    privilege: Privilege,
+) -> Result<(), Status> {
+    if !cache.enabled() {
+        return Ok(());
+    }
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .ok_or_else(|| Status::unauthenticated("principal missing"))?;
+    cache
+        .authorize(principal, ObjectType::Global, "*", privilege.as_str())
+        .map_err(|_| {
+            Status::permission_denied(format!(
+                "no global {} privilege",
                 privilege.as_str()
             ))
         })

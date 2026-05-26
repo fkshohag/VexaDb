@@ -1,16 +1,29 @@
 package vexaclient
 
-// InsertResult is returned by Insert / Upsert.
+// InsertResult is returned by Insert.
 type InsertResult struct {
 	// IDs of affected rows (same order as input when provided).
 	IDs []string
 	// Upserted count from the server.
 	Upserted uint64
+	// InsertCount mirrors Milvus's InsertResult shape. Always equal to
+	// `Upserted` on VexaDb.
+	InsertCount int64
+}
+
+// UpsertResult is returned by Upsert (Milvus parity). The shape mirrors
+// `InsertResult` but is a distinct type so callers can switch between
+// Insert and Upsert without losing type information.
+type UpsertResult struct {
+	IDs         []string
+	Upserted    uint64
+	UpsertCount int64
 }
 
 // DeleteResult is returned by Delete.
 type DeleteResult struct {
-	Deleted uint64
+	Deleted     uint64
+	DeleteCount int64
 }
 
 // SearchResult is one ANN hit (convenience view; use ResultSet for columns).

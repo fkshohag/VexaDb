@@ -14,14 +14,26 @@ type ColumnBasedInsertOption struct {
 	idStrings []string
 	idInt64s  []int64
 	columns   map[string]columnData
+	// Partition is the optional target partition (Milvus parity).
+	// Empty string means the collection's `_default` partition.
+	Partition string
+	// PartialUpdate enables Milvus-style partial upsert: existing fields not
+	// in the payload are preserved instead of being cleared. Only honored by
+	// `Client.Upsert`; ignored on plain `Insert`.
+	PartialUpdate bool
 }
 
 type columnData struct {
 	strings   []string
 	int64s    []int64
+	int32s    []int32
+	int16s    []int16
+	int8s     []int8
 	floats    []float64
 	bools     []bool
 	vectors   [][]float32
+	binaryVec [][]byte
+	int8Vec   [][]int8
 	vectorDim int
 	sparse    []*entity.SparseVector
 }
@@ -68,6 +80,85 @@ func (o *ColumnBasedInsertOption) WithIDs(ids []string) *ColumnBasedInsertOption
 	return o
 }
 
+// WithInt8Column / WithInt16Column / WithInt32Column store narrow ints
+// in the payload as int64 (VexaDb has one numeric type at rest).
+func (o *ColumnBasedInsertOption) WithInt8Column(name string, data []int8) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{int8s: data}
+	return o
+}
+func (o *ColumnBasedInsertOption) WithInt16Column(name string, data []int16) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{int16s: data}
+	return o
+}
+func (o *ColumnBasedInsertOption) WithInt32Column(name string, data []int32) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{int32s: data}
+	return o
+}
+
+// WithBinaryVectorColumn stores a binary vector column. VexaDb decodes the
+// byte stream to float32 dimensions on the gateway by `byte >> bit`
+// expansion so the rest of the engine stays single-typed.
+func (o *ColumnBasedInsertOption) WithBinaryVectorColumn(name string, dim int, data [][]byte) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{binaryVec: data, vectorDim: dim}
+	return o
+}
+
+// WithFloat16VectorColumn / WithBFloat16VectorColumn accept the caller's
+// float32 representation. VexaDb stores float32 internally; the explicit
+// builders exist purely for Milvus parity so callers do not have to
+// rewrite their setup code.
+func (o *ColumnBasedInsertOption) WithFloat16VectorColumn(name string, dim int, data [][]float32) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{vectors: data, vectorDim: dim}
+	return o
+}
+func (o *ColumnBasedInsertOption) WithBFloat16VectorColumn(name string, dim int, data [][]float32) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{vectors: data, vectorDim: dim}
+	return o
+}
+
+// WithInt8VectorColumn stores int8 vector data (e.g. quantized embeddings).
+// The payload is sent as raw int8 values; VexaDb expands them to float32 on
+// the server side.
+func (o *ColumnBasedInsertOption) WithInt8VectorColumn(name string, dim int, data [][]int8) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{int8Vec: data, vectorDim: dim}
+	return o
+}
+
+// WithSparseColumn attaches a slice of optional sparse vectors aligned with
+// the row order.
+func (o *ColumnBasedInsertOption) WithSparseColumn(name string, data []*entity.SparseVector) *ColumnBasedInsertOption {
+	o.columns[name] = columnData{sparse: data}
+	return o
+}
+
+// WithColumns accepts pre-built typed columns (Milvus parity).
+func (o *ColumnBasedInsertOption) WithColumns(cols ...entity.Column) *ColumnBasedInsertOption {
+	for _, col := range cols {
+		switch c := col.(type) {
+		case entity.StringColumn:
+			o.columns[c.Field] = columnData{strings: c.Data}
+		case entity.Int64Column:
+			o.columns[c.Field] = columnData{int64s: c.Data}
+		case entity.FloatVectorColumn:
+			o.columns[c.Field] = columnData{vectors: c.Data, vectorDim: c.Dim}
+		}
+	}
+	return o
+}
+
+// WithPartition targets a specific partition (Milvus parity).
+func (o *ColumnBasedInsertOption) WithPartition(name string) *ColumnBasedInsertOption {
+	o.Partition = name
+	return o
+}
+
+// WithPartialUpdate switches the upsert to Milvus's partial-update mode:
+// existing payload fields not present in the new payload are preserved.
+func (o *ColumnBasedInsertOption) WithPartialUpdate(on bool) *ColumnBasedInsertOption {
+	o.PartialUpdate = on
+	return o
+}
+
 // Row is one entity for row-based insert.
 type Row struct {
 	ID     any // string or int64
@@ -76,9 +167,15 @@ type Row struct {
 
 // RowBasedInsertOption inserts entities row-by-row.
 type RowBasedInsertOption struct {
-	Collection string
-	Rows       []Row
+	Collection  string
+	Rows        []Row
 	VectorField string
+	Partition   string
+}
+
+func (o *RowBasedInsertOption) WithPartition(name string) *RowBasedInsertOption {
+	o.Partition = name
+	return o
 }
 
 func NewRowBasedInsertOption(collection string, rows ...Row) *RowBasedInsertOption {
@@ -134,10 +231,20 @@ func (o *ColumnBasedInsertOption) buildPoints() ([]gatewayPoint, error) {
 			switch {
 			case len(col.vectors) > 0:
 				values = col.vectors[i]
+			case len(col.binaryVec) > 0:
+				values = bytesToFloat32(col.binaryVec[i])
+			case len(col.int8Vec) > 0:
+				values = int8ToFloat32(col.int8Vec[i])
 			case len(col.strings) > 0:
 				payload[name] = col.strings[i]
 			case len(col.int64s) > 0:
 				payload[name] = col.int64s[i]
+			case len(col.int32s) > 0:
+				payload[name] = int64(col.int32s[i])
+			case len(col.int16s) > 0:
+				payload[name] = int64(col.int16s[i])
+			case len(col.int8s) > 0:
+				payload[name] = int64(col.int8s[i])
 			case len(col.floats) > 0:
 				payload[name] = col.floats[i]
 			case len(col.bools) > 0:
@@ -208,9 +315,34 @@ func formatID(id any) (string, error) {
 }
 
 type gatewayPoint struct {
-	ID      string                 `json:"id"`
-	Values  []float32              `json:"values"`
-	Payload map[string]any         `json:"payload,omitempty"`
-	Sparse  *entity.SparseVector   `json:"sparse,omitempty"`
+	ID      string               `json:"id"`
+	Values  []float32            `json:"values"`
+	Payload map[string]any       `json:"payload,omitempty"`
+	Sparse  *entity.SparseVector `json:"sparse,omitempty"`
+}
+
+// bytesToFloat32 expands a Milvus-style binary vector (1 bit per dimension,
+// MSB first) to one float32 per bit so VexaDb can store it as a regular
+// dense vector. Each output value is either 0.0 or 1.0.
+func bytesToFloat32(b []byte) []float32 {
+	out := make([]float32, 0, len(b)*8)
+	for _, byteVal := range b {
+		for i := 7; i >= 0; i-- {
+			bit := (byteVal >> uint(i)) & 1
+			out = append(out, float32(bit))
+		}
+	}
+	return out
+}
+
+// int8ToFloat32 widens an int8 vector to float32 with no scaling. Callers
+// that quantize on the client side keep the original semantics by
+// normalizing before sending.
+func int8ToFloat32(v []int8) []float32 {
+	out := make([]float32, len(v))
+	for i, x := range v {
+		out[i] = float32(x)
+	}
+	return out
 }
 

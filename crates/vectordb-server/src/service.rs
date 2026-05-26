@@ -23,6 +23,8 @@ use vectordb_proto::vectordb::v1::{
     DescribeResourceGroupResponse, DistanceMetric as ProtoMetric, DropDatabaseRequest,
     DropDatabaseResponse, DropPartitionRequest, DropPartitionResponse, DropPayloadIndexRequest,
     DropPayloadIndexResponse, DropResourceGroupRequest, DropResourceGroupResponse,
+    AnalyzerResult, AnalyzerToken, HybridSearchRequest, HybridSearchResponse, RunAnalyzerRequest,
+    RunAnalyzerResponse,
     FlushCollectionRequest, FlushCollectionResponse, GetCompactionStateRequest,
     GetCompactionStateResponse, GetPartitionStatsRequest, GetPartitionStatsResponse,
     GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HasPartitionRequest,
@@ -52,7 +54,7 @@ use crate::config::ServerConfig;
 use crate::leader;
 use crate::metrics::RpcTimer;
 use crate::replication::ReplicatedEngine;
-use vectordb_rbac::{ObjectType, Privilege};
+use vectordb_rbac::{require_global, ObjectType, Privilege};
 use vectordb_storage::BulkPoint;
 
 pub struct VectorServiceImpl {
@@ -563,22 +565,43 @@ impl VectorService for VectorServiceImpl {
         require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Delete)?;
         let req = request.into_inner();
         let mut deleted = 0u64;
-        for id in req.ids {
-            if !self.owns_point(&id) {
+        for id in &req.ids {
+            if !self.owns_point(id) {
                 return Err(Status::failed_precondition(format!(
                     "point {id} belongs to another shard"
                 )));
             }
             if let Some(rep) = &self.replicated {
-                rep.delete(&req.collection, &id)
+                rep.delete(&req.collection, id)
                     .await
                     .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
             } else {
                 self.engine
-                    .delete(&req.collection, &id)
+                    .delete(&req.collection, id)
                     .map_err(map_engine_err)?;
             }
             deleted += 1;
+        }
+        // Filter / partition-scoped delete (Milvus parity). Parse the expr
+        // here so the engine sees a strongly-typed `Filter`. Empty filter
+        // + empty partition + empty ids is treated as a no-op.
+        if !req.filter.is_empty() || !req.partition.is_empty() {
+            let filter = if req.filter.is_empty() {
+                None
+            } else {
+                Some(vectordb_core::parse_filter_expr(&req.filter).map_err(|e| {
+                    Status::invalid_argument(format!("invalid filter expression: {e}"))
+                })?)
+            };
+            let partition = if req.partition.is_empty() {
+                None
+            } else {
+                Some(req.partition.as_str())
+            };
+            deleted += self
+                .engine
+                .delete_by_filter(&req.collection, filter.as_ref(), partition)
+                .map_err(map_engine_err)?;
         }
         Ok(Response::new(DeleteResponse { deleted }))
     }
@@ -826,18 +849,40 @@ impl VectorService for VectorServiceImpl {
         } else {
             req.limit as usize
         };
+        let filter = if req.filter.is_empty() {
+            None
+        } else {
+            Some(vectordb_core::parse_filter_expr(&req.filter).map_err(|e| {
+                Status::invalid_argument(format!("invalid filter expression: {e}"))
+            })?)
+        };
+        let partition = if req.partition.is_empty() {
+            None
+        } else {
+            Some(req.partition.as_str())
+        };
         let (rows, next_cursor) = self
             .engine
-            .scroll(&req.collection, &req.cursor, limit)
+            .scroll_filtered(&req.collection, &req.cursor, limit, filter.as_ref(), partition)
             .map_err(map_engine_err)?;
+        let with_vec = req.with_vector;
+        let with_pay = req.with_payload || !req.output_fields.is_empty();
         let points = rows
             .into_iter()
             .map(|(id, vector, payload)| VectorPoint {
                 id,
-                values: vector.values,
-                payload: payload
-                    .map(|v| serde_json::to_vec(&v).unwrap_or_default())
-                    .unwrap_or_default(),
+                values: if with_vec {
+                    vector.map(|v| v.values).unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                payload: if with_pay {
+                    payload
+                        .map(|v| serde_json::to_vec(&v).unwrap_or_default())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
                 sparse: None,
             })
             .collect();
@@ -1195,6 +1240,140 @@ impl VectorService for VectorServiceImpl {
         // the router synthesize a single-replica view from topology.
         let _ = request.into_inner().collection;
         Ok(Response::new(DescribeReplicaResponse { replicas: vec![] }))
+    }
+
+    async fn hybrid_search(
+        &self,
+        request: Request<HybridSearchRequest>,
+    ) -> Result<Response<HybridSearchResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Search)?;
+        let req = request.into_inner();
+        if req.requests.is_empty() {
+            return Err(Status::invalid_argument(
+                "HybridSearch requires at least one AnnRequest",
+            ));
+        }
+        // Parse per-leg filters up front so the engine sees typed Filters.
+        let mut leg_filters: Vec<Option<Filter>> = Vec::with_capacity(req.requests.len());
+        let mut sparse_legs: Vec<Option<vectordb_core::SparseVector>> = Vec::with_capacity(req.requests.len());
+        for r in &req.requests {
+            leg_filters.push(if r.filter.is_empty() {
+                None
+            } else {
+                Some(vectordb_core::parse_filter_expr(&r.filter).map_err(|e| {
+                    Status::invalid_argument(format!("invalid leg filter: {e}"))
+                })?)
+            });
+            sparse_legs.push(proto_sparse_to_core(r.sparse_query.clone()));
+        }
+        let mut ann_requests: Vec<vectordb_storage::search::AnnRequest<'_>> = Vec::with_capacity(req.requests.len());
+        for (i, r) in req.requests.iter().enumerate() {
+            let query = if !r.dense_query.is_empty() {
+                vectordb_storage::search::AnnQuery::Dense(&r.dense_query)
+            } else if let Some(s) = sparse_legs[i].as_ref() {
+                vectordb_storage::search::AnnQuery::Sparse(s)
+            } else if !r.text_query.is_empty() {
+                vectordb_storage::search::AnnQuery::Text(r.text_query.as_str())
+            } else {
+                return Err(Status::invalid_argument(format!(
+                    "AnnRequest[{i}] missing dense / sparse / text query"
+                )));
+            };
+            ann_requests.push(vectordb_storage::search::AnnRequest {
+                field: r.field.clone(),
+                limit: r.limit.max(1) as usize,
+                query,
+                filter: leg_filters[i].as_ref(),
+            });
+        }
+        let reranker = match req.reranker_kind.as_str() {
+            "" | "rrf" => vectordb_storage::search::Reranker::Rrf,
+            "weighted" => vectordb_storage::search::Reranker::Weighted(req.reranker_weights.clone()),
+            "function" => vectordb_storage::search::Reranker::Function,
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown reranker_kind: {other} (want rrf|weighted|function)"
+                )))
+            }
+        };
+        let output = OutputOptions {
+            output_fields: req.output_fields.clone(),
+            with_payload: req.with_payload,
+            with_vector: req.with_vector,
+        };
+        let hits = self
+            .engine
+            .hybrid_search_multi(
+                &req.collection,
+                ann_requests,
+                reranker,
+                req.limit.max(1) as usize,
+                output,
+            )
+            .map_err(map_engine_err)?;
+        Ok(Response::new(HybridSearchResponse {
+            hits: hits.into_iter().map(scored_to_proto).collect(),
+        }))
+    }
+
+    async fn run_analyzer(
+        &self,
+        request: Request<RunAnalyzerRequest>,
+    ) -> Result<Response<RunAnalyzerResponse>, Status> {
+        // No collection scope; gated by global Query privilege.
+        require_global(&self.rbac, &request, Privilege::Query)?;
+        let req = request.into_inner();
+        if req.text.is_empty() {
+            return Ok(Response::new(RunAnalyzerResponse { results: vec![] }));
+        }
+        // Pull optional stop_words out of analyzer_params_json. We accept
+        // either Milvus's nested `filter: [{type: "stop", stop_words: [...]}]`
+        // shape or a flat `stop_words: [...]` for convenience.
+        let mut stop_words: Vec<String> = Vec::new();
+        if !req.analyzer_params_json.is_empty() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&req.analyzer_params_json) {
+                if let Some(arr) = v.get("stop_words").and_then(|x| x.as_array()) {
+                    for s in arr {
+                        if let Some(s) = s.as_str() {
+                            stop_words.push(s.to_string());
+                        }
+                    }
+                }
+                if let Some(filters) = v.get("filter").and_then(|x| x.as_array()) {
+                    for f in filters {
+                        if f.get("type").and_then(|t| t.as_str()) == Some("stop") {
+                            if let Some(arr) = f.get("stop_words").and_then(|x| x.as_array()) {
+                                for s in arr {
+                                    if let Some(s) = s.as_str() {
+                                        stop_words.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let results = self
+            .engine
+            .analyze_text(&req.text, &stop_words)
+            .map_err(map_engine_err)?;
+        let results = results
+            .into_iter()
+            .map(|tokens| AnalyzerResult {
+                tokens: tokens
+                    .into_iter()
+                    .map(|t| AnalyzerToken {
+                        token: t.token,
+                        start_offset: t.start_offset as u64,
+                        end_offset: t.end_offset as u64,
+                        position: t.position as u64,
+                        hash: t.hash,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(Response::new(RunAnalyzerResponse { results }))
     }
 
     async fn transfer_replica(

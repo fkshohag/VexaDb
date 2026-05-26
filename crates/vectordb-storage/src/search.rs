@@ -7,6 +7,32 @@ use vectordb_core::{
 
 use crate::engine::CollectionState;
 
+/// One leg of a [`hybrid_search_multi`] call. Mirrors Milvus's `AnnRequest`:
+/// a per-field top-k together with the query payload to use for that
+/// field. The `field` name is informational only — VexaDb dispatches based
+/// on the `query` variant (dense / sparse / text).
+pub struct AnnRequest<'a> {
+    pub field: String,
+    pub limit: usize,
+    pub query: AnnQuery<'a>,
+    pub filter: Option<&'a Filter>,
+}
+
+pub enum AnnQuery<'a> {
+    Dense(&'a [f32]),
+    Sparse(&'a SparseVector),
+    Text(&'a str),
+}
+
+/// Reranking policy applied across [`AnnRequest`] result lists.
+/// `Weighted` carries one weight per request (must equal `requests.len()`).
+/// `Function` is a pass-through that interleaves and dedups by best score.
+pub enum Reranker {
+    Rrf,
+    Weighted(Vec<f32>),
+    Function,
+}
+
 pub struct SearchParams<'a> {
     pub query: &'a [f32],
     pub sparse_query: Option<&'a SparseVector>,
@@ -109,6 +135,99 @@ pub fn hybrid_search(
     }
 
     Ok(results)
+}
+
+/// Multi-vector search: run every request independently against the same
+/// collection, then rerank with `reranker`. Mirrors Milvus's
+/// `HybridSearch` semantics — one AnnRequest per field, per-request
+/// limit, single merged result with global `limit`.
+pub fn hybrid_search_multi(
+    state: &CollectionState,
+    requests: Vec<AnnRequest<'_>>,
+    reranker: Reranker,
+    limit: usize,
+) -> Result<Vec<ScoredPoint>, vectordb_core::Error> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut per_leg: Vec<Vec<(String, f32)>> = Vec::with_capacity(requests.len());
+    for req in &requests {
+        let k = req.limit.max(1);
+        let hits: Vec<(String, f32)> = match &req.query {
+            AnnQuery::Dense(q) => dense_search(state, q, k, req.filter)?
+                .into_iter()
+                .map(|h| (h.id, h.score))
+                .collect(),
+            AnnQuery::Sparse(q) => state
+                .sparse_index
+                .as_ref()
+                .map(|idx| idx.search(q, k))
+                .unwrap_or_default(),
+            AnnQuery::Text(t) => state
+                .bm25_index
+                .as_ref()
+                .map(|idx| idx.search(t, k))
+                .unwrap_or_default(),
+        };
+        per_leg.push(hits);
+    }
+    let merged = match reranker {
+        Reranker::Rrf => {
+            let non_empty: Vec<Vec<(String, f32)>> =
+                per_leg.into_iter().filter(|l| !l.is_empty()).collect();
+            if non_empty.is_empty() {
+                Vec::new()
+            } else if non_empty.len() == 1 {
+                sparse_to_scored(non_empty.into_iter().next().unwrap())
+            } else {
+                rrf_fusion(&non_empty, limit)
+            }
+        }
+        Reranker::Weighted(weights) => {
+            // weighted_fusion only takes (dense, lexical, alpha) today;
+            // generalize by min-max normalizing each leg and summing
+            // weight * normalized_score so callers can blend any number
+            // of legs with explicit weights.
+            let mut acc: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+            for (i, leg) in per_leg.iter().enumerate() {
+                if leg.is_empty() {
+                    continue;
+                }
+                let w = weights.get(i).copied().unwrap_or(1.0);
+                let max = leg.iter().map(|(_, s)| *s).fold(f32::MIN, f32::max);
+                let min = leg.iter().map(|(_, s)| *s).fold(f32::MAX, f32::min);
+                let span = (max - min).max(f32::EPSILON);
+                for (id, score) in leg {
+                    let norm = (*score - min) / span;
+                    *acc.entry(id.clone()).or_insert(0.0) += w * norm;
+                }
+            }
+            let mut all: Vec<(String, f32)> = acc.into_iter().collect();
+            all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            all.truncate(limit);
+            sparse_to_scored(all)
+        }
+        Reranker::Function => {
+            // Pass-through: dedup across legs keeping the best per-leg
+            // score, then sort. The "function" itself is applied client
+            // side in Milvus; on the server we keep the contract minimal.
+            let _ = weighted_fusion as fn(_, _, _, _) -> _; // silence unused import
+            let mut acc: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+            for leg in per_leg {
+                for (id, score) in leg {
+                    let cur = acc.entry(id).or_insert(score);
+                    if score > *cur {
+                        *cur = score;
+                    }
+                }
+            }
+            let mut all: Vec<(String, f32)> = acc.into_iter().collect();
+            all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            all.truncate(limit);
+            sparse_to_scored(all)
+        }
+    };
+    Ok(merged)
 }
 
 fn sparse_to_scored(pairs: Vec<(String, f32)>) -> Vec<ScoredPoint> {

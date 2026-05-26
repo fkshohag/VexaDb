@@ -32,7 +32,9 @@ use vectordb_proto::vectordb::v1::{
     MutateCollectionMetaResponse, QueryRequest, QueryResponse, RebalanceCollectionReport,
     RebalanceRequest, RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse,
     RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest, ReindexCollectionResponse,
-    ReplicaInfo, ReplicaShard, ScrollRequest, ScrollResponse, SearchRequest, SearchResponse,
+    ReplicaInfo, ReplicaShard, RunAnalyzerRequest, RunAnalyzerResponse, ScrollRequest,
+    ScrollResponse, ScoredPoint as ScoredPointProto, SearchRequest, SearchResponse,
+    HybridSearchRequest, HybridSearchResponse,
     StatsRequest, StatsResponse, TransferReplicaRequest, TransferReplicaResponse,
     UpdateResourceGroupRequest, UpdateResourceGroupResponse, UpsertRequest, UpsertResponse,
     VectorPoint,
@@ -1322,6 +1324,9 @@ impl VectorService for RouterService {
     ) -> Result<Response<DeleteResponse>, Status> {
         require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Delete)?;
         let req = request.into_inner();
+        let collection = req.collection.clone();
+        let filter = req.filter.clone();
+        let partition = req.partition.clone();
         let mut by_endpoint: HashMap<String, Vec<String>> = HashMap::new();
         for id in req.ids {
             let ep = self
@@ -1341,9 +1346,21 @@ impl VectorService for RouterService {
                 .await
                 .map_err(|e| Status::unavailable(e.to_string()))?;
             deleted += client
-                .delete(&req.collection, ids)
+                .delete(&collection, ids)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        // Filter / partition-scoped delete: fan out to every shard so each
+        // can scan its local payloads. Tolerate per-shard failures and
+        // return the partial total — the caller can retry to converge.
+        if !filter.is_empty() || !partition.is_empty() {
+            for (_, mut client) in self.clients_for_all_shards().await? {
+                let n = client
+                    .delete_full(&collection, vec![], filter.clone(), partition.clone())
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                deleted += n;
+            }
         }
         Ok(Response::new(DeleteResponse { deleted }))
     }
@@ -1540,15 +1557,145 @@ impl VectorService for RouterService {
 
     async fn scroll(
         &self,
-        _request: Request<ScrollRequest>,
+        request: Request<ScrollRequest>,
     ) -> Result<Response<ScrollResponse>, Status> {
-        // Scroll is a *per-shard* operation — call shards directly via the
-        // rebalance tooling, not through the router. Returning an error
-        // keeps the router from accidentally aggregating across shards
-        // and breaking cursor semantics.
-        Err(Status::failed_precondition(
-            "Scroll is per-shard; rebalance tools should connect to shard nodes directly",
-        ))
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Query)?;
+        let req = request.into_inner();
+        // Cursor format: "<shard_idx>|<per_shard_cursor>" (back-compat: an
+        // empty cursor starts at shard 0). The router walks shards in
+        // index order; when a shard reports an empty next_cursor we move
+        // to the next shard until all are drained.
+        let (mut shard_idx, mut per_cursor) = if req.cursor.is_empty() {
+            (0usize, String::new())
+        } else {
+            let mut it = req.cursor.splitn(2, '|');
+            let s = it.next().unwrap_or("0");
+            let c = it.next().unwrap_or("").to_string();
+            (s.parse::<usize>().unwrap_or(0), c)
+        };
+        let mut shards = self.clients_for_all_shards().await?;
+        if shards.is_empty() {
+            return Ok(Response::new(ScrollResponse {
+                points: vec![],
+                next_cursor: String::new(),
+            }));
+        }
+        while shard_idx < shards.len() {
+            let (_, client) = &mut shards[shard_idx];
+            let (points, next) = client
+                .scroll_filtered(
+                    &req.collection,
+                    &per_cursor,
+                    req.limit,
+                    &req.filter,
+                    &req.partition,
+                    &req.output_fields,
+                    req.with_payload,
+                    req.with_vector,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if !points.is_empty() {
+                let cur = if next.is_empty() {
+                    if shard_idx + 1 >= shards.len() {
+                        String::new()
+                    } else {
+                        format!("{}|", shard_idx + 1)
+                    }
+                } else {
+                    format!("{shard_idx}|{next}")
+                };
+                return Ok(Response::new(ScrollResponse {
+                    points,
+                    next_cursor: cur,
+                }));
+            }
+            shard_idx += 1;
+            per_cursor.clear();
+        }
+        Ok(Response::new(ScrollResponse {
+            points: vec![],
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn hybrid_search(
+        &self,
+        request: Request<HybridSearchRequest>,
+    ) -> Result<Response<HybridSearchResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Search)?;
+        let req = request.into_inner();
+        let limit = req.limit.max(1) as usize;
+        // Fan-out: each shard returns up to `2 * limit` candidates so the
+        // router has enough to rerank across shards. We re-apply the same
+        // reranker policy on the unioned results.
+        let mut per_shard_req = req.clone();
+        // Oversample per shard so the router has enough headroom.
+        per_shard_req.limit = (req.limit * 2).max(req.limit);
+        let futures: Vec<_> = self
+            .clients_for_all_shards()
+            .await?
+            .into_iter()
+            .map(|(_, mut client)| {
+                let req = per_shard_req.clone();
+                async move { client.hybrid_search(req).await }
+            })
+            .collect();
+        let results = join_all(futures).await;
+        let mut merged: HashMap<String, ScoredPointProto> = HashMap::new();
+        let mut total = 0usize;
+        let mut failed = 0usize;
+        let mut last_err: Option<String> = None;
+        for res in results {
+            total += 1;
+            match res {
+                Ok(resp) => {
+                    for h in resp.hits {
+                        merged
+                            .entry(h.id.clone())
+                            .and_modify(|cur| {
+                                if h.score > cur.score {
+                                    *cur = h.clone();
+                                }
+                            })
+                            .or_insert(h);
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    last_err = Some(e.to_string());
+                    tracing::warn!(error = %e, "shard hybrid_search failed (partial results)");
+                }
+            }
+        }
+        if failed == total && total > 0 {
+            return Err(Status::internal(format!(
+                "all {total} shards failed; last error: {}",
+                last_err.unwrap_or_default()
+            )));
+        }
+        let mut hits: Vec<ScoredPointProto> = merged.into_values().collect();
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(Response::new(HybridSearchResponse { hits }))
+    }
+
+    async fn run_analyzer(
+        &self,
+        request: Request<RunAnalyzerRequest>,
+    ) -> Result<Response<RunAnalyzerResponse>, Status> {
+        // The analyzer is deterministic per-input; forward to the first
+        // healthy shard and return its response unchanged.
+        let req = request.into_inner();
+        let shards = self.clients_for_all_shards().await?;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in shards {
+            match client.run_analyzer(req.clone()).await {
+                Ok(resp) => return Ok(Response::new(resp)),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted run_analyzer")))
     }
 
     async fn rebalance(

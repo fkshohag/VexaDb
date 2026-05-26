@@ -36,9 +36,12 @@ func (c *Client) Insert(ctx context.Context, opt *ColumnBasedInsertOption) (Inse
 	return c.upsertColumn(ctx, opt)
 }
 
-// Upsert inserts or updates entities (column-based).
-func (c *Client) Upsert(ctx context.Context, opt *ColumnBasedInsertOption) (InsertResult, error) {
-	return c.upsertColumn(ctx, opt)
+// Upsert inserts or updates entities (column-based). Returns an
+// `UpsertResult` shape matching Milvus's API; the result is convertible to
+// the legacy `InsertResult` for source compatibility.
+func (c *Client) Upsert(ctx context.Context, opt *ColumnBasedInsertOption) (UpsertResult, error) {
+	r, err := c.upsertColumn(ctx, opt)
+	return UpsertResult{IDs: r.IDs, Upserted: r.Upserted}, err
 }
 
 func (c *Client) upsertColumn(ctx context.Context, opt *ColumnBasedInsertOption) (InsertResult, error) {
@@ -46,7 +49,7 @@ func (c *Client) upsertColumn(ctx context.Context, opt *ColumnBasedInsertOption)
 	if err != nil {
 		return InsertResult{}, err
 	}
-	return c.upsertPoints(ctx, opt.Collection, points)
+	return c.upsertPoints(ctx, opt.Collection, opt.Partition, points)
 }
 
 // InsertRows inserts entities (row-based).
@@ -59,10 +62,10 @@ func (c *Client) upsertRows(ctx context.Context, opt *RowBasedInsertOption) (Ins
 	if err != nil {
 		return InsertResult{}, err
 	}
-	return c.upsertPoints(ctx, opt.Collection, points)
+	return c.upsertPoints(ctx, opt.Collection, opt.Partition, points)
 }
 
-func (c *Client) upsertPoints(ctx context.Context, collection string, points []gatewayPoint) (InsertResult, error) {
+func (c *Client) upsertPoints(ctx context.Context, collection, partition string, points []gatewayPoint) (InsertResult, error) {
 	ids := make([]string, len(points))
 	bodyPoints := make([]map[string]any, len(points))
 	for i, p := range points {
@@ -76,8 +79,12 @@ func (c *Client) upsertPoints(ctx context.Context, collection string, points []g
 		}
 		bodyPoints[i] = m
 	}
+	body := map[string]any{"points": bodyPoints}
+	if partition != "" {
+		body["partition"] = partition
+	}
 	var out upsertResp
-	err := c.do(ctx, http.MethodPost, "/v1/collections/"+collection+"/upsert", map[string]any{"points": bodyPoints}, &out)
+	err := c.do(ctx, http.MethodPost, "/v1/collections/"+collection+"/upsert", body, &out)
 	return InsertResult{IDs: ids, Upserted: out.Upserted}, err
 }
 
@@ -106,16 +113,23 @@ func (c *Client) BulkUpsert(ctx context.Context, collection string, opt *ColumnB
 	return InsertResult{IDs: ids, Upserted: out.Upserted}, err
 }
 
-// Delete removes points by ID.
+// Delete removes points by ID, filter expression, partition, or any
+// combination thereof. Mirrors Milvus's `Client.Delete(DeleteOption)`.
 func (c *Client) Delete(ctx context.Context, opt *DeleteOption) (DeleteResult, error) {
+	body := map[string]any{"ids": opt.IDs}
+	if opt.FilterExpr != "" {
+		body["filter"] = opt.FilterExpr
+	}
+	if opt.Partition != "" {
+		body["partition"] = opt.Partition
+	}
 	var out deleteResp
-	err := c.do(ctx, http.MethodDelete, "/v1/collections/"+opt.Collection+"/points",
-		map[string]any{"ids": opt.IDs}, &out)
-	return DeleteResult{Deleted: out.Deleted}, err
+	err := c.do(ctx, http.MethodDelete, "/v1/collections/"+opt.Collection+"/points", body, &out)
+	return DeleteResult{Deleted: out.Deleted, DeleteCount: int64(out.Deleted)}, err
 }
 
-// Get returns one point by ID.
-func (c *Client) Get(ctx context.Context, opt *GetOption) (map[string]any, error) {
+// GetByID returns one point by ID (back-compat helper).
+func (c *Client) GetByID(ctx context.Context, opt *GetOption) (map[string]any, error) {
 	var out map[string]any
 	err := c.do(ctx, http.MethodGet, "/v1/collections/"+opt.Collection+"/points/"+opt.ID, nil, &out)
 	if err != nil {
@@ -125,6 +139,13 @@ func (c *Client) Get(ctx context.Context, opt *GetOption) (map[string]any, error
 		return nil, err
 	}
 	return out, nil
+}
+
+// Get retrieves entities by primary key (Milvus parity). The IDs come from
+// `opt.IDs` (set via `WithStringIDs` / `WithInt64IDs` / `WithIDs`). The
+// result is a `ResultSet` containing one column per output field.
+func (c *Client) Get(ctx context.Context, opt *QueryOption) (*entity.ResultSet, error) {
+	return c.Query(ctx, opt)
 }
 
 // Search runs ANN search for the first query vector in the option.
@@ -161,6 +182,37 @@ func (c *Client) SearchResultSet(ctx context.Context, opt *SearchOption) (*entit
 			"values":  opt.SparseQuery.Values,
 		}
 	}
+	// Milvus-parity passthroughs. The server side ignores fields it does
+	// not honor yet (consistency_level, group_by, etc.).
+	if opt.Offset > 0 {
+		body["offset"] = opt.Offset
+	}
+	if len(opt.Partitions) > 0 {
+		body["partitions"] = opt.Partitions
+	}
+	if opt.ConsistencyLevel != "" {
+		body["consistency_level"] = opt.ConsistencyLevel
+	}
+	if opt.GroupByField != "" {
+		body["group_by_field"] = opt.GroupByField
+		body["group_size"] = opt.GroupSize
+		body["strict_group_size"] = opt.StrictGroupSize
+	}
+	if opt.IgnoreGrowing {
+		body["ignore_growing"] = true
+	}
+	if len(opt.AnnParam) > 0 {
+		body["ann_param"] = opt.AnnParam
+	}
+	if len(opt.SearchParams) > 0 {
+		body["search_params"] = opt.SearchParams
+	}
+	if opt.FunctionReranker != "" {
+		body["function_reranker"] = opt.FunctionReranker
+	}
+	if len(opt.TemplateParams) > 0 {
+		body["template_params"] = opt.TemplateParams
+	}
 	var hits []searchHitJSON
 	if err := c.do(ctx, http.MethodPost, "/v1/collections/"+opt.Collection+"/search", body, &hits); err != nil {
 		return nil, err
@@ -168,7 +220,8 @@ func (c *Client) SearchResultSet(ctx context.Context, opt *SearchOption) (*entit
 	return searchHitsToResultSet(hits), nil
 }
 
-// Query runs filter-only retrieval.
+// Query runs filter-only retrieval. Use `WithIDs` for primary-key lookup
+// (Milvus's `Get`) or `WithFilter` for arbitrary expressions.
 func (c *Client) Query(ctx context.Context, opt *QueryOption) (*entity.ResultSet, error) {
 	body := map[string]any{
 		"filter":        filterBody(opt.FilterExpr, opt.FilterJSON),
@@ -178,6 +231,15 @@ func (c *Client) Query(ctx context.Context, opt *QueryOption) (*entity.ResultSet
 		"output_fields": opt.OutputFields,
 		"with_payload":  opt.IncludePayload,
 		"with_vector":   opt.IncludeVector,
+	}
+	if len(opt.Partitions) > 0 {
+		body["partitions"] = opt.Partitions
+	}
+	if opt.ConsistencyLevel != "" {
+		body["consistency_level"] = opt.ConsistencyLevel
+	}
+	if len(opt.TemplateParams) > 0 {
+		body["template_params"] = opt.TemplateParams
 	}
 	var out queryResp
 	if err := c.do(ctx, http.MethodPost, "/v1/collections/"+opt.Collection+"/query", body, &out); err != nil {

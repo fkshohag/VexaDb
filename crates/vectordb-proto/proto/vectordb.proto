@@ -80,6 +80,10 @@ service VectorService {
   // Replica info (collection-level introspection used by ResourceGroup tooling).
   rpc DescribeReplica(DescribeReplicaRequest) returns (DescribeReplicaResponse);
   rpc TransferReplica(TransferReplicaRequest) returns (TransferReplicaResponse);
+  // Multi-vector / multi-leg ANN search (Milvus-parity HybridSearch).
+  rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
+  // Text analyzer diagnostics (Milvus RunAnalyzer).
+  rpc RunAnalyzer(RunAnalyzerRequest) returns (RunAnalyzerResponse);
 }
 
 message ApplyRbacRequest {
@@ -300,6 +304,11 @@ message StatsResponse {
 message DeleteRequest {
   string collection = 1;
   repeated string ids = 2;
+  // Optional filter expression. When set together with `ids`, the engine
+  // deletes the union of both.
+  string filter = 3;
+  // Optional partition scope (Milvus-parity). Empty = all partitions.
+  string partition = 4;
 }
 
 message DeleteResponse {
@@ -369,6 +378,16 @@ message ScrollRequest {
   string collection = 1;
   string cursor = 2;
   uint32 limit = 3;
+  // Optional filter expression (Milvus parity). Empty = no filter.
+  string filter = 4;
+  // Optional partition scope. Empty = all partitions.
+  string partition = 5;
+  // Output controls. `output_fields` is informational on the server today
+  // (every field of the payload is returned); the SDK uses it to slice
+  // the result.
+  repeated string output_fields = 6;
+  bool with_payload = 7;
+  bool with_vector = 8;
 }
 
 message ScrollResponse {
@@ -721,3 +740,76 @@ message TransferReplicaRequest {
   string database = 5;
 }
 message TransferReplicaResponse {}
+
+// ---- HybridSearch (Milvus parity) ---------------------------------------
+
+message AnnRequest {
+  // Vector field name. Informational on VexaDb today; the server picks the
+  // physical index based on which of `dense_query`/`sparse_query`/`text_query`
+  // is set.
+  string field = 1;
+  uint32 limit = 2;
+  // Exactly one of the three should be set.
+  repeated float dense_query = 3;
+  SparseVector sparse_query = 4;
+  string text_query = 5;
+  // Optional per-leg filter expression.
+  string filter = 6;
+}
+
+message HybridSearchRequest {
+  string collection = 1;
+  uint32 limit = 2;
+  repeated AnnRequest requests = 3;
+  // Reranker selection. `kind` is one of `rrf`, `weighted`, `function`.
+  // `weights` is only honored when kind == `weighted`; length must match
+  // `requests.len()` (missing entries default to 1.0).
+  string reranker_kind = 4;
+  repeated float reranker_weights = 5;
+  // Output controls (same shape as Search).
+  repeated string output_fields = 6;
+  bool with_payload = 7;
+  bool with_vector = 8;
+  // Optional partition scope.
+  repeated string partitions = 9;
+}
+
+message HybridSearchResponse {
+  repeated ScoredPoint hits = 1;
+}
+
+// ---- RunAnalyzer (Milvus parity) ----------------------------------------
+
+message RunAnalyzerRequest {
+  // One or more input strings.
+  repeated string text = 1;
+  // Optional analyzer params (JSON-encoded for forward compat).
+  string analyzer_params_json = 2;
+  // Comma-separated analyzer names (Milvus collection / field analyzer).
+  // VexaDb uses BM25 tokenizer regardless; the field is preserved for
+  // forward compatibility.
+  repeated string analyzer_name = 3;
+  // Optional collection + field reference (mirrors WithField in Milvus).
+  string collection = 4;
+  string field = 5;
+  // Include per-token detail (offsets, position, hash). Always populated
+  // by VexaDb; the field is kept for source compatibility.
+  bool with_detail = 6;
+  bool with_hash = 7;
+}
+
+message AnalyzerToken {
+  string token = 1;
+  uint64 start_offset = 2;
+  uint64 end_offset = 3;
+  uint64 position = 4;
+  uint64 hash = 5;
+}
+
+message AnalyzerResult {
+  repeated AnalyzerToken tokens = 1;
+}
+
+message RunAnalyzerResponse {
+  repeated AnalyzerResult results = 1;
+}

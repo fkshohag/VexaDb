@@ -1554,6 +1554,74 @@ impl CollectionEngine {
         self.commit_entry(&entry)
     }
 
+    /// Delete every point matching `filter`, optionally scoped to a single
+    /// partition. Mirrors Milvus's `Delete(WithExpr / WithPartition)`. Each
+    /// matching point is recorded as an individual WAL `Delete` entry so
+    /// replication and snapshots stay consistent.
+    ///
+    /// `partition = Some("_default")` matches both `_partition == "_default"`
+    /// payloads and points with no `_partition` tag (the back-compat rule).
+    /// Returns the number of points actually removed.
+    pub fn delete_by_filter(
+        &self,
+        collection: &str,
+        filter: Option<&Filter>,
+        partition: Option<&str>,
+    ) -> Result<u64> {
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
+        let victims: Vec<String> = {
+            let collections = self.collections.read();
+            let state = collections
+                .get(&fq)
+                .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
+            if let Some(p) = partition {
+                if !state.config.partitions.iter().any(|n| n == p) {
+                    return Err(EngineError::PartitionNotFound(p.to_string()));
+                }
+            }
+            let filter = filter.filter(|f| !f.is_empty());
+            state
+                .index
+                .iter_points()
+                .into_iter()
+                .filter_map(|(id, _)| {
+                    let payload = state.payloads.get(&id);
+                    if let Some(p) = partition {
+                        let in_part = match payload
+                            .and_then(|pl| pl.get(vectordb_core::PARTITION_PAYLOAD_FIELD))
+                        {
+                            Some(serde_json::Value::String(s)) => s == p,
+                            _ => p == vectordb_core::DEFAULT_PARTITION,
+                        };
+                        if !in_part {
+                            return None;
+                        }
+                    }
+                    let pass = match filter {
+                        Some(f) => payload.map(|p| f.matches(p)).unwrap_or(false),
+                        None => true,
+                    };
+                    if pass {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let mut deleted = 0u64;
+        for id in victims {
+            let entry = WalEntry::Delete {
+                collection: fq.clone(),
+                id,
+            };
+            self.commit_entry(&entry)?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
     /// Bulk import: one WAL record per chunk (default chunk size 500).
     pub fn bulk_upsert(
         &self,
@@ -1873,6 +1941,30 @@ impl CollectionEngine {
         Ok(hits)
     }
 
+    /// Multi-vector ANN search across several `AnnRequest`s. Mirrors
+    /// Milvus's `HybridSearch`: each request hits a different vector
+    /// "field" (dense / sparse / BM25 text) with its own top-k; results
+    /// are merged via `reranker` and truncated to `limit`.
+    pub fn hybrid_search_multi(
+        &self,
+        collection: &str,
+        requests: Vec<crate::search::AnnRequest<'_>>,
+        reranker: crate::search::Reranker,
+        limit: usize,
+        output: OutputOptions,
+    ) -> Result<Vec<ScoredPoint>> {
+        let fq = self.resolve_alias(collection);
+        self.ensure_collection_loaded(&fq)?;
+        let collections = self.collections.read();
+        let state = collections
+            .get(&fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
+        let mut hits = crate::search::hybrid_search_multi(state, requests, reranker, limit)
+            .map_err(EngineError::Core)?;
+        crate::output::attach_outputs(state, &mut hits, &output);
+        Ok(hits)
+    }
+
     /// Filter-only retrieval (no ANN). Supports pagination via `offset` + `limit`.
     pub fn query(
         &self,
@@ -1954,12 +2046,42 @@ impl CollectionEngine {
         cursor: &str,
         limit: usize,
     ) -> Result<(Vec<(String, Vector, Option<Value>)>, String)> {
+        let (rows, next) = self.scroll_filtered(collection, cursor, limit, None, None)?;
+        let chunk = rows
+            .into_iter()
+            .map(|(id, vec_opt, payload)| (id, vec_opt.unwrap_or_else(|| Vector::new(Vec::new())), payload))
+            .collect();
+        Ok((chunk, next))
+    }
+
+    /// Filter/partition-aware scroll. Mirrors Milvus's QueryIterator cursor:
+    /// callers pass an opaque `cursor` (an ID alphabetically — empty to
+    /// start) and a `batch_size`; the engine walks the index in id-order,
+    /// applies `filter` and partition scoping, and returns one batch plus
+    /// `next_cursor`. Empty `next_cursor` means the iteration is complete.
+    ///
+    /// Vectors are returned only when the caller explicitly asks via the
+    /// `OutputOptions`-like `include_vector` field in callers (the engine
+    /// always materializes the index vector here, callers can drop it).
+    pub fn scroll_filtered(
+        &self,
+        collection: &str,
+        cursor: &str,
+        batch_size: usize,
+        filter: Option<&Filter>,
+        partition: Option<&str>,
+    ) -> Result<(Vec<(String, Option<Vector>, Option<Value>)>, String)> {
         let fq = self.resolve_alias(collection);
         self.ensure_collection_loaded(&fq)?;
         let collections = self.collections.read();
         let state = collections
             .get(&fq)
             .ok_or_else(|| EngineError::CollectionNotFound(collection.to_string()))?;
+        if let Some(p) = partition {
+            if !state.config.partitions.iter().any(|n| n == p) {
+                return Err(EngineError::PartitionNotFound(p.to_string()));
+            }
+        }
         let mut all = state.index.iter_points();
         all.sort_by(|a, b| a.0.cmp(&b.0));
         let start = if cursor.is_empty() {
@@ -1969,20 +2091,86 @@ impl CollectionEngine {
                 .map(|i| i + 1)
                 .unwrap_or_else(|i| i)
         };
-        let end = (start + limit.max(1)).min(all.len());
-        let chunk: Vec<(String, Vector, Option<Value>)> = all[start..end]
-            .iter()
-            .map(|(id, vec)| {
-                let payload = state.payloads.get(id).cloned();
-                (id.clone(), vec.clone(), payload)
-            })
-            .collect();
-        let next = if end < all.len() {
+        let batch_size = batch_size.max(1);
+        let filter = filter.filter(|f| !f.is_empty());
+        let mut chunk: Vec<(String, Option<Vector>, Option<Value>)> = Vec::new();
+        let mut last_idx = start;
+        for i in start..all.len() {
+            let (id, vec) = &all[i];
+            let payload = state.payloads.get(id);
+            if let Some(p) = partition {
+                let in_part = match payload.and_then(|pl| pl.get(vectordb_core::PARTITION_PAYLOAD_FIELD)) {
+                    Some(serde_json::Value::String(s)) => s == p,
+                    _ => p == vectordb_core::DEFAULT_PARTITION,
+                };
+                if !in_part {
+                    last_idx = i;
+                    continue;
+                }
+            }
+            if let Some(f) = filter {
+                let matches = payload.map(|pl| f.matches(pl)).unwrap_or(false);
+                if !matches {
+                    last_idx = i;
+                    continue;
+                }
+            }
+            chunk.push((id.clone(), Some(vec.clone()), payload.cloned()));
+            last_idx = i;
+            if chunk.len() >= batch_size {
+                break;
+            }
+        }
+        let next = if last_idx + 1 < all.len() {
             chunk.last().map(|(id, _, _)| id.clone()).unwrap_or_default()
         } else {
             String::new()
         };
         Ok((chunk, next))
+    }
+
+    /// Tokenize text with the same pipeline BM25 uses. Optional `stop_words`
+    /// removes specified tokens after lowercasing. Mirrors Milvus's
+    /// `RunAnalyzer` for diagnostics; returns one token list per input.
+    pub fn analyze_text(
+        &self,
+        inputs: &[String],
+        stop_words: &[String],
+    ) -> Result<Vec<Vec<AnalyzedToken>>> {
+        use std::collections::HashSet;
+        let stop: HashSet<String> = stop_words.iter().map(|s| s.to_lowercase()).collect();
+        let out = inputs
+            .iter()
+            .map(|text| {
+                let tokens = vectordb_core::tokenize(text);
+                let mut start = 0usize;
+                let mut result = Vec::with_capacity(tokens.len());
+                for tok in tokens {
+                    if stop.contains(&tok) {
+                        start += tok.len();
+                        continue;
+                    }
+                    // Use byte position in original text to find offsets;
+                    // best-effort since tokenization lowercases.
+                    let lc = text.to_lowercase();
+                    let pos = lc[start..]
+                        .find(&tok)
+                        .map(|p| start + p)
+                        .unwrap_or(start);
+                    let end_byte = pos + tok.len();
+                    result.push(AnalyzedToken {
+                        token: tok.clone(),
+                        start_offset: pos,
+                        end_offset: end_byte,
+                        position: result.len(),
+                        hash: stable_hash(&tok),
+                    });
+                    start = end_byte;
+                }
+                result
+            })
+            .collect();
+        Ok(out)
     }
 
     pub fn stats(&self, collection: &str) -> Result<CollectionStats> {
@@ -2269,6 +2457,31 @@ pub struct CollectionStats {
     pub bm25_text_field: String,
     pub payload_index_count: usize,
     pub scalar_quantization: bool,
+}
+
+/// One token emitted by [`CollectionEngine::analyze_text`]. Mirrors the
+/// information Milvus's `RunAnalyzer` returns: surface form, position
+/// inside the input text, and a stable 64-bit hash useful for matching the
+/// BM25 inverted index posting order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzedToken {
+    pub token: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub position: usize,
+    pub hash: u64,
+}
+
+/// FNV-1a 64 — used by `analyze_text` to surface a deterministic token
+/// hash without pulling a heavier crate in. Not cryptographically strong;
+/// callers should treat it as opaque.
+fn stable_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 fn matches_filter(state: &CollectionState, filter: Option<&Filter>, id: &str) -> bool {
@@ -2896,6 +3109,99 @@ mod m4_tests {
             engine.partition_stats("parts", "hot").unwrap_err(),
             EngineError::PartitionNotFound(_)
         ));
+    }
+
+    #[test]
+    fn delete_by_filter_and_partition_remove_only_matches() {
+        let (_dir, engine) = open_engine_with_collection("dbf");
+        engine
+            .commit_meta(MetaOp::CreatePartition {
+                collection: "dbf".into(),
+                database: vectordb_core::DEFAULT_DATABASE.into(),
+                partition: "hot".into(),
+            })
+            .unwrap();
+        for (id, color) in [("d1", "red"), ("d2", "blue"), ("d3", "red")] {
+            engine
+                .upsert(
+                    "dbf",
+                    id.into(),
+                    Vector::new(vec![0.0, 0.0, 0.0, 0.0]),
+                    Some(format!(r#"{{"color":"{color}"}}"#).into_bytes()),
+                    None,
+                )
+                .unwrap();
+        }
+        for (id, color) in [("h1", "red"), ("h2", "green")] {
+            engine
+                .upsert_in_partition(
+                    "dbf",
+                    "hot",
+                    id.into(),
+                    Vector::new(vec![0.0, 0.0, 0.0, 1.0]),
+                    Some(format!(r#"{{"color":"{color}"}}"#).into_bytes()),
+                    None,
+                )
+                .unwrap();
+        }
+        // Delete every red point in the default partition only.
+        let filter = vectordb_core::parse_filter_expr("color == 'red'").unwrap();
+        let n = engine
+            .delete_by_filter(
+                "dbf",
+                Some(&filter),
+                Some(vectordb_core::DEFAULT_PARTITION),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "should delete d1 and d3 only");
+        assert_eq!(engine.stats("dbf").unwrap().vector_count, 3);
+        // h1 (hot) should still be present.
+        assert!(engine.get("dbf", "h1").unwrap().is_some());
+    }
+
+    #[test]
+    fn analyze_text_returns_tokens_with_offsets_and_stopwords() {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        let out = engine
+            .analyze_text(
+                &vec!["Hello world, hello again!".to_string()],
+                &vec![],
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        let toks: Vec<&str> = out[0].iter().map(|t| t.token.as_str()).collect();
+        assert_eq!(toks, vec!["hello", "world", "hello", "again"]);
+        // With stop word filter "hello":
+        let out2 = engine
+            .analyze_text(
+                &vec!["Hello world, hello again!".to_string()],
+                &vec!["hello".to_string()],
+            )
+            .unwrap();
+        let toks2: Vec<&str> = out2[0].iter().map(|t| t.token.as_str()).collect();
+        assert_eq!(toks2, vec!["world", "again"]);
+    }
+
+    #[test]
+    fn scroll_filtered_walks_only_matching_points() {
+        let (_dir, engine) = open_engine_with_collection("sf");
+        for (id, kind) in [("a", "x"), ("b", "y"), ("c", "x"), ("d", "y")] {
+            engine
+                .upsert(
+                    "sf",
+                    id.into(),
+                    Vector::new(vec![0.0, 0.0, 0.0, 0.0]),
+                    Some(format!(r#"{{"kind":"{kind}"}}"#).into_bytes()),
+                    None,
+                )
+                .unwrap();
+        }
+        let filter = vectordb_core::parse_filter_expr("kind == 'x'").unwrap();
+        let (rows, next) = engine.scroll_filtered("sf", "", 10, Some(&filter), None).unwrap();
+        let ids: Vec<String> = rows.into_iter().map(|(id, _, _)| id).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+        assert!(next.is_empty());
     }
 
     #[test]
