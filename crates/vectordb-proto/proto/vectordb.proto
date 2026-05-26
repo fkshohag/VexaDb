@@ -64,6 +64,13 @@ service VectorService {
   rpc CompactCollection(CompactCollectionRequest) returns (CompactCollectionResponse);
   rpc GetCompactionState(GetCompactionStateRequest) returns (GetCompactionStateResponse);
   rpc ListPersistentSegments(ListPersistentSegmentsRequest) returns (ListPersistentSegmentsResponse);
+  // Partitions (Create/Drop go through MetaOp::CreatePartition/DropPartition
+  // via op_json; read-side RPCs return data directly).
+  rpc CreatePartition(CreatePartitionRequest) returns (CreatePartitionResponse);
+  rpc DropPartition(DropPartitionRequest) returns (DropPartitionResponse);
+  rpc HasPartition(HasPartitionRequest) returns (HasPartitionResponse);
+  rpc ListPartitions(ListPartitionsRequest) returns (ListPartitionsResponse);
+  rpc GetPartitionStats(GetPartitionStatsRequest) returns (GetPartitionStatsResponse);
 }
 
 message ApplyRbacRequest {
@@ -573,4 +580,42 @@ message SegmentEntry {
 
 message ListPersistentSegmentsResponse {
   repeated SegmentEntry segments = 1;
+}
+
+// ---- Partition management (Milvus parity) --------------------------------
+
+message CreatePartitionRequest {
+  // JSON-encoded MetaOp::CreatePartition { collection, database, partition }.
+  bytes op_json = 1;
+}
+message CreatePartitionResponse {}
+
+message DropPartitionRequest {
+  // JSON-encoded MetaOp::DropPartition { collection, database, partition }.
+  bytes op_json = 1;
+}
+message DropPartitionResponse {}
+
+message HasPartitionRequest {
+  string collection = 1;
+  string partition = 2;
+}
+message HasPartitionResponse {
+  bool exists = 1;
+}
+
+message ListPartitionsRequest {
+  string collection = 1;
+}
+message ListPartitionsResponse {
+  repeated string partitions = 1;
+}
+
+message GetPartitionStatsRequest {
+  string collection = 1;
+  string partition = 2;
+}
+message GetPartitionStatsResponse {
+  // Free-form key/value stats: at minimum {row_count, partition_name, collection}.
+  map<string, string> stats = 1;
 }

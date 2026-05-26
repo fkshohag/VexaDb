@@ -319,6 +319,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/collections/:name/compact", post(compact_collection_route))
         .route("/v1/compactions/:id", get(get_compaction_state_route))
         .route("/v1/collections/:name/segments", get(list_segments_route))
+        // ---- Partitions (Milvus parity) -----------------------------------
+        .route(
+            "/v1/collections/:name/partitions",
+            get(list_partitions_route).post(create_partition_route),
+        )
+        .route(
+            "/v1/collections/:name/partitions/:partition",
+            get(has_partition_route).delete(drop_partition_route),
+        )
+        .route(
+            "/v1/collections/:name/partitions/:partition/stats",
+            get(get_partition_stats_route),
+        )
         .route("/v1/admin/compact-wal", post(compact_wal))
         .route("/v1/admin/rebalance", post(trigger_rebalance).get(rebalance_status))
         .route("/v1/admin/cluster", get(cluster_status))
@@ -1405,6 +1418,107 @@ async fn list_segments_route(
         })
         .collect();
     Ok(Json(serde_json::json!(segments)))
+}
+
+// ---- Partitions (Milvus parity) ----------------------------------------
+
+#[derive(Debug, serde::Deserialize)]
+struct CreatePartitionBody {
+    partition_name: String,
+}
+
+async fn create_partition_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<CreatePartitionBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let op = serde_json::json!({
+        "CreatePartition": {
+            "collection": name,
+            "database": db,
+            "partition": body.partition_name,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .create_partition(bytes)
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn drop_partition_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, partition)): Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let op = serde_json::json!({
+        "DropPartition": {
+            "collection": name,
+            "database": db,
+            "partition": partition,
+        }
+    });
+    let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut client = state.client.lock().await;
+    client
+        .drop_partition(bytes)
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+async fn has_partition_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, partition)): Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let exists = client
+        .has_partition(&fqn, &partition)
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "exists": exists })))
+}
+
+async fn list_partitions_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let parts = client
+        .list_partitions(&fqn)
+        .await
+        .map_err(map_index_grpc_err)?;
+    Ok(Json(serde_json::json!({ "partitions": parts })))
+}
+
+async fn get_partition_stats_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((name, partition)): Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let db = current_db(&headers);
+    let fqn = fq(&db, &name);
+    let mut client = state.client.lock().await;
+    let stats = client
+        .get_partition_stats(&fqn, &partition)
+        .await
+        .map_err(map_index_grpc_err)?;
+    let map: serde_json::Map<String, Value> = stats
+        .into_iter()
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+    Ok(Json(Value::Object(map)))
 }
 
 fn map_index_grpc_err(e: anyhow::Error) -> StatusCode {

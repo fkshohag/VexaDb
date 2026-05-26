@@ -28,12 +28,16 @@ type mgmtStubGateway struct {
 	indexes              map[string][]storedIndex // collection -> indexes
 	knownCollections     map[string]bool
 	compactions          map[uint64]storedCompaction
+	partitions           map[string][]string // collection -> partition names
+	partitionRows        map[string]map[string]int
 	createCalls          atomic.Int32
 	dropCalls            atomic.Int32
 	flushCalls           atomic.Int32
 	compactCalls         atomic.Int32
 	loadCalls            atomic.Int32
 	releaseCalls         atomic.Int32
+	createPartCalls      atomic.Int32
+	dropPartCalls        atomic.Int32
 	lastCreateBody       atomic.Pointer[map[string]any]
 	lastAlterPropsBody   atomic.Pointer[map[string]any]
 	lastDropPropsBody    atomic.Pointer[map[string]any]
@@ -63,6 +67,8 @@ func newMgmtStub() *mgmtStubGateway {
 		indexes:          map[string][]storedIndex{},
 		knownCollections: map[string]bool{"docs": true},
 		compactions:      map[uint64]storedCompaction{},
+		partitions:       map[string][]string{"docs": {"_default"}},
+		partitionRows:    map[string]map[string]int{"docs": {"_default": 0}},
 	}
 	s.nextCompaction.Store(1)
 	return s
@@ -112,6 +118,8 @@ func (s *mgmtStubGateway) handleCollection(w http.ResponseWriter, r *http.Reques
 	switch segment {
 	case "indexes":
 		s.handleIndexes(w, r, name, rest)
+	case "partitions":
+		s.handlePartitions(w, r, name, rest)
 	case "load":
 		if r.Method == http.MethodPost {
 			s.loadCalls.Add(1)
@@ -257,6 +265,118 @@ func (s *mgmtStubGateway) handleIndexes(w http.ResponseWriter, r *http.Request, 
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *mgmtStubGateway) handlePartitions(w http.ResponseWriter, r *http.Request, name string, rest []string) {
+	switch {
+	case len(rest) == 0 && r.Method == http.MethodGet:
+		s.mu.Lock()
+		parts := append([]string(nil), s.partitions[name]...)
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"partitions": parts})
+
+	case len(rest) == 0 && r.Method == http.MethodPost:
+		raw, _ := io.ReadAll(r.Body)
+		var body struct {
+			PartitionName string `json:"partition_name"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil || body.PartitionName == "" {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		s.createPartCalls.Add(1)
+		s.mu.Lock()
+		for _, p := range s.partitions[name] {
+			if p == body.PartitionName {
+				s.mu.Unlock()
+				http.Error(w, "partition exists", http.StatusBadRequest)
+				return
+			}
+		}
+		s.partitions[name] = append(s.partitions[name], body.PartitionName)
+		if s.partitionRows[name] == nil {
+			s.partitionRows[name] = map[string]int{}
+		}
+		s.partitionRows[name][body.PartitionName] = 0
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+
+	case len(rest) == 1 && r.Method == http.MethodGet:
+		partition := rest[0]
+		s.mu.Lock()
+		exists := false
+		for _, p := range s.partitions[name] {
+			if p == partition {
+				exists = true
+				break
+			}
+		}
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"exists": exists})
+
+	case len(rest) == 1 && r.Method == http.MethodDelete:
+		partition := rest[0]
+		if partition == "_default" {
+			http.Error(w, "cannot drop default partition", http.StatusBadRequest)
+			return
+		}
+		s.dropPartCalls.Add(1)
+		s.mu.Lock()
+		found := false
+		out := make([]string, 0, len(s.partitions[name]))
+		for _, p := range s.partitions[name] {
+			if p == partition {
+				found = true
+				continue
+			}
+			out = append(out, p)
+		}
+		s.partitions[name] = out
+		delete(s.partitionRows[name], partition)
+		s.mu.Unlock()
+		if !found {
+			http.Error(w, "partition not found", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+
+	case len(rest) == 2 && rest[1] == "stats" && r.Method == http.MethodGet:
+		partition := rest[0]
+		s.mu.Lock()
+		rows, ok := s.partitionRows[name][partition]
+		s.mu.Unlock()
+		if !ok {
+			http.Error(w, "partition not found", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"row_count":      itoa(rows),
+			"partition_name": partition,
+			"collection":     "default/" + name,
+		})
+
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	buf := make([]byte, 0, 16)
+	for n > 0 {
+		buf = append([]byte{byte('0' + n%10)}, buf...)
+		n /= 10
+	}
+	if neg {
+		buf = append([]byte{'-'}, buf...)
+	}
+	return string(buf)
 }
 
 func (s *mgmtStubGateway) handleCompaction(w http.ResponseWriter, r *http.Request) {
@@ -577,5 +697,120 @@ func TestRefreshLoad(t *testing.T) {
 	}
 	if err := task.Await(ctx); err != nil {
 		t.Fatalf("Await: %v", err)
+	}
+}
+
+// ---- Partitions ----------------------------------------------------------
+
+func TestCreateListHasPartition(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+
+	// Fresh collection starts with only _default.
+	names, err := cli.ListPartitions(ctx, NewListPartitionOption("docs"))
+	if err != nil {
+		t.Fatalf("ListPartitions: %v", err)
+	}
+	if len(names) != 1 || names[0] != "_default" {
+		t.Fatalf("expected only _default, got %v", names)
+	}
+
+	if err := cli.CreatePartition(ctx, NewCreatePartitionOption("docs", "hot")); err != nil {
+		t.Fatalf("CreatePartition: %v", err)
+	}
+	if got := stub.createPartCalls.Load(); got != 1 {
+		t.Fatalf("createPartCalls=%d want 1", got)
+	}
+
+	has, err := cli.HasPartition(ctx, NewHasPartitionOption("docs", "hot"))
+	if err != nil {
+		t.Fatalf("HasPartition: %v", err)
+	}
+	if !has {
+		t.Fatalf("HasPartition(hot)=false")
+	}
+
+	has, err = cli.HasPartition(ctx, NewHasPartitionOption("docs", "cold"))
+	if err != nil {
+		t.Fatalf("HasPartition cold: %v", err)
+	}
+	if has {
+		t.Fatalf("HasPartition(cold)=true")
+	}
+
+	names, _ = cli.ListPartitions(ctx, NewListPartitionOption("docs"))
+	if len(names) != 2 {
+		t.Fatalf("expected 2 partitions after create, got %v", names)
+	}
+}
+
+func TestDropPartition(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+
+	_ = cli.CreatePartition(ctx, NewCreatePartitionOption("docs", "warm"))
+	if err := cli.DropPartition(ctx, NewDropPartitionOption("docs", "warm")); err != nil {
+		t.Fatalf("DropPartition: %v", err)
+	}
+	if got := stub.dropPartCalls.Load(); got != 1 {
+		t.Fatalf("dropPartCalls=%d want 1", got)
+	}
+	has, _ := cli.HasPartition(ctx, NewHasPartitionOption("docs", "warm"))
+	if has {
+		t.Fatalf("warm partition should be gone")
+	}
+
+	// Cannot drop default.
+	if err := cli.DropPartition(ctx, NewDropPartitionOption("docs", "_default")); err == nil {
+		t.Fatalf("expected error dropping _default")
+	}
+}
+
+func TestGetPartitionStats(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+
+	stub.mu.Lock()
+	stub.partitionRows["docs"]["_default"] = 42
+	stub.mu.Unlock()
+
+	stats, err := cli.GetPartitionStats(ctx,
+		NewGetPartitionStatsOption("docs", "_default"))
+	if err != nil {
+		t.Fatalf("GetPartitionStats: %v", err)
+	}
+	if stats["row_count"] != "42" {
+		t.Fatalf("row_count = %q want 42", stats["row_count"])
+	}
+	if stats["partition_name"] != "_default" {
+		t.Fatalf("partition_name = %q", stats["partition_name"])
+	}
+	if stats["collection"] != "default/docs" {
+		t.Fatalf("collection = %q", stats["collection"])
+	}
+}
+
+func TestPartitionOptionValidation(t *testing.T) {
+	stub := newMgmtStub()
+	cli, srv := newMgmtTestClient(t, stub)
+	defer srv.Close()
+	ctx := context.Background()
+	if err := cli.CreatePartition(ctx, NewCreatePartitionOption("", "p")); err == nil {
+		t.Fatal("expected error on empty collection")
+	}
+	if err := cli.CreatePartition(ctx, NewCreatePartitionOption("docs", "")); err == nil {
+		t.Fatal("expected error on empty partition")
+	}
+	if _, err := cli.HasPartition(ctx, NewHasPartitionOption("docs", "")); err == nil {
+		t.Fatal("expected error on empty partition for HasPartition")
+	}
+	if _, err := cli.ListPartitions(ctx, &ListPartitionsOption{}); err == nil {
+		t.Fatal("expected error on empty collection for ListPartitions")
 	}
 }

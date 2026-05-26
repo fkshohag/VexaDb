@@ -8,16 +8,17 @@ use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
     AddPayloadIndexRequest, AlterDatabaseRequest, ApplyRbacRequest, BulkUpsertRequest,
     CollectionSpec, CompactCollectionRequest, CompactWalRequest, CompactWalResponse,
-    CreateCollectionRequest, CreateDatabaseRequest, CreateSnapshotRequest, DatabaseInfo,
-    DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest, DescribeAliasRequest,
-    DescribeCollectionRequest, DescribeDatabaseRequest, DistanceMetric, DropDatabaseRequest,
-    DropPayloadIndexRequest, FlushCollectionRequest, FlushCollectionResponse,
-    GetCompactionStateRequest, GetCompactionStateResponse, GetRbacSnapshotRequest, GetRequest,
+    CreateCollectionRequest, CreateDatabaseRequest, CreatePartitionRequest, CreateSnapshotRequest,
+    DatabaseInfo, DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest,
+    DescribeAliasRequest, DescribeCollectionRequest, DescribeDatabaseRequest, DistanceMetric,
+    DropDatabaseRequest, DropPartitionRequest, DropPayloadIndexRequest, FlushCollectionRequest,
+    FlushCollectionResponse, GetCompactionStateRequest, GetCompactionStateResponse,
+    GetPartitionStatsRequest, GetRbacSnapshotRequest, GetRequest, HasPartitionRequest,
     HealthRequest, HealthResponse, ImportChunk, ListAliasesRequest, ListCollectionsRequest,
-    ListDatabasesRequest, ListPersistentSegmentsRequest, ListPersistentSegmentsResponse,
-    ListSnapshotsRequest, MutateCollectionMetaRequest, QueryRequest, QueryResponse,
-    ReindexCollectionRequest, ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest,
-    StatsResponse, UpsertRequest, VectorPoint,
+    ListDatabasesRequest, ListPartitionsRequest, ListPersistentSegmentsRequest,
+    ListPersistentSegmentsResponse, ListSnapshotsRequest, MutateCollectionMetaRequest,
+    QueryRequest, QueryResponse, ReindexCollectionRequest, ReindexCollectionResponse,
+    SearchRequest, SnapshotInfo, StatsRequest, StatsResponse, UpsertRequest, VectorPoint,
 };
 use vectordb_proto::VectorServiceClient;
 
@@ -319,6 +320,68 @@ impl VectorDbClient {
             .await?
             .into_inner();
         Ok(resp)
+    }
+
+    // ---- Partition management (Milvus parity) -------------------------------
+
+    /// Create a partition via a JSON-encoded `MetaOp::CreatePartition`.
+    pub async fn create_partition(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .create_partition(self.authed(CreatePartitionRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a partition via a JSON-encoded `MetaOp::DropPartition`. Cascades:
+    /// the engine deletes every point tagged with the partition.
+    pub async fn drop_partition(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_partition(self.authed(DropPartitionRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn has_partition(
+        &mut self,
+        collection: &str,
+        partition: &str,
+    ) -> anyhow::Result<bool> {
+        let resp = self
+            .inner
+            .has_partition(self.authed(HasPartitionRequest {
+                collection: collection.to_string(),
+                partition: partition.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.exists)
+    }
+
+    pub async fn list_partitions(&mut self, collection: &str) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .inner
+            .list_partitions(self.authed(ListPartitionsRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.partitions)
+    }
+
+    pub async fn get_partition_stats(
+        &mut self,
+        collection: &str,
+        partition: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let resp = self
+            .inner
+            .get_partition_stats(self.authed(GetPartitionStatsRequest {
+                collection: collection.to_string(),
+                partition: partition.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.stats)
     }
 
     pub async fn upsert(

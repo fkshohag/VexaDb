@@ -69,6 +69,12 @@ pub enum Privilege {
     Compact,
     GetCompactionState,
     GetPersistentSegmentInfo,
+    // Partition management (Milvus parity, collection-scoped).
+    CreatePartition,
+    DropPartition,
+    DescribePartition,
+    ShowPartitions,
+    GetPartitionStatistics,
     // Data plane
     Search,
     Query,
@@ -111,6 +117,11 @@ impl Privilege {
         Privilege::Compact,
         Privilege::GetCompactionState,
         Privilege::GetPersistentSegmentInfo,
+        Privilege::CreatePartition,
+        Privilege::DropPartition,
+        Privilege::DescribePartition,
+        Privilege::ShowPartitions,
+        Privilege::GetPartitionStatistics,
         Privilege::Search,
         Privilege::Query,
         Privilege::Insert,
@@ -151,6 +162,11 @@ impl Privilege {
             Privilege::Compact => "Compact",
             Privilege::GetCompactionState => "GetCompactionState",
             Privilege::GetPersistentSegmentInfo => "GetPersistentSegmentInfo",
+            Privilege::CreatePartition => "CreatePartition",
+            Privilege::DropPartition => "DropPartition",
+            Privilege::DescribePartition => "DescribePartition",
+            Privilege::ShowPartitions => "ShowPartitions",
+            Privilege::GetPartitionStatistics => "GetPartitionStatistics",
             Privilege::Search => "Search",
             Privilege::Query => "Query",
             Privilege::Insert => "Insert",
@@ -192,7 +208,13 @@ impl Privilege {
             | Privilege::Flush
             | Privilege::Compact
             | Privilege::GetCompactionState
-            | Privilege::GetPersistentSegmentInfo => ObjectType::Collection,
+            | Privilege::GetPersistentSegmentInfo
+            // Partition management — collection-scoped (Milvus parity).
+            | Privilege::CreatePartition
+            | Privilege::DropPartition
+            | Privilege::DescribePartition
+            | Privilege::ShowPartitions
+            | Privilege::GetPartitionStatistics => ObjectType::Collection,
             _ => ObjectType::Global,
         }
     }

@@ -109,6 +109,23 @@ pub struct CollectionConfig {
     /// some well-known keys (see `well_known_properties`) influence runtime.
     #[serde(default)]
     pub properties: std::collections::BTreeMap<String, String>,
+    /// Logical partitions inside the collection. Mirrors Milvus's
+    /// per-collection partition model: every collection has at least
+    /// [`DEFAULT_PARTITION`]; upserts are tagged with `_partition` payload
+    /// and searches/queries may filter by partition name.
+    #[serde(default = "default_partitions")]
+    pub partitions: Vec<String>,
+}
+
+/// Default partition automatically attached to every collection.
+pub const DEFAULT_PARTITION: &str = "_default";
+
+/// System payload field used to tag a point's partition. Reserved — users
+/// cannot upsert this field directly.
+pub const PARTITION_PAYLOAD_FIELD: &str = "_partition";
+
+fn default_partitions() -> Vec<String> {
+    vec![DEFAULT_PARTITION.to_string()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -160,6 +177,7 @@ impl CollectionConfig {
             bm25_text_field: None,
             quantization: None,
             properties: std::collections::BTreeMap::new(),
+            partitions: default_partitions(),
         }
     }
 

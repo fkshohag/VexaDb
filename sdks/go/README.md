@@ -187,11 +187,67 @@ for _, s := range segs {
 - **Scalar index types**: `INVERTED` / `BITMAP` / `TRIE` → VexaDb's
   `keyword` payload index; `STL_SORT` → `numeric`; sparse → `sparse`.
 - **Load**: always `Loaded`/`100%` for existing collections.
-- **Partitions**: VexaDb has none. `LoadPartitions`/`ReleasePartitions`
-  alias to the whole-collection variants.
+- **Partitions**: see the [Partitions](#partitions-milvus-v26-parity) section
+  below. `LoadPartitions`/`ReleasePartitions` from the Management surface
+  still alias to whole-collection load/release because VexaDb is
+  always-resident.
 - **Compaction IDs**: minted from epoch-ms so they sort chronologically;
   state lookups only resolve on the originating shard (single-shard
   cluster: always works).
+
+## Partitions (Milvus v2.6 parity)
+
+VexaDb implements partitions as **logical subsets of a collection**: every
+collection ships with the built-in `_default` partition, and additional
+partitions are tracked in `CollectionConfig::partitions`. Upserts into a
+non-default partition stamp a reserved `_partition` payload field on the
+point, so partition filtering reuses the existing filter DSL and
+`DropPartition` is a true cascade that deletes the partition's data.
+
+```go
+import (
+    "github.com/vectordb/vectordb/sdks/go/vexaclient"
+)
+
+// Lifecycle
+_ = cli.CreatePartition(ctx,
+    vexaclient.NewCreatePartitionOption("docs", "hot"))
+
+ok, _ := cli.HasPartition(ctx,
+    vexaclient.NewHasPartitionOption("docs", "hot"))
+_ = ok
+
+names, _ := cli.ListPartitions(ctx,
+    vexaclient.NewListPartitionOption("docs"))
+// names => ["_default", "hot"]
+
+stats, _ := cli.GetPartitionStats(ctx,
+    vexaclient.NewGetPartitionStatsOption("docs", "hot"))
+// stats["row_count"], stats["partition_name"], stats["collection"]
+
+// DropPartition is a cascade: it deletes every point tagged with `hot`
+// in the same MetaOp, then removes the name from the collection config.
+_ = cli.DropPartition(ctx,
+    vexaclient.NewDropPartitionOption("docs", "hot"))
+```
+
+### Mapping notes
+
+- The `_default` partition is reserved and cannot be dropped; the server
+  returns `400 Bad Request` if you try.
+- Existing data inserted **before** the partition was created keeps its
+  original payload (no automatic backfill of `_partition`). Such points
+  count toward the `_default` partition's `row_count`.
+- Upserts that target a partition automatically inject
+  `payload._partition = "<name>"`. Searches/queries can scope to a
+  partition by adding `_partition == "<name>"` to the filter expression
+  (the existing filter DSL already understands this field).
+- Upserting into an unknown partition returns
+  `NotFound: partition not found: <name>` from the gateway.
+- RBAC privileges (`CreatePartition`, `DropPartition`, `DescribePartition`,
+  `ShowPartitions`, `GetPartitionStatistics`) are **collection-scoped** —
+  built-in roles `read_write` and `read_only` are already granted the
+  appropriate subset.
 
 ## Client management
 

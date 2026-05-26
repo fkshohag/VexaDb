@@ -142,6 +142,12 @@ impl RbacState {
             "Flush",
             "Compact",
             "GetPersistentSegmentInfo",
+            // Partition management — Milvus parity, collection-scoped.
+            "CreatePartition",
+            "DropPartition",
+            "DescribePartition",
+            "ShowPartitions",
+            "GetPartitionStatistics",
         ] {
             let obj = match p {
                 "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,
@@ -165,6 +171,10 @@ impl RbacState {
             "ListIndexes",
             "GetLoadState",
             "GetPersistentSegmentInfo",
+            // Partitions — read-side only.
+            "DescribePartition",
+            "ShowPartitions",
+            "GetPartitionStatistics",
         ] {
             let obj = match p {
                 "ListCollections" | "ListDatabases" | "DescribeDatabase" => ObjectType::Global,

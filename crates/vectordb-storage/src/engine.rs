@@ -78,6 +78,10 @@ pub enum EngineError {
     DatabaseNotFound(String),
     #[error("database not empty: {0} (use force=true to cascade drop)")]
     DatabaseNotEmpty(String),
+    #[error("partition not found: {0}")]
+    PartitionNotFound(String),
+    #[error("partition exists: {0}")]
+    PartitionExists(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -472,6 +476,39 @@ impl CollectionEngine {
                     return Err(EngineError::CollectionNotFound(collection.clone()));
                 }
             }
+            MetaOp::CreatePartition {
+                collection,
+                database,
+                partition,
+            } => {
+                check_simple_name(partition)?;
+                let fq = format!("{database}/{collection}");
+                let state = collections
+                    .get(&fq)
+                    .ok_or_else(|| EngineError::CollectionNotFound(collection.clone()))?;
+                if state.config.partitions.iter().any(|p| p == partition) {
+                    return Err(EngineError::PartitionExists(partition.clone()));
+                }
+            }
+            MetaOp::DropPartition {
+                collection,
+                database,
+                partition,
+            } => {
+                if partition == vectordb_core::DEFAULT_PARTITION {
+                    return Err(EngineError::InvalidMeta(format!(
+                        "the built-in `{}` partition cannot be dropped",
+                        vectordb_core::DEFAULT_PARTITION
+                    )));
+                }
+                let fq = format!("{database}/{collection}");
+                let state = collections
+                    .get(&fq)
+                    .ok_or_else(|| EngineError::CollectionNotFound(collection.clone()))?;
+                if !state.config.partitions.iter().any(|p| p == partition) {
+                    return Err(EngineError::PartitionNotFound(partition.clone()));
+                }
+            }
         }
         Ok(())
     }
@@ -539,6 +576,22 @@ impl CollectionEngine {
             } => {
                 let fq = format!("{database}/{collection}");
                 self.apply_drop_payload_index(&fq, field)
+            }
+            MetaOp::CreatePartition {
+                collection,
+                database,
+                partition,
+            } => {
+                let fq = format!("{database}/{collection}");
+                self.apply_create_partition(&fq, partition)
+            }
+            MetaOp::DropPartition {
+                collection,
+                database,
+                partition,
+            } => {
+                let fq = format!("{database}/{collection}");
+                self.apply_drop_partition(&fq, partition)
             }
         }
     }
@@ -750,6 +803,131 @@ impl CollectionEngine {
             .put(format!("collection:{fq}"), json)
             .map_err(|e| EngineError::Rocks(e.to_string()))?;
         Ok(())
+    }
+
+    fn apply_create_partition(&self, fq: &str, partition: &str) -> Result<()> {
+        let mut collections = self.collections.write();
+        let state = collections
+            .get_mut(fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.to_string()))?;
+        if state.config.partitions.iter().any(|p| p == partition) {
+            return Err(EngineError::PartitionExists(partition.to_string()));
+        }
+        state.config.partitions.push(partition.to_string());
+        let json =
+            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(format!("collection:{fq}"), json)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        Ok(())
+    }
+
+    fn apply_drop_partition(&self, fq: &str, partition: &str) -> Result<()> {
+        if partition == vectordb_core::DEFAULT_PARTITION {
+            return Err(EngineError::InvalidMeta(format!(
+                "the built-in `{}` partition cannot be dropped",
+                vectordb_core::DEFAULT_PARTITION
+            )));
+        }
+        let mut collections = self.collections.write();
+        let state = collections
+            .get_mut(fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.to_string()))?;
+        let before = state.config.partitions.len();
+        state.config.partitions.retain(|p| p != partition);
+        if state.config.partitions.len() == before {
+            // Caller treats DropPartition as authoritative (no idempotent
+            // silent success). Mirrors Milvus's error-on-missing semantics.
+            return Err(EngineError::PartitionNotFound(partition.to_string()));
+        }
+        // Mass-delete every point whose `_partition` payload tags into this
+        // partition. We collect IDs first to avoid mutating while iterating.
+        let field = vectordb_core::PARTITION_PAYLOAD_FIELD;
+        let victims: Vec<String> = state
+            .payloads
+            .iter()
+            .filter_map(|(id, payload)| match payload.get(field) {
+                Some(Value::String(s)) if s == partition => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        for id in &victims {
+            // Best-effort removal — if a backing index is missing the point
+            // we keep going so config is still updated.
+            let _ = state.index.remove(id);
+            state.payloads.remove(id);
+            state.payload_indexes.remove(id);
+            state.quantized.remove(id);
+            if let Some(idx) = &mut state.sparse_index {
+                idx.remove(id);
+            }
+            if let Some(bm25) = &mut state.bm25_index {
+                bm25.remove(id);
+            }
+        }
+        let json =
+            serde_json::to_vec(&state.config).map_err(|e| EngineError::Rocks(e.to_string()))?;
+        self.meta_db
+            .read()
+            .put(format!("collection:{fq}"), json)
+            .map_err(|e| EngineError::Rocks(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List partition names for a collection. Always non-empty (the
+    /// default partition is auto-created on collection creation).
+    pub fn list_partitions(&self, name: &str) -> Result<Vec<String>> {
+        let fq = self.resolve_alias(name);
+        let collections = self.collections.read();
+        let state = collections
+            .get(&fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.clone()))?;
+        Ok(state.config.partitions.clone())
+    }
+
+    /// Returns true iff `partition` exists in `collection`.
+    pub fn has_partition(&self, collection: &str, partition: &str) -> Result<bool> {
+        let fq = self.resolve_alias(collection);
+        let collections = self.collections.read();
+        let state = collections
+            .get(&fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.clone()))?;
+        Ok(state.config.partitions.iter().any(|p| p == partition))
+    }
+
+    /// Stats for a single partition: row count + collection metadata.
+    /// Returns `PartitionNotFound` if the partition is not declared.
+    pub fn partition_stats(
+        &self,
+        collection: &str,
+        partition: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        let fq = self.resolve_alias(collection);
+        let collections = self.collections.read();
+        let state = collections
+            .get(&fq)
+            .ok_or_else(|| EngineError::CollectionNotFound(fq.clone()))?;
+        if !state.config.partitions.iter().any(|p| p == partition) {
+            return Err(EngineError::PartitionNotFound(partition.to_string()));
+        }
+        let field = vectordb_core::PARTITION_PAYLOAD_FIELD;
+        // Count points carrying the partition tag. The default partition
+        // also picks up legacy / pre-partition points whose payload has no
+        // `_partition` field — they're treated as belonging to `_default`.
+        let row_count = state
+            .payloads
+            .iter()
+            .filter(|(_, payload)| match payload.get(field) {
+                Some(Value::String(s)) => s == partition,
+                _ => partition == vectordb_core::DEFAULT_PARTITION,
+            })
+            .count();
+        let mut out = std::collections::BTreeMap::new();
+        out.insert("row_count".to_string(), row_count.to_string());
+        out.insert("partition_name".to_string(), partition.to_string());
+        out.insert("collection".to_string(), fq);
+        Ok(out)
     }
 
     /// Resolve an alias to its target collection name. Input/output are FQN
@@ -1119,14 +1297,58 @@ impl CollectionEngine {
         payload: Option<Vec<u8>>,
         sparse: Option<SparseVector>,
     ) -> Result<()> {
+        self.upsert_in_partition(
+            collection,
+            vectordb_core::DEFAULT_PARTITION,
+            id,
+            vector,
+            payload,
+            sparse,
+        )
+    }
+
+    /// Partition-aware upsert. `partition` is validated against
+    /// `CollectionConfig::partitions`; when it's the default partition the
+    /// payload is left untouched (back-compat for pre-partition writers),
+    /// otherwise the engine injects a `_partition` tag into the payload so
+    /// the membership is queryable via the existing filter DSL and
+    /// `DropPartition` can find the points later.
+    pub fn upsert_in_partition(
+        &self,
+        collection: &str,
+        partition: &str,
+        id: String,
+        vector: Vector,
+        payload: Option<Vec<u8>>,
+        sparse: Option<SparseVector>,
+    ) -> Result<()> {
         let fq = self.resolve_alias(collection);
         self.ensure_collection_loaded(&fq)?;
+        let partition = if partition.is_empty() {
+            vectordb_core::DEFAULT_PARTITION
+        } else {
+            partition
+        };
+        {
+            let cols = self.collections.read();
+            let state = cols
+                .get(&fq)
+                .ok_or_else(|| EngineError::CollectionNotFound(fq.clone()))?;
+            if !state.config.partitions.iter().any(|p| p == partition) {
+                return Err(EngineError::PartitionNotFound(partition.to_string()));
+            }
+        }
+        let payload = if partition == vectordb_core::DEFAULT_PARTITION {
+            payload
+        } else {
+            Some(inject_partition_tag(payload, partition)?)
+        };
         let entry = WalEntry::Upsert {
             collection: fq,
-            id: id.clone(),
-            vector: vector.clone(),
-            payload: payload.clone(),
-            sparse: sparse.clone(),
+            id,
+            vector,
+            payload,
+            sparse,
         };
         self.commit_entry(&entry)
     }
@@ -1148,17 +1370,63 @@ impl CollectionEngine {
         points: Vec<BulkPoint>,
         chunk_size: usize,
     ) -> Result<u64> {
+        self.bulk_upsert_in_partition(
+            collection,
+            vectordb_core::DEFAULT_PARTITION,
+            points,
+            chunk_size,
+        )
+    }
+
+    /// Partition-aware bulk import. Same back-compat rule as
+    /// [`upsert_in_partition`]: payload is left untouched for the default
+    /// partition, otherwise each point's payload is tagged with
+    /// `_partition`. The partition is validated once up front.
+    pub fn bulk_upsert_in_partition(
+        &self,
+        collection: &str,
+        partition: &str,
+        points: Vec<BulkPoint>,
+        chunk_size: usize,
+    ) -> Result<u64> {
         let fq = self.resolve_alias(collection);
         self.ensure_collection_loaded(&fq)?;
         if points.is_empty() {
             return Ok(0);
         }
+        let partition = if partition.is_empty() {
+            vectordb_core::DEFAULT_PARTITION
+        } else {
+            partition
+        };
+        {
+            let cols = self.collections.read();
+            let state = cols
+                .get(&fq)
+                .ok_or_else(|| EngineError::CollectionNotFound(fq.clone()))?;
+            if !state.config.partitions.iter().any(|p| p == partition) {
+                return Err(EngineError::PartitionNotFound(partition.to_string()));
+            }
+        }
+        let needs_tag = partition != vectordb_core::DEFAULT_PARTITION;
         let chunk_size = chunk_size.max(1);
         let mut total = 0u64;
         for chunk in points.chunks(chunk_size) {
+            let owned: Vec<BulkPoint> = if needs_tag {
+                chunk
+                    .iter()
+                    .cloned()
+                    .map(|mut p| {
+                        p.payload = Some(inject_partition_tag(p.payload, partition)?);
+                        Ok::<_, EngineError>(p)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                chunk.to_vec()
+            };
             let entry = WalEntry::BulkUpsert {
                 collection: fq.clone(),
-                points: chunk.to_vec(),
+                points: owned,
             };
             self.commit_entry(&entry)?;
             total += chunk.len() as u64;
@@ -1707,6 +1975,33 @@ fn check_simple_name(name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Inject the `_partition` tag into the JSON payload, creating an object
+/// payload if none exists or wrapping non-object payloads under `_raw`.
+/// Returns the canonical JSON bytes; only called by partition-aware
+/// upsert paths.
+fn inject_partition_tag(payload: Option<Vec<u8>>, partition: &str) -> Result<Vec<u8>> {
+    let field = vectordb_core::PARTITION_PAYLOAD_FIELD;
+    let mut value = match payload {
+        Some(bytes) if !bytes.is_empty() => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                // Bytes weren't valid JSON; preserve them under `_raw` so
+                // we don't silently drop user data.
+                let raw = String::from_utf8_lossy(&bytes).to_string();
+                serde_json::json!({ "_raw": raw })
+            }
+        },
+        _ => Value::Object(serde_json::Map::new()),
+    };
+    if !value.is_object() {
+        value = serde_json::json!({ "_raw": value });
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(field.to_string(), Value::String(partition.to_string()));
+    }
+    serde_json::to_vec(&value).map_err(|e| EngineError::InvalidPayload(e.to_string()))
 }
 
 fn parse_payload(bytes: &[u8]) -> Result<Value> {
@@ -2291,5 +2586,140 @@ mod m4_tests {
             .search("idx", &[25.0, 0.0, 0.0, 0.0], 1, None, OutputOptions::default())
             .unwrap();
         assert_eq!(before[0].id, after[0].id);
+    }
+
+    // ---- Partition management (Milvus parity) ------------------------------
+
+    fn open_engine_with_collection(name: &str) -> (tempfile::TempDir, CollectionEngine) {
+        let dir = tempdir().unwrap();
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        engine.create_collection(test_config(name)).unwrap();
+        (dir, engine)
+    }
+
+    #[test]
+    fn new_collection_has_default_partition() {
+        let (_dir, engine) = open_engine_with_collection("parts");
+        let names = engine.list_partitions("parts").unwrap();
+        assert_eq!(names, vec![vectordb_core::DEFAULT_PARTITION.to_string()]);
+        assert!(engine
+            .has_partition("parts", vectordb_core::DEFAULT_PARTITION)
+            .unwrap());
+        assert!(!engine.has_partition("parts", "nope").unwrap());
+    }
+
+    #[test]
+    fn create_and_drop_partition_round_trips() {
+        let (_dir, engine) = open_engine_with_collection("parts");
+
+        engine
+            .commit_meta(MetaOp::CreatePartition {
+                collection: "parts".into(),
+                database: vectordb_core::DEFAULT_DATABASE.into(),
+                partition: "hot".into(),
+            })
+            .unwrap();
+        assert!(engine.has_partition("parts", "hot").unwrap());
+
+        // Duplicate create fails.
+        let err = engine
+            .commit_meta(MetaOp::CreatePartition {
+                collection: "parts".into(),
+                database: vectordb_core::DEFAULT_DATABASE.into(),
+                partition: "hot".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PartitionExists(_)));
+
+        engine
+            .commit_meta(MetaOp::DropPartition {
+                collection: "parts".into(),
+                database: vectordb_core::DEFAULT_DATABASE.into(),
+                partition: "hot".into(),
+            })
+            .unwrap();
+        assert!(!engine.has_partition("parts", "hot").unwrap());
+
+        // Dropping the default partition is rejected.
+        let err = engine
+            .commit_meta(MetaOp::DropPartition {
+                collection: "parts".into(),
+                database: vectordb_core::DEFAULT_DATABASE.into(),
+                partition: vectordb_core::DEFAULT_PARTITION.into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidMeta(_)));
+    }
+
+    #[test]
+    fn upsert_in_partition_tags_payload_and_drop_removes_points() {
+        let (_dir, engine) = open_engine_with_collection("parts");
+        engine
+            .commit_meta(MetaOp::CreatePartition {
+                collection: "parts".into(),
+                database: vectordb_core::DEFAULT_DATABASE.into(),
+                partition: "hot".into(),
+            })
+            .unwrap();
+
+        // 1 point in _default + 2 points in hot.
+        engine
+            .upsert(
+                "parts",
+                "d1".into(),
+                Vector::new(vec![1.0, 0.0, 0.0, 0.0]),
+                Some(br#"{"x":1}"#.to_vec()),
+                None,
+            )
+            .unwrap();
+        for (i, id) in ["h1", "h2"].iter().enumerate() {
+            engine
+                .upsert_in_partition(
+                    "parts",
+                    "hot",
+                    id.to_string(),
+                    Vector::new(vec![i as f32, 1.0, 0.0, 0.0]),
+                    Some(format!(r#"{{"x":{i}}}"#).into_bytes()),
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.stats("parts").unwrap().vector_count, 3);
+
+        let stats_default = engine
+            .partition_stats("parts", vectordb_core::DEFAULT_PARTITION)
+            .unwrap();
+        assert_eq!(stats_default.get("row_count").unwrap(), "1");
+        let stats_hot = engine.partition_stats("parts", "hot").unwrap();
+        assert_eq!(stats_hot.get("row_count").unwrap(), "2");
+
+        engine
+            .commit_meta(MetaOp::DropPartition {
+                collection: "parts".into(),
+                database: vectordb_core::DEFAULT_DATABASE.into(),
+                partition: "hot".into(),
+            })
+            .unwrap();
+        assert_eq!(engine.stats("parts").unwrap().vector_count, 1);
+        assert!(matches!(
+            engine.partition_stats("parts", "hot").unwrap_err(),
+            EngineError::PartitionNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn upsert_in_unknown_partition_errors() {
+        let (_dir, engine) = open_engine_with_collection("parts");
+        let err = engine
+            .upsert_in_partition(
+                "parts",
+                "nope",
+                "x".into(),
+                Vector::new(vec![0.0, 0.0, 0.0, 0.0]),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::PartitionNotFound(_)));
     }
 }

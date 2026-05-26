@@ -174,6 +174,12 @@ pub async fn bootstrap(ctx: &RbacContext, root_password: Option<&str>) -> anyhow
                 (ObjectType::Collection, "Flush"),
                 (ObjectType::Collection, "Compact"),
                 (ObjectType::Collection, "GetPersistentSegmentInfo"),
+                // Partitions (Milvus parity, collection-scoped).
+                (ObjectType::Collection, "CreatePartition"),
+                (ObjectType::Collection, "DropPartition"),
+                (ObjectType::Collection, "DescribePartition"),
+                (ObjectType::Collection, "ShowPartitions"),
+                (ObjectType::Collection, "GetPartitionStatistics"),
             ],
         ).await;
     }
@@ -193,6 +199,10 @@ pub async fn bootstrap(ctx: &RbacContext, root_password: Option<&str>) -> anyhow
                 (ObjectType::Collection, "ListIndexes"),
                 (ObjectType::Collection, "GetLoadState"),
                 (ObjectType::Collection, "GetPersistentSegmentInfo"),
+                // Partitions — read-side only.
+                (ObjectType::Collection, "DescribePartition"),
+                (ObjectType::Collection, "ShowPartitions"),
+                (ObjectType::Collection, "GetPartitionStatistics"),
             ],
         ).await;
     }
@@ -334,6 +344,14 @@ pub fn route_priv(method: &str, path: &str) -> Option<RoutePriv> {
         ("POST", ["v1", "collections", _, "compact"]) => c(Compact, 2),
         ("GET", ["v1", "compactions", _]) => g(GetCompactionState),
         ("GET", ["v1", "collections", _, "segments"]) => c(GetPersistentSegmentInfo, 2),
+        // Partitions (collection-scoped).
+        ("GET", ["v1", "collections", _, "partitions"]) => c(ShowPartitions, 2),
+        ("POST", ["v1", "collections", _, "partitions"]) => c(CreatePartition, 2),
+        ("GET", ["v1", "collections", _, "partitions", _]) => c(DescribePartition, 2),
+        ("DELETE", ["v1", "collections", _, "partitions", _]) => c(DropPartition, 2),
+        ("GET", ["v1", "collections", _, "partitions", _, "stats"]) => {
+            c(GetPartitionStatistics, 2)
+        }
         // RBAC management (everything under /v1/auth, /v1/users, /v1/roles,
         // /v1/privilege-groups, /v1/admin/rbac).
         ("POST", ["v1", "auth", "tokens"])

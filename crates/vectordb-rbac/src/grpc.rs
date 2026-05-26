@@ -150,6 +150,13 @@ pub fn method_priv(method: &str) -> Option<MethodPriv> {
         // privilege is global to mirror CompactWal.
         "GetCompactionState" => p(GetCompactionState, true),
         "ListPersistentSegments" => p(GetPersistentSegmentInfo, false),
+        // Partitions: Create/Drop encode the collection inside the MetaOp JSON
+        // so the server handler resolves the privilege per-call. Read-side RPCs
+        // resolve directly off `collection` in the request.
+        "CreatePartition" | "DropPartition" => None,
+        "HasPartition" => p(DescribePartition, false),
+        "ListPartitions" => p(ShowPartitions, false),
+        "GetPartitionStats" => p(GetPartitionStatistics, false),
         _ => None,
     }
 }

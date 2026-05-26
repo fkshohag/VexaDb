@@ -13,19 +13,21 @@ use vectordb_proto::vectordb::v1::{
     CollectionSpec, CompactCollectionRequest, CompactCollectionResponse,
     CompactionState as ProtoCompactionState, CompactWalRequest, CompactWalResponse,
     CreateCollectionRequest, CreateCollectionResponse, CreateDatabaseRequest,
-    CreateDatabaseResponse, CreateSnapshotRequest, CreateSnapshotResponse, DatabaseInfo,
-    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
-    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse,
-    DescribeCollectionRequest, DescribeCollectionResponse, DescribeDatabaseRequest,
-    DescribeDatabaseResponse, DistanceMetric as ProtoMetric, DropDatabaseRequest,
-    DropDatabaseResponse, DropPayloadIndexRequest, DropPayloadIndexResponse,
+    CreateDatabaseResponse, CreatePartitionRequest, CreatePartitionResponse, CreateSnapshotRequest,
+    CreateSnapshotResponse, DatabaseInfo, DeleteCollectionRequest, DeleteCollectionResponse,
+    DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
+    DescribeAliasRequest, DescribeAliasResponse, DescribeCollectionRequest,
+    DescribeCollectionResponse, DescribeDatabaseRequest, DescribeDatabaseResponse,
+    DistanceMetric as ProtoMetric, DropDatabaseRequest, DropDatabaseResponse, DropPartitionRequest,
+    DropPartitionResponse, DropPayloadIndexRequest, DropPayloadIndexResponse,
     FlushCollectionRequest, FlushCollectionResponse, GetCompactionStateRequest,
-    GetCompactionStateResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest,
-    GetResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
+    GetCompactionStateResponse, GetPartitionStatsRequest, GetPartitionStatsResponse,
+    GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest, GetResponse, HasPartitionRequest,
+    HasPartitionResponse, HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse,
     ListAliasesRequest, ListAliasesResponse, ListCollectionsRequest, ListCollectionsResponse,
-    ListDatabasesRequest, ListDatabasesResponse, ListPersistentSegmentsRequest,
-    ListPersistentSegmentsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    MutateCollectionMetaRequest, MutateCollectionMetaResponse,
+    ListDatabasesRequest, ListDatabasesResponse, ListPartitionsRequest, ListPartitionsResponse,
+    ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, MutateCollectionMetaRequest, MutateCollectionMetaResponse,
     PayloadFieldIndex as ProtoPayloadIndex, PayloadIndexKind as ProtoIndexKind, QueryRequest,
     QueryResponse, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
     RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest,
@@ -484,6 +486,13 @@ impl VectorService for VectorServiceImpl {
             | vectordb_storage::MetaOp::DropPayloadIndex { .. } => {
                 return Err(Status::invalid_argument(
                     "payload-index ops must use the AddPayloadIndex / DropPayloadIndex RPCs",
+                ));
+            }
+            // Partition ops belong on the dedicated CreatePartition / DropPartition RPCs.
+            vectordb_storage::MetaOp::CreatePartition { .. }
+            | vectordb_storage::MetaOp::DropPartition { .. } => {
+                return Err(Status::invalid_argument(
+                    "partition ops must use the CreatePartition / DropPartition RPCs",
                 ));
             }
         };
@@ -1013,6 +1022,82 @@ impl VectorService for VectorServiceImpl {
         }))
     }
 
+    // ---- Partitions (Milvus parity) -----------------------------------------
+
+    async fn create_partition(
+        &self,
+        request: Request<CreatePartitionRequest>,
+    ) -> Result<Response<CreatePartitionResponse>, Status> {
+        let op = parse_partition_meta_op(&request.get_ref().op_json)?;
+        ensure_create_partition(&op)?;
+        let target = partition_op_target(&op);
+        require_collection(&self.rbac, &request, &target, Privilege::CreatePartition)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(CreatePartitionResponse {}))
+    }
+
+    async fn drop_partition(
+        &self,
+        request: Request<DropPartitionRequest>,
+    ) -> Result<Response<DropPartitionResponse>, Status> {
+        let op = parse_partition_meta_op(&request.get_ref().op_json)?;
+        ensure_drop_partition(&op)?;
+        let target = partition_op_target(&op);
+        require_collection(&self.rbac, &request, &target, Privilege::DropPartition)?;
+        if let Some(rep) = &self.replicated {
+            rep.apply_meta(op)
+                .await
+                .map_err(|e| leader::map_raft_err(e, self.raft_ref()))?;
+        } else {
+            self.engine.commit_meta(op).map_err(map_engine_err)?;
+        }
+        Ok(Response::new(DropPartitionResponse {}))
+    }
+
+    async fn has_partition(
+        &self,
+        request: Request<HasPartitionRequest>,
+    ) -> Result<Response<HasPartitionResponse>, Status> {
+        let req = request.into_inner();
+        let exists = self
+            .engine
+            .has_partition(&req.collection, &req.partition)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(HasPartitionResponse { exists }))
+    }
+
+    async fn list_partitions(
+        &self,
+        request: Request<ListPartitionsRequest>,
+    ) -> Result<Response<ListPartitionsResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let partitions = self
+            .engine
+            .list_partitions(&collection)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(ListPartitionsResponse { partitions }))
+    }
+
+    async fn get_partition_stats(
+        &self,
+        request: Request<GetPartitionStatsRequest>,
+    ) -> Result<Response<GetPartitionStatsResponse>, Status> {
+        let req = request.into_inner();
+        let stats = self
+            .engine
+            .partition_stats(&req.collection, &req.partition)
+            .map_err(map_engine_err)?;
+        Ok(Response::new(GetPartitionStatsResponse {
+            stats: stats.into_iter().collect(),
+        }))
+    }
+
     async fn register_node(
         &self,
         _request: Request<RegisterNodeRequest>,
@@ -1241,6 +1326,44 @@ fn index_op_target(op: &vectordb_storage::MetaOp) -> String {
     }
 }
 
+/// Parse a MetaOp JSON payload destined for the partition RPCs.
+fn parse_partition_meta_op(bytes: &[u8]) -> Result<vectordb_storage::MetaOp, Status> {
+    serde_json::from_slice::<vectordb_storage::MetaOp>(bytes)
+        .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))
+}
+
+fn ensure_create_partition(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::CreatePartition { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument("expected MetaOp::CreatePartition"))
+    }
+}
+
+fn ensure_drop_partition(op: &vectordb_storage::MetaOp) -> Result<(), Status> {
+    if matches!(op, vectordb_storage::MetaOp::DropPartition { .. }) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument("expected MetaOp::DropPartition"))
+    }
+}
+
+fn partition_op_target(op: &vectordb_storage::MetaOp) -> String {
+    match op {
+        vectordb_storage::MetaOp::CreatePartition {
+            collection,
+            database,
+            ..
+        }
+        | vectordb_storage::MetaOp::DropPartition {
+            collection,
+            database,
+            ..
+        } => format!("{database}/{collection}"),
+        _ => "*".into(),
+    }
+}
+
 fn core_compaction_state_to_proto(
     s: vectordb_storage::CompactionStateCode,
 ) -> ProtoCompactionState {
@@ -1381,6 +1504,12 @@ fn map_engine_err(e: EngineError) -> Status {
         EngineError::DatabaseNotEmpty(n) => Status::failed_precondition(format!(
             "database {n} is not empty (use force=true to cascade drop)"
         )),
+        EngineError::PartitionNotFound(n) => {
+            Status::not_found(format!("partition not found: {n}"))
+        }
+        EngineError::PartitionExists(n) => {
+            Status::already_exists(format!("partition exists: {n}"))
+        }
         EngineError::InvalidMeta(m) => Status::invalid_argument(m),
         EngineError::Core(c) => Status::invalid_argument(c.to_string()),
         other => Status::internal(other.to_string()),

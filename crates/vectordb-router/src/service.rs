@@ -11,16 +11,19 @@ use vectordb_proto::vectordb::v1::{
     BulkUpsertRequest, BulkUpsertResponse, ClusterNodeStatus, ClusterStatusRequest,
     ClusterStatusResponse, CollectionSpec, CompactCollectionRequest, CompactCollectionResponse,
     CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
-    CreateDatabaseRequest, CreateDatabaseResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-    DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest, DeleteResponse,
-    DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse,
-    DescribeCollectionRequest, DescribeCollectionResponse, DescribeDatabaseRequest,
-    DescribeDatabaseResponse, DropDatabaseRequest, DropDatabaseResponse, DropPayloadIndexRequest,
-    DropPayloadIndexResponse, FlushCollectionRequest, FlushCollectionResponse,
-    GetCompactionStateRequest, GetCompactionStateResponse, GetRbacSnapshotRequest,
-    GetRbacSnapshotResponse, GetRequest, GetResponse, HealthRequest, HealthResponse, ImportChunk,
-    ImportStreamResponse, ListAliasesRequest, ListAliasesResponse, ListCollectionsRequest,
-    ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreatePartitionRequest, CreatePartitionResponse,
+    CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest,
+    DeleteCollectionResponse, DeleteRequest, DeleteResponse, DeleteSnapshotRequest,
+    DeleteSnapshotResponse, DescribeAliasRequest, DescribeAliasResponse, DescribeCollectionRequest,
+    DescribeCollectionResponse, DescribeDatabaseRequest, DescribeDatabaseResponse,
+    DropDatabaseRequest, DropDatabaseResponse, DropPartitionRequest, DropPartitionResponse,
+    DropPayloadIndexRequest, DropPayloadIndexResponse, FlushCollectionRequest,
+    FlushCollectionResponse, GetCompactionStateRequest, GetCompactionStateResponse,
+    GetPartitionStatsRequest, GetPartitionStatsResponse, GetRbacSnapshotRequest,
+    GetRbacSnapshotResponse, GetRequest, GetResponse, HasPartitionRequest, HasPartitionResponse,
+    HealthRequest, HealthResponse, ImportChunk, ImportStreamResponse, ListAliasesRequest,
+    ListAliasesResponse, ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest,
+    ListDatabasesResponse, ListPartitionsRequest, ListPartitionsResponse,
     ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListSnapshotsRequest,
     ListSnapshotsResponse, MutateCollectionMetaRequest, MutateCollectionMetaResponse, QueryRequest,
     QueryResponse, RebalanceCollectionReport, RebalanceRequest, RebalanceResponse,
@@ -752,6 +755,12 @@ impl VectorService for RouterService {
                     "payload-index ops must use the AddPayloadIndex / DropPayloadIndex RPCs",
                 ));
             }
+            vectordb_storage::MetaOp::CreatePartition { .. }
+            | vectordb_storage::MetaOp::DropPartition { .. } => {
+                return Err(Status::invalid_argument(
+                    "partition ops must use the CreatePartition / DropPartition RPCs",
+                ));
+            }
         };
         require_collection(&self.rbac, &request, &target, priv_kind)?;
         let req = request.into_inner();
@@ -1025,6 +1034,120 @@ impl VectorService for RouterService {
             }));
         }
         Ok(Response::new(ListPersistentSegmentsResponse { segments: merged }))
+    }
+
+    // ---- Partitions (Milvus parity) -----------------------------------------
+
+    async fn create_partition(
+        &self,
+        request: Request<CreatePartitionRequest>,
+    ) -> Result<Response<CreatePartitionResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.create_partition(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted create_partition")));
+        }
+        Ok(Response::new(CreatePartitionResponse {}))
+    }
+
+    async fn drop_partition(
+        &self,
+        request: Request<DropPartitionRequest>,
+    ) -> Result<Response<DropPartitionResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.drop_partition(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted drop_partition")));
+        }
+        Ok(Response::new(DropPartitionResponse {}))
+    }
+
+    async fn has_partition(
+        &self,
+        request: Request<HasPartitionRequest>,
+    ) -> Result<Response<HasPartitionResponse>, Status> {
+        let req = request.into_inner();
+        // All shards share replicated meta — first responder wins.
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.has_partition(&req.collection, &req.partition).await {
+                Ok(exists) => return Ok(Response::new(HasPartitionResponse { exists })),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted has_partition")))
+    }
+
+    async fn list_partitions(
+        &self,
+        request: Request<ListPartitionsRequest>,
+    ) -> Result<Response<ListPartitionsResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.list_partitions(&collection).await {
+                Ok(parts) => {
+                    return Ok(Response::new(ListPartitionsResponse { partitions: parts }))
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted list_partitions")))
+    }
+
+    async fn get_partition_stats(
+        &self,
+        request: Request<GetPartitionStatsRequest>,
+    ) -> Result<Response<GetPartitionStatsResponse>, Status> {
+        let req = request.into_inner();
+        // Sum row_count across shards; carry non-numeric stats from the first
+        // shard that reports them so callers still see partition_name etc.
+        let mut total_rows: u64 = 0;
+        let mut merged: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client
+                .get_partition_stats(&req.collection, &req.partition)
+                .await
+            {
+                Ok(stats) => {
+                    ok += 1;
+                    for (k, v) in stats {
+                        if k == "row_count" {
+                            if let Ok(n) = v.parse::<u64>() {
+                                total_rows = total_rows.saturating_add(n);
+                            }
+                        } else {
+                            merged.entry(k).or_insert(v);
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted get_partition_stats")));
+        }
+        merged.insert("row_count".into(), total_rows.to_string());
+        Ok(Response::new(GetPartitionStatsResponse { stats: merged }))
     }
 
     async fn delete(

@@ -149,6 +149,25 @@ pub enum MetaOp {
         database: String,
         field: String,
     },
+    // ---- Partition management (Milvus-parity) ---------------------------
+    /// Create a new logical partition inside a collection. Partitions live
+    /// in `CollectionConfig::partitions` and gate upserts via the
+    /// `_partition` payload field.
+    CreatePartition {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        partition: String,
+    },
+    /// Drop a partition. Removes the partition name from the config and
+    /// deletes every point whose `_partition` payload equals `partition`.
+    /// Dropping [`vectordb_core::DEFAULT_PARTITION`] is rejected.
+    DropPartition {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        partition: String,
+    },
 }
 
 fn default_database() -> String {
