@@ -173,6 +173,26 @@ pub(crate) const FILTER_BRUTE_FORCE_LIMIT: usize = 50_000;
 pub(crate) const FILTER_OVERSEARCH_FACTOR: usize = 16;
 pub(crate) const FILTER_OVERSEARCH_CAP: usize = 1024;
 
+/// True for RBAC errors that are safe to swallow during WAL replay because
+/// the persisted RBAC snapshot has already converged past them (the entity
+/// was created or dropped earlier in the snapshot, so re-applying the WAL
+/// entry against the restored state would conflict). `LastAdmin` and
+/// `BuiltinRole` are intentionally excluded — those are invariant violations
+/// that callers should always see.
+fn is_convergent_rbac_error(err: &RbacError) -> bool {
+    matches!(
+        err,
+        RbacError::UserExists(_)
+            | RbacError::UserNotFound(_)
+            | RbacError::RoleExists(_)
+            | RbacError::RoleNotFound(_)
+            | RbacError::TokenExists(_)
+            | RbacError::TokenNotFound(_)
+            | RbacError::GroupExists(_)
+            | RbacError::GroupNotFound(_)
+    )
+}
+
 impl CollectionEngine {
     pub fn open(config: EngineConfig) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
@@ -1265,6 +1285,7 @@ impl CollectionEngine {
         // drops the bad records permanently.
         let mut skipped_unknown_collection: usize = 0;
         let mut first_skipped: Option<String> = None;
+        let mut skipped_convergent_rbac: usize = 0;
         for (i, entry) in entries.iter().enumerate() {
             match self.apply_entry(entry) {
                 Ok(()) => {}
@@ -1279,6 +1300,24 @@ impl CollectionEngine {
                             entry_index = i + 1,
                             skipped_total = skipped_unknown_collection,
                             "WAL replay: skipping entry for unknown collection (will be dropped on next compact_wal)"
+                        );
+                    }
+                }
+                // RBAC ops are durably re-snapshotted to RocksDB after every
+                // successful apply (`persist_rbac`). On the next cold start
+                // the snapshot already reflects the mutation, so re-applying
+                // the same WAL entry would surface "*Exists" / "*NotFound"
+                // errors even though state is fully converged. Treat those
+                // as safe-to-skip — same pattern as `CollectionNotFound`
+                // above. Live `commit_rbac` paths still reject duplicates
+                // because they hit `RbacState::apply` before any snapshot.
+                Err(EngineError::Rbac(ref rbac_err)) if is_convergent_rbac_error(rbac_err) => {
+                    skipped_convergent_rbac += 1;
+                    if skipped_convergent_rbac <= 3 {
+                        tracing::warn!(
+                            entry_index = i + 1,
+                            error = %rbac_err,
+                            "WAL replay: skipping RBAC entry already reflected in snapshot"
                         );
                     }
                 }
@@ -1303,6 +1342,7 @@ impl CollectionEngine {
                 entries = total,
                 total_secs = started.elapsed().as_secs_f64(),
                 skipped_unknown_collection = skipped_unknown_collection,
+                skipped_convergent_rbac = skipped_convergent_rbac,
                 first_skipped = first_skipped.as_deref(),
                 "WAL replay: complete"
             );
@@ -3311,5 +3351,47 @@ mod m4_tests {
             })
             .unwrap_err();
         assert!(matches!(err, EngineError::ResourceGroupNotFound(_)));
+    }
+
+    // ---- WAL replay idempotency (regression) -------------------------------
+
+    /// Reproduces the cold-start crash where the persisted RBAC snapshot
+    /// already contains the role created by an earlier WAL `CreateRole`
+    /// entry. Reopening the engine must tolerate the duplicate apply
+    /// instead of bubbling `RoleExists` up to the gRPC bootstrap.
+    #[test]
+    fn reopen_tolerates_duplicate_rbac_create_in_wal() {
+        let dir = tempdir().unwrap();
+
+        // 1) Open, commit a CreateRole, and persist a snapshot. The WAL now
+        // holds the entry and meta_db holds the snapshot.
+        {
+            let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+            engine
+                .commit_rbac(RbacOp::CreateRole {
+                    name: "auditor".into(),
+                    description: "compliance".into(),
+                    created_at_ms: 1,
+                })
+                .unwrap();
+            assert!(engine.rbac().role("auditor").is_some());
+        }
+
+        // 2) Reopening replays the WAL against the restored snapshot.
+        // Without the convergent-RBAC tolerance, this would fail with
+        // `EngineError::Rbac(RoleExists("auditor"))`.
+        let engine = CollectionEngine::open(EngineConfig::new(dir.path())).unwrap();
+        assert!(engine.rbac().role("auditor").is_some());
+    }
+
+    /// `LastAdmin` / `BuiltinRole` invariant errors must NOT be swallowed
+    /// — even though they reach `apply_rbac`, callers need to see them.
+    #[test]
+    fn convergent_rbac_helper_excludes_invariant_errors() {
+        use vectordb_rbac::RbacError;
+        assert!(is_convergent_rbac_error(&RbacError::RoleExists("x".into())));
+        assert!(is_convergent_rbac_error(&RbacError::UserNotFound("x".into())));
+        assert!(!is_convergent_rbac_error(&RbacError::LastAdmin));
+        assert!(!is_convergent_rbac_error(&RbacError::BuiltinRole("admin".into())));
     }
 }
