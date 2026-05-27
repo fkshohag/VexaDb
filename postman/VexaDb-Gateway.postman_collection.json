@@ -1,0 +1,1159 @@
+{
+  "info": {
+    "name": "VexaDb Gateway",
+    "_postman_id": "c8ad13e0-9b3a-4b9e-9b0a-vexadbgw0001",
+    "description": "REST surface exposed by `vectordb-gateway`. Mirrors the Milvus v2.6 SDK API surface (Collections, Databases, Partitions, Indexes, Resource Groups, Vector ops, RBAC, Admin).\n\nQuick start:\n1. Import this collection together with `VexaDb-Local.postman_environment.json`.\n2. Start the gateway (`./scripts/run-single.sh` or your usual launch script). The default URL is `http://127.0.0.1:8080`.\n3. If RBAC is enabled, run **Auth / Login** first; the script stashes `apiToken` for every subsequent request.\n\nAll path variables use Postman's `:name` syntax so you can edit them per-request.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      { "key": "token", "value": "{{apiToken}}", "type": "string" }
+    ]
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://127.0.0.1:8080", "type": "string" },
+    { "key": "apiToken", "value": "", "type": "string" },
+    { "key": "dbName", "value": "default", "type": "string" },
+    { "key": "collectionName", "value": "docs", "type": "string" },
+    { "key": "partitionName", "value": "hot", "type": "string" },
+    { "key": "fieldName", "value": "color", "type": "string" },
+    { "key": "pointId", "value": "doc-001", "type": "string" },
+    { "key": "aliasName", "value": "docs_v1", "type": "string" },
+    { "key": "roleName", "value": "read_write", "type": "string" },
+    { "key": "userName", "value": "alice", "type": "string" },
+    { "key": "privilegeGroup", "value": "vector_read", "type": "string" },
+    { "key": "resourceGroup", "value": "hot_rg", "type": "string" },
+    { "key": "snapshotId", "value": "", "type": "string" },
+    { "key": "compactionId", "value": "", "type": "string" },
+    { "key": "tokenId", "value": "", "type": "string" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Always tag requests with the current Postman database so the",
+          "// gateway prefixes collection names automatically.",
+          "if (pm.collectionVariables.get('dbName')) {",
+          "  pm.request.headers.upsert({ key: 'X-Database', value: pm.collectionVariables.get('dbName') });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "Probes & Version",
+      "item": [
+        { "name": "GET /health", "request": { "method": "GET", "url": "{{baseUrl}}/health", "auth": { "type": "noauth" } } },
+        { "name": "GET /live", "request": { "method": "GET", "url": "{{baseUrl}}/live", "auth": { "type": "noauth" } } },
+        { "name": "GET /ready", "request": { "method": "GET", "url": "{{baseUrl}}/ready", "auth": { "type": "noauth" } } },
+        { "name": "GET /metrics", "request": { "method": "GET", "url": "{{baseUrl}}/metrics", "auth": { "type": "noauth" } } },
+        { "name": "GET /v1/version", "request": { "method": "GET", "url": "{{baseUrl}}/v1/version" } }
+      ]
+    },
+    {
+      "name": "Auth & RBAC",
+      "item": [
+        {
+          "name": "POST /v1/auth/login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "  if (body.token) pm.collectionVariables.set('apiToken', body.token);",
+                  "  if (body.token_id) pm.collectionVariables.set('tokenId', body.token_id);",
+                  "  console.log('apiToken stored');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "auth": { "type": "noauth" },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"username\": \"root\",\n  \"password\": \"VexaDb!\"\n}" },
+            "url": "{{baseUrl}}/v1/auth/login"
+          }
+        },
+        {
+          "name": "POST /v1/auth/tokens",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"description\": \"postman-test\"\n}" },
+            "url": "{{baseUrl}}/v1/auth/tokens"
+          }
+        },
+        {
+          "name": "DELETE /v1/auth/tokens/:id",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/auth/tokens/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "auth", "tokens", ":id"],
+              "variable": [{ "key": "id", "value": "{{tokenId}}" }]
+            }
+          }
+        },
+        { "name": "GET /v1/users", "request": { "method": "GET", "url": "{{baseUrl}}/v1/users" } },
+        {
+          "name": "POST /v1/users",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{userName}}\",\n  \"password\": \"Sup3r-secret\",\n  \"roles\": [\"read_only\"]\n}" },
+            "url": "{{baseUrl}}/v1/users"
+          }
+        },
+        {
+          "name": "GET /v1/users/:name",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/users/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "users", ":name"],
+              "variable": [{ "key": "name", "value": "{{userName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/users/:name",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/users/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "users", ":name"],
+              "variable": [{ "key": "name", "value": "{{userName}}" }]
+            }
+          }
+        },
+        {
+          "name": "PATCH /v1/users/:name/password",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"old\": \"Sup3r-secret\",\n  \"new\": \"N3w-secret\"\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/users/:name/password",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "users", ":name", "password"],
+              "variable": [{ "key": "name", "value": "{{userName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/users/:name/roles/:role",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/v1/users/:name/roles/:role",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "users", ":name", "roles", ":role"],
+              "variable": [
+                { "key": "name", "value": "{{userName}}" },
+                { "key": "role", "value": "{{roleName}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/users/:name/roles/:role",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/users/:name/roles/:role",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "users", ":name", "roles", ":role"],
+              "variable": [
+                { "key": "name", "value": "{{userName}}" },
+                { "key": "role", "value": "{{roleName}}" }
+              ]
+            }
+          }
+        },
+        { "name": "GET /v1/roles", "request": { "method": "GET", "url": "{{baseUrl}}/v1/roles" } },
+        {
+          "name": "POST /v1/roles",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{roleName}}\",\n  \"description\": \"app readers/writers\"\n}" },
+            "url": "{{baseUrl}}/v1/roles"
+          }
+        },
+        {
+          "name": "GET /v1/roles/:name",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/roles/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "roles", ":name"],
+              "variable": [{ "key": "name", "value": "{{roleName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/roles/:name",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/roles/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "roles", ":name"],
+              "variable": [{ "key": "name", "value": "{{roleName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/roles/:role/grants",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"object_type\": \"Collection\",\n  \"object_name\": \"{{collectionName}}\",\n  \"privilege\": \"Search\"\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/roles/:role/grants",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "roles", ":role", "grants"],
+              "variable": [{ "key": "role", "value": "{{roleName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/roles/:role/grants",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"object_type\": \"Collection\",\n  \"object_name\": \"{{collectionName}}\",\n  \"privilege\": \"Search\"\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/roles/:role/grants",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "roles", ":role", "grants"],
+              "variable": [{ "key": "role", "value": "{{roleName}}" }]
+            }
+          }
+        },
+        { "name": "GET /v1/privilege-groups", "request": { "method": "GET", "url": "{{baseUrl}}/v1/privilege-groups" } },
+        {
+          "name": "POST /v1/privilege-groups",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{privilegeGroup}}\",\n  \"privileges\": [\"Search\", \"Query\", \"Get\"]\n}" },
+            "url": "{{baseUrl}}/v1/privilege-groups"
+          }
+        },
+        {
+          "name": "PATCH /v1/privilege-groups/:name",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"add\": [\"DescribeCollection\"],\n  \"remove\": [\"Get\"]\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/privilege-groups/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "privilege-groups", ":name"],
+              "variable": [{ "key": "name", "value": "{{privilegeGroup}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/privilege-groups/:name",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/privilege-groups/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "privilege-groups", ":name"],
+              "variable": [{ "key": "name", "value": "{{privilegeGroup}}" }]
+            }
+          }
+        },
+        { "name": "POST /v1/admin/rbac/backup", "request": { "method": "POST", "url": "{{baseUrl}}/v1/admin/rbac/backup" } },
+        {
+          "name": "POST /v1/admin/rbac/restore",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"users\": [],\n  \"roles\": [],\n  \"privilege_groups\": []\n}" },
+            "url": "{{baseUrl}}/v1/admin/rbac/restore"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Databases",
+      "item": [
+        { "name": "GET /v1/databases", "request": { "method": "GET", "url": "{{baseUrl}}/v1/databases" } },
+        {
+          "name": "POST /v1/databases",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{dbName}}\",\n  \"properties\": { \"database.replica.number\": \"1\" }\n}" },
+            "url": "{{baseUrl}}/v1/databases"
+          }
+        },
+        {
+          "name": "GET /v1/databases/:name",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/databases/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "databases", ":name"],
+              "variable": [{ "key": "name", "value": "{{dbName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/databases/:name (force)",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/databases/:name?force=true",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "databases", ":name"],
+              "query": [{ "key": "force", "value": "true" }],
+              "variable": [{ "key": "name", "value": "{{dbName}}" }]
+            }
+          }
+        },
+        {
+          "name": "PATCH /v1/databases/:name/properties",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"set\": { \"database.replica.number\": \"3\" },\n  \"unset\": []\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/databases/:name/properties",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "databases", ":name", "properties"],
+              "variable": [{ "key": "name", "value": "{{dbName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/databases/:name/properties",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"keys\": [\"database.replica.number\"]\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/databases/:name/properties",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "databases", ":name", "properties"],
+              "variable": [{ "key": "name", "value": "{{dbName}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Collections",
+      "item": [
+        { "name": "GET /v1/collections", "request": { "method": "GET", "url": "{{baseUrl}}/v1/collections" } },
+        {
+          "name": "POST /v1/collections",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{collectionName}}\",\n  \"dimension\": 4,\n  \"metric\": \"cosine\",\n  \"payload_indexes\": [\n    { \"field\": \"{{fieldName}}\", \"kind\": \"keyword\" }\n  ],\n  \"sparse_enabled\": false,\n  \"bm25_text_field\": \"text\",\n  \"scalar_quantization\": false,\n  \"properties\": { \"collection.ttl.seconds\": \"0\" }\n}" },
+            "url": "{{baseUrl}}/v1/collections"
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/collections/:name",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/reindex",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/reindex",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "reindex"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/rename",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"new_name\": \"{{collectionName}}_renamed\"\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/rename",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "rename"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "PATCH /v1/collections/:name/properties",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"set\": { \"collection.ttl.seconds\": \"3600\" },\n  \"unset\": []\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/properties",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "properties"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "stats"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/aliases",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/aliases",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "aliases"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Aliases",
+      "item": [
+        { "name": "GET /v1/aliases", "request": { "method": "GET", "url": "{{baseUrl}}/v1/aliases" } },
+        {
+          "name": "POST /v1/aliases",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"alias\": \"{{aliasName}}\",\n  \"collection\": \"{{collectionName}}\"\n}" },
+            "url": "{{baseUrl}}/v1/aliases"
+          }
+        },
+        {
+          "name": "GET /v1/aliases/:alias",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/aliases/:alias",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "aliases", ":alias"],
+              "variable": [{ "key": "alias", "value": "{{aliasName}}" }]
+            }
+          }
+        },
+        {
+          "name": "PUT /v1/aliases/:alias",
+          "request": {
+            "method": "PUT",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"collection\": \"{{collectionName}}\"\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/aliases/:alias",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "aliases", ":alias"],
+              "variable": [{ "key": "alias", "value": "{{aliasName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/aliases/:alias",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/aliases/:alias",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "aliases", ":alias"],
+              "variable": [{ "key": "alias", "value": "{{aliasName}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Partitions",
+      "item": [
+        {
+          "name": "GET /v1/collections/:name/partitions",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/partitions",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "partitions"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/partitions",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"partition_name\": \"{{partitionName}}\"\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/partitions",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "partitions"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/partitions/:partition",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/partitions/:partition",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "partitions", ":partition"],
+              "variable": [
+                { "key": "name", "value": "{{collectionName}}" },
+                { "key": "partition", "value": "{{partitionName}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/collections/:name/partitions/:partition",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/partitions/:partition",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "partitions", ":partition"],
+              "variable": [
+                { "key": "name", "value": "{{collectionName}}" },
+                { "key": "partition", "value": "{{partitionName}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/partitions/:partition/stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/partitions/:partition/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "partitions", ":partition", "stats"],
+              "variable": [
+                { "key": "name", "value": "{{collectionName}}" },
+                { "key": "partition", "value": "{{partitionName}}" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Indexes",
+      "item": [
+        {
+          "name": "GET /v1/collections/:name/indexes",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/indexes",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "indexes"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/indexes (HNSW)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"field\": \"vector\",\n  \"kind\": \"hnsw\",\n  \"index_name\": \"vector_hnsw\",\n  \"metric\": \"cosine\",\n  \"params\": { \"M\": \"16\", \"efConstruction\": \"200\" }\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/indexes",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "indexes"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/indexes (scalar)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"field\": \"{{fieldName}}\",\n  \"kind\": \"keyword\",\n  \"index_name\": \"color_kw\",\n  \"params\": {}\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/indexes",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "indexes"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/indexes/:field",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/indexes/:field",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "indexes", ":field"],
+              "variable": [
+                { "key": "name", "value": "{{collectionName}}" },
+                { "key": "field", "value": "{{fieldName}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/collections/:name/indexes/:field",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/indexes/:field",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "indexes", ":field"],
+              "variable": [
+                { "key": "name", "value": "{{collectionName}}" },
+                { "key": "field", "value": "{{fieldName}}" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "PATCH /v1/collections/:name/indexes/:field/properties",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"set\": { \"index.color_kw.params.case_insensitive\": \"true\" },\n  \"unset\": []\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/indexes/:field/properties",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "indexes", ":field", "properties"],
+              "variable": [
+                { "key": "name", "value": "{{collectionName}}" },
+                { "key": "field", "value": "{{fieldName}}" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Load · Flush · Compact · Segments",
+      "item": [
+        {
+          "name": "POST /v1/collections/:name/load",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/load",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "load"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/release",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/release",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "release"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/load-state",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/load-state",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "load-state"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/refresh-load",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/refresh-load",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "refresh-load"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/flush",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/flush",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "flush"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/compact",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "  if (body.compaction_id) pm.collectionVariables.set('compactionId', body.compaction_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/compact",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "compact"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/compactions/:id",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/compactions/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "compactions", ":id"],
+              "variable": [{ "key": "id", "value": "{{compactionId}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/segments",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/segments",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "segments"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Vector — Insert / Upsert / Bulk",
+      "item": [
+        {
+          "name": "POST /v1/collections/:name/upsert",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"partition\": \"{{partitionName}}\",\n  \"points\": [\n    { \"id\": \"doc-001\", \"values\": [0.1, 0.2, 0.3, 0.4], \"payload\": { \"color\": \"red\", \"text\": \"hello world\" } },\n    { \"id\": \"doc-002\", \"values\": [0.9, 0.1, 0.0, 0.0], \"payload\": { \"color\": \"blue\", \"text\": \"vexa db is fast\" } }\n  ]\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/upsert",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "upsert"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/upsert (with sparse)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"points\": [\n    {\n      \"id\": \"doc-003\",\n      \"values\": [0.5, 0.5, 0.0, 0.0],\n      \"payload\": { \"color\": \"green\" },\n      \"sparse\": { \"indices\": [1, 21, 100], \"values\": [0.1, 0.2, 0.3] }\n    }\n  ]\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/upsert",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "upsert"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/bulk",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"chunk_size\": 500,\n  \"points\": [\n    { \"id\": \"b-001\", \"values\": [0.1, 0.0, 0.0, 0.0] },\n    { \"id\": \"b-002\", \"values\": [0.0, 0.1, 0.0, 0.0] },\n    { \"id\": \"b-003\", \"values\": [0.0, 0.0, 0.1, 0.0] }\n  ]\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/bulk",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "bulk"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Vector — Search / HybridSearch / Query / Scroll",
+      "item": [
+        {
+          "name": "POST /v1/collections/:name/search",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"vector\": [0.1, 0.2, 0.3, 0.4],\n  \"top_k\": 5,\n  \"filter\": \"color == 'red'\",\n  \"search_mode\": \"dense\",\n  \"output_fields\": [\"color\", \"text\"],\n  \"with_payload\": true,\n  \"with_vector\": false\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/search",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "search"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/search (hybrid_rrf)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"vector\": [0.1, 0.2, 0.3, 0.4],\n  \"top_k\": 5,\n  \"search_mode\": \"hybrid_rrf\",\n  \"sparse_query\": { \"indices\": [1, 21, 100], \"values\": [0.1, 0.2, 0.3] },\n  \"text_query\": \"hello\",\n  \"with_payload\": true\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/search",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "search"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/hybrid-search (RRF)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"limit\": 5,\n  \"requests\": [\n    { \"field\": \"vector\", \"limit\": 20, \"dense\": [0.1, 0.2, 0.3, 0.4], \"filter\": \"color == 'red'\" },\n    { \"field\": \"sparse\", \"limit\": 20, \"sparse\": { \"indices\": [1, 21, 100], \"values\": [0.1, 0.2, 0.3] } },\n    { \"field\": \"text\",   \"limit\": 20, \"text\": \"vexa db\" }\n  ],\n  \"reranker\": { \"kind\": \"rrf\" },\n  \"output_fields\": [\"color\"],\n  \"with_payload\": true,\n  \"with_vector\": false,\n  \"partitions\": [\"{{partitionName}}\"]\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/hybrid-search",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "hybrid-search"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/hybrid-search (Weighted)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"limit\": 5,\n  \"requests\": [\n    { \"field\": \"vector\", \"limit\": 20, \"dense\": [0.1, 0.2, 0.3, 0.4] },\n    { \"field\": \"text\",   \"limit\": 20, \"text\": \"vexa db\" }\n  ],\n  \"reranker\": { \"kind\": \"weighted\", \"weights\": [0.7, 0.3] }\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/hybrid-search",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "hybrid-search"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/query",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"filter\": \"color == 'red'\",\n  \"ids\": [],\n  \"limit\": 50,\n  \"offset\": 0,\n  \"output_fields\": [\"id\", \"color\"],\n  \"with_payload\": true,\n  \"with_vector\": false\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/query",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "query"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/query (Get by IDs)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"ids\": [\"doc-001\", \"doc-002\"],\n  \"with_payload\": true\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/query",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "query"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/collections/:name/scroll",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"cursor\": \"\",\n  \"limit\": 100,\n  \"filter\": \"color == 'red'\",\n  \"partition\": \"{{partitionName}}\",\n  \"output_fields\": [\"id\", \"color\"],\n  \"with_payload\": true,\n  \"with_vector\": false\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/scroll",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "scroll"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Vector — Delete / Get",
+      "item": [
+        {
+          "name": "DELETE /v1/collections/:name/points (by ids)",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"ids\": [\"doc-001\", \"doc-002\"]\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/points",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "points"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/collections/:name/points (by filter + partition)",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"filter\": \"color == 'red'\",\n  \"partition\": \"{{partitionName}}\"\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/points",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "points"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/points/:id",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/points/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "points", ":id"],
+              "variable": [
+                { "key": "name", "value": "{{collectionName}}" },
+                { "key": "id", "value": "{{pointId}}" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Analyzer",
+      "item": [
+        {
+          "name": "POST /v1/admin/analyze",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"text\": [\"Hello world, hello again!\"],\n  \"analyzer_params\": {\n    \"tokenizer\": \"standard\",\n    \"filter\": [{ \"type\": \"stop\", \"stop_words\": [\"hello\"] }]\n  },\n  \"with_detail\": true,\n  \"with_hash\": true\n}" },
+            "url": "{{baseUrl}}/v1/admin/analyze"
+          }
+        },
+        {
+          "name": "POST /v1/admin/analyze (with field reference)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"text\": [\"vexa db is a vector database\"],\n  \"collection\": \"{{collectionName}}\",\n  \"field\": \"text\"\n}" },
+            "url": "{{baseUrl}}/v1/admin/analyze"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Resource groups & Replicas",
+      "item": [
+        { "name": "GET /v1/resource-groups", "request": { "method": "GET", "url": "{{baseUrl}}/v1/resource-groups" } },
+        {
+          "name": "POST /v1/resource-groups",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"name\": \"{{resourceGroup}}\",\n  \"config\": {\n    \"requests\": { \"node_num\": 1 },\n    \"limits\":   { \"node_num\": 2 },\n    \"transfer_from\": [],\n    \"transfer_to\":   [],\n    \"node_filter\":   { \"node_labels\": {} }\n  }\n}" },
+            "url": "{{baseUrl}}/v1/resource-groups"
+          }
+        },
+        {
+          "name": "GET /v1/resource-groups/:name",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/resource-groups/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "resource-groups", ":name"],
+              "variable": [{ "key": "name", "value": "{{resourceGroup}}" }]
+            }
+          }
+        },
+        {
+          "name": "PATCH /v1/resource-groups/:name",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"config\": {\n    \"requests\": { \"node_num\": 2 },\n    \"limits\":   { \"node_num\": 4 },\n    \"transfer_from\": [],\n    \"transfer_to\":   [],\n    \"node_filter\":   { \"node_labels\": { \"tier\": \"hot\" } }\n  }\n}" },
+            "url": {
+              "raw": "{{baseUrl}}/v1/resource-groups/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "resource-groups", ":name"],
+              "variable": [{ "key": "name", "value": "{{resourceGroup}}" }]
+            }
+          }
+        },
+        {
+          "name": "DELETE /v1/resource-groups/:name",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/resource-groups/:name",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "resource-groups", ":name"],
+              "variable": [{ "key": "name", "value": "{{resourceGroup}}" }]
+            }
+          }
+        },
+        {
+          "name": "GET /v1/collections/:name/replicas",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/v1/collections/:name/replicas",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "collections", ":name", "replicas"],
+              "variable": [{ "key": "name", "value": "{{collectionName}}" }]
+            }
+          }
+        },
+        {
+          "name": "POST /v1/admin/transfer-replica",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"collection\": \"{{collectionName}}\",\n  \"source_group\": \"__default_resource_group\",\n  \"target_group\": \"{{resourceGroup}}\",\n  \"replica_num\": 1,\n  \"database\": \"{{dbName}}\"\n}" },
+            "url": "{{baseUrl}}/v1/admin/transfer-replica"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Snapshots",
+      "item": [
+        { "name": "GET /v1/snapshots", "request": { "method": "GET", "url": "{{baseUrl}}/v1/snapshots" } },
+        {
+          "name": "POST /v1/snapshots",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "  if (body.id) pm.collectionVariables.set('snapshotId', body.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": { "method": "POST", "url": "{{baseUrl}}/v1/snapshots" }
+        },
+        {
+          "name": "DELETE /v1/snapshots/:id",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{baseUrl}}/v1/snapshots/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "snapshots", ":id"],
+              "variable": [{ "key": "id", "value": "{{snapshotId}}" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Admin & Cluster",
+      "item": [
+        { "name": "GET /v1/admin/cluster", "request": { "method": "GET", "url": "{{baseUrl}}/v1/admin/cluster" } },
+        {
+          "name": "POST /v1/admin/compact-wal",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"snapshot_first\": true\n}" },
+            "url": "{{baseUrl}}/v1/admin/compact-wal"
+          }
+        },
+        {
+          "name": "POST /v1/admin/rebalance",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"dry_run\": false\n}" },
+            "url": "{{baseUrl}}/v1/admin/rebalance"
+          }
+        },
+        { "name": "GET /v1/admin/rebalance", "request": { "method": "GET", "url": "{{baseUrl}}/v1/admin/rebalance" } }
+      ]
+    }
+  ]
+}
