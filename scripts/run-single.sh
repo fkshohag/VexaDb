@@ -35,13 +35,19 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 CLEAN=0
 STOP_ONLY=0
+# WITH_ADMIN tri-state: "" = env default (see below), 1 = force on, 0 = force off.
+WITH_ADMIN_ARG=""
 for arg in "$@"; do
   case "$arg" in
     --clean|-c|--fresh) CLEAN=1 ;;
     --stop) STOP_ONLY=1 ;;
+    --with-admin|--admin) WITH_ADMIN_ARG=1 ;;
+    --no-admin)           WITH_ADMIN_ARG=0 ;;
     --help|-h)
       sed -n '/^# Build /,/^# --clean (or FRESH=1)\./p' "$0" | sed 's/^# \{0,1\}//'
-      echo "  --stop            kill stale vectordb-server/gateway on default ports"
+      echo "  --stop            kill stale vectordb-server/gateway/admin on default ports"
+      echo "  --with-admin      also build + serve the admin panel on :ADMIN_PORT"
+      echo "  --no-admin        do not start the admin panel (overrides WITH_ADMIN=1)"
       exit 0
       ;;
     *)
@@ -52,6 +58,8 @@ for arg in "$@"; do
   esac
 done
 if [[ "${FRESH:-0}" == "1" ]]; then CLEAN=1; fi
+# Final decision: explicit flag > env var > off.
+WITH_ADMIN="${WITH_ADMIN_ARG:-${WITH_ADMIN:-0}}"
 
 # ---------------------------------------------------------------------------
 # Config (env-overridable)
@@ -64,6 +72,7 @@ DATA_DIR="${DATA_DIR:-$ROOT/run-data/single}"
 GRPC_PORT="${GRPC_PORT:-6334}"
 GATEWAY_PORT="${GATEWAY_PORT:-8080}"
 METRICS_PORT="${METRICS_PORT:-9090}"
+ADMIN_PORT="${ADMIN_PORT:-8090}"
 NODE_ID="${NODE_ID:-single-1}"
 API_KEY="${API_KEY:-}"
 # Default dev credentials match the Postman collection login example.
@@ -84,14 +93,15 @@ API_KEY_FILE="$DATA_DIR/.api-key"
 # Colorized prefix logger
 # ---------------------------------------------------------------------------
 if [[ -t 1 ]]; then
-  C_INFO=$'\033[1;36m'  # cyan
+  C_INFO=$'\033[1;36m'    # cyan
   C_SERVER=$'\033[1;33m'  # yellow
-  C_GW=$'\033[1;35m'    # magenta
-  C_WARN=$'\033[1;31m'  # red
+  C_GW=$'\033[1;35m'      # magenta
+  C_VIOLET=$'\033[1;34m'  # blue (admin)
+  C_WARN=$'\033[1;31m'    # red
   C_DIM=$'\033[2m'
   C_OFF=$'\033[0m'
 else
-  C_INFO=""; C_SERVER=""; C_GW=""; C_WARN=""; C_DIM=""; C_OFF=""
+  C_INFO=""; C_SERVER=""; C_GW=""; C_VIOLET=""; C_WARN=""; C_DIM=""; C_OFF=""
 fi
 
 log()  { printf "%s▶ %s%s\n" "$C_INFO" "$*" "$C_OFF"; }
@@ -103,23 +113,25 @@ pids_on_port() {
   lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true
 }
 
-# Stop vectordb-server / vectordb-gateway processes holding our ports.
+# Stop vectordb-server / vectordb-gateway / vectordb-admin processes holding
+# our ports. Includes the admin port so re-running with --with-admin doesn't
+# leak the previous panel binary.
 stop_stale_vexa() {
   local port pid comm killed=0
-  for port in "$GRPC_PORT" "$GATEWAY_PORT" "${METRICS_PORT:-}"; do
+  for port in "$GRPC_PORT" "$GATEWAY_PORT" "${METRICS_PORT:-}" "$ADMIN_PORT"; do
     [[ -z "$port" ]] && continue
     for pid in $(pids_on_port "$port"); do
       # macOS ps -o comm= may be a full path; match on basename only.
       comm="$(basename "$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')")"
       case "$comm" in
-        vectordb-server|vectordb-gateway)
+        vectordb-server|vectordb-gateway|vectordb-admin)
           warn "Stopping stale $comm (pid $pid) on port $port"
           kill "$pid" 2>/dev/null || true
           killed=1
           ;;
         *)
           warn "Port $port is in use by '$comm' (pid $pid), not a VexaDb binary"
-          warn "Free the port or set GRPC_PORT / GATEWAY_PORT / METRICS_PORT"
+          warn "Free the port or set GRPC_PORT / GATEWAY_PORT / METRICS_PORT / ADMIN_PORT"
           exit 1
           ;;
       esac
@@ -225,17 +237,39 @@ esac
 
 SERVER_BIN="$ROOT/$TARGET_DIR/vectordb-server"
 GATEWAY_BIN="$ROOT/$TARGET_DIR/vectordb-gateway"
+ADMIN_DIR="$ROOT/admin"
+ADMIN_BIN="$ADMIN_DIR/backend/vectordb-admin"
+ADMIN_DIST="$ADMIN_DIR/frontend/dist"
 
 if [[ "$SKIP_BUILD" == "1" ]]; then
   log "Skipping build (SKIP_BUILD=1)"
   [[ -x "$SERVER_BIN"  ]] || { warn "Missing binary: $SERVER_BIN";  exit 1; }
   [[ -x "$GATEWAY_BIN" ]] || { warn "Missing binary: $GATEWAY_BIN"; exit 1; }
+  if [[ "$WITH_ADMIN" == "1" ]]; then
+    [[ -x "$ADMIN_BIN" ]] || { warn "Missing admin binary: $ADMIN_BIN — run admin/scripts/build.sh first or drop SKIP_BUILD=1"; exit 1; }
+    [[ -d "$ADMIN_DIST" ]] || { warn "Missing admin frontend build: $ADMIN_DIST"; exit 1; }
+  fi
 else
   log "Building (mode=$MODE)…"
   # shellcheck disable=SC2086
   cargo build $CARGO_RELEASE \
     -p vectordb-server \
     -p vectordb-gateway
+  if [[ "$WITH_ADMIN" == "1" ]]; then
+    # Tooling preflight — keep the error message close to the failing tool so
+    # users don't get a wall of Node/Go output for a missing binary.
+    for tool in npm go; do
+      if ! command -v "$tool" >/dev/null 2>&1; then
+        warn "--with-admin needs '$tool' on PATH (or pass --no-admin)"
+        exit 1
+      fi
+    done
+    log "Building admin frontend (npm) + backend (go)…"
+    ( cd "$ADMIN_DIR/frontend" && \
+      ( [[ -d node_modules ]] || npm install --no-audit --no-fund ) && \
+      npm run build )
+    ( cd "$ADMIN_DIR/backend" && go build -o vectordb-admin . )
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -253,6 +287,13 @@ elif [[ -n "$API_KEY" ]]; then
 else
   AUTH_DISPLAY="(open)"
 fi
+if [[ "$WITH_ADMIN" == "1" ]]; then
+  ADMIN_DISPLAY="http://127.0.0.1:${ADMIN_PORT}"
+  ADMIN_LOG_HINT=",admin"
+else
+  ADMIN_DISPLAY="(disabled — pass --with-admin)"
+  ADMIN_LOG_HINT=""
+fi
 
 cat <<BANNER
 ${C_INFO}
@@ -264,8 +305,9 @@ VexaDb single-instance
   gRPC:        127.0.0.1:${GRPC_PORT}
   REST:        http://127.0.0.1:${GATEWAY_PORT}
   metrics:     ${METRICS_DISPLAY}
+  admin:       ${ADMIN_DISPLAY}
   auth:        ${AUTH_DISPLAY}
-  logs:        ${LOG_DIR}/{server,gateway}.log${C_OFF}
+  logs:        ${LOG_DIR}/{server,gateway${ADMIN_LOG_HINT}}.log${C_OFF}
 
 Press Ctrl-C to stop.
 
@@ -276,9 +318,10 @@ BANNER
 # ---------------------------------------------------------------------------
 SERVER_PID=""
 GATEWAY_PID=""
+ADMIN_PID=""
 cleanup() {
   log "Stopping…"
-  for pid in "$GATEWAY_PID" "$SERVER_PID"; do
+  for pid in "$ADMIN_PID" "$GATEWAY_PID" "$SERVER_PID"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -286,12 +329,13 @@ cleanup() {
   # Give them a moment for graceful shutdown, then SIGKILL stragglers.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     if ! { [[ -n "$SERVER_PID"  ]] && kill -0 "$SERVER_PID"  2>/dev/null; } \
-    && ! { [[ -n "$GATEWAY_PID" ]] && kill -0 "$GATEWAY_PID" 2>/dev/null; }; then
+    && ! { [[ -n "$GATEWAY_PID" ]] && kill -0 "$GATEWAY_PID" 2>/dev/null; } \
+    && ! { [[ -n "$ADMIN_PID"   ]] && kill -0 "$ADMIN_PID"   2>/dev/null; }; then
       break
     fi
     sleep 0.2
   done
-  for pid in "$GATEWAY_PID" "$SERVER_PID"; do
+  for pid in "$ADMIN_PID" "$GATEWAY_PID" "$SERVER_PID"; do
     [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
   done
   wait 2>/dev/null || true
@@ -365,6 +409,45 @@ for i in $(seq 1 60); do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# Start vectordb-admin (optional)
+# ---------------------------------------------------------------------------
+if [[ "$WITH_ADMIN" == "1" ]]; then
+  log "Starting vectordb-admin on :${ADMIN_PORT}"
+  ADMIN_ENV=(
+    "ADMIN_LISTEN=:${ADMIN_PORT}"
+    "VECTORDB_URL=http://127.0.0.1:${GATEWAY_PORT}"
+    "ADMIN_STATIC=${ADMIN_DIST}"
+  )
+  # Inject the dev API key so the admin panel can reach the gateway even
+  # before the user logs in. Once they sign in as `root`, the bearer token
+  # from the browser overrides this on every request.
+  if [[ -n "$API_KEY" ]]; then
+    ADMIN_ENV+=("VECTORDB_API_KEY=$API_KEY")
+  fi
+  ( cd "$ADMIN_DIR/backend" && env "${ADMIN_ENV[@]}" "$ADMIN_BIN" ) \
+      > >(prefix "admin" "$C_VIOLET" "$LOG_DIR/admin.log") \
+      2> >(prefix "admin" "$C_VIOLET" "$LOG_DIR/admin.log") &
+  ADMIN_PID=$!
+
+  log "Waiting for admin /config.json on :${ADMIN_PORT}…"
+  for i in $(seq 1 40); do
+    if curl -fsS --max-time 1 "http://127.0.0.1:${ADMIN_PORT}/config.json" >/dev/null 2>&1; then
+      log "Admin is up: http://127.0.0.1:${ADMIN_PORT}"
+      break
+    fi
+    if ! kill -0 "$ADMIN_PID" 2>/dev/null; then
+      warn "vectordb-admin exited before becoming ready. See $LOG_DIR/admin.log"
+      exit 1
+    fi
+    sleep 0.25
+    if [[ $i -eq 40 ]]; then
+      warn "Admin panel never responded on :${ADMIN_PORT} within 10s"
+      exit 1
+    fi
+  done
+fi
+
 # Quick smoke output for the user.
 cat <<TRY
 ${C_INFO}
@@ -388,11 +471,24 @@ Or bootstrap a fresh root via:
 
 TRY
 
+if [[ "$WITH_ADMIN" == "1" ]]; then
+  cat <<ADMIN_TIP
+${C_VIOLET}Admin panel:
+  open http://127.0.0.1:${ADMIN_PORT}
+  log in as     root / ${ROOT_PASSWORD}
+  (or paste API key ${API_KEY})${C_OFF}
+
+ADMIN_TIP
+fi
+
 # ---------------------------------------------------------------------------
 # Wait until either child exits, then let the EXIT trap clean up.
 # Portable to bash 3.2 (no `wait -n`); polls both pids once per second.
 # ---------------------------------------------------------------------------
-while kill -0 "$SERVER_PID" 2>/dev/null && kill -0 "$GATEWAY_PID" 2>/dev/null; do
+while :; do
+  kill -0 "$SERVER_PID"  2>/dev/null || break
+  kill -0 "$GATEWAY_PID" 2>/dev/null || break
+  if [[ -n "$ADMIN_PID" ]] && ! kill -0 "$ADMIN_PID" 2>/dev/null; then break; fi
   sleep 1
 done
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -400,5 +496,8 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
   warn "vectordb-gateway exited — see $LOG_DIR/gateway.log"
+fi
+if [[ -n "$ADMIN_PID" ]] && ! kill -0 "$ADMIN_PID" 2>/dev/null; then
+  warn "vectordb-admin exited — see $LOG_DIR/admin.log"
 fi
 warn "One of the processes exited; tearing down."

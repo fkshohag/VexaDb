@@ -32,13 +32,19 @@ help: ## Show available targets.
 		/^[a-zA-Z0-9_.-]+:.*##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 }' \
 		$(MAKEFILE_LIST)
 	@echo
-	@echo "Cluster lifecycle (one source of truth — scripts/cluster.py):"
+	@echo "Cluster lifecycle (Docker; one source of truth — scripts/cluster.py):"
 	@echo "  make up                       # 1 shard, RF=1 (default)"
 	@echo "  make up RF=3 SHARDS=2         # 2 shards × 3 replicas = 6 data nodes"
 	@echo "  make scale-rf RF=5            # bump replication factor"
 	@echo "  make add-shard                # add capacity (auto-rebalance moves data)"
 	@echo "  make down                     # stop (keeps volumes)"
 	@echo "  make nuke                     # stop and DELETE data volumes"
+	@echo
+	@echo "Bare-metal single-instance dev (no Docker; scripts/run-single.sh):"
+	@echo "  make up-all                   # server + gateway + admin panel"
+	@echo "  make up-all-clean             # same, wiping ./run-data first"
+	@echo "  make up-all-release           # same, with --release binaries"
+	@echo "  make down-all                 # kill the bare-metal stack"
 	@echo
 
 # ---------------------------------------------------------------------------
@@ -222,6 +228,32 @@ run-single-release: ## Same as run-single but with --release binaries.
 .PHONY: run-single-clean
 run-single-clean: ## run-single with a wiped data dir (fresh start).
 	./scripts/run-single.sh --clean
+
+# ---------------------------------------------------------------------------
+# Full bare-metal stack (server + gateway + admin panel) — no Docker.
+# Builds the admin frontend (Vite) + backend (Go) once, then keeps everything
+# under a single process tree so Ctrl-C tears the whole stack down.
+# ---------------------------------------------------------------------------
+
+.PHONY: up-all
+up-all: ## Bring up the full bare-metal stack: server + gateway + admin panel.
+	./scripts/run-single.sh --with-admin
+
+.PHONY: up-all-clean
+up-all-clean: ## up-all with a wiped data dir (fresh RBAC + storage).
+	./scripts/run-single.sh --with-admin --clean
+
+.PHONY: up-all-release
+up-all-release: ## up-all built with --release binaries.
+	MODE=release ./scripts/run-single.sh --with-admin
+
+.PHONY: down-all
+down-all: ## Kill the bare-metal stack (server + gateway + admin) by port.
+	./scripts/run-single.sh --stop
+
+.PHONY: admin-build
+admin-build: ## Build the admin panel (frontend + Go binary) without starting it.
+	./admin/scripts/build.sh
 
 .PHONY: run-shard-0 run-shard-1 run-router
 run-shard-0: ## Run shard-0 locally (config/node-0.toml).

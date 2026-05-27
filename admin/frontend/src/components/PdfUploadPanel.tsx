@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, type PdfChunk, type PdfExtractResult } from "../api";
+import { api, type AuthHeaders, type PdfChunk, type PdfExtractResult } from "../api";
 import { embedViaProxy } from "../embedApi";
 import {
   loadEmbeddingSettings,
@@ -12,7 +12,7 @@ import { hashEmbed } from "../embed";
 import type { CollectionInfo } from "../types";
 
 interface Props {
-  apiKey: string;
+  auth: AuthHeaders;
   info: CollectionInfo;
   onError: (msg: string) => void;
   onSuccess: (msg: string) => void;
@@ -47,7 +47,7 @@ const fmtSecs = (ms: number) => {
   return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 };
 
-export function PdfUploadPanel({ apiKey, info, onError, onSuccess, onUpserted }: Props) {
+export function PdfUploadPanel({ auth, info, onError, onSuccess, onUpserted }: Props) {
   const dim = info.dimension ?? 0;
   const dimMissing = dim === 0;
 
@@ -220,7 +220,7 @@ export function PdfUploadPanel({ apiKey, info, onError, onSuccess, onUpserted }:
           setProgress((p) =>
             p ? { ...p, phase: "upserting", done: start + batch.length - points.length } : p
           );
-          const r = await api.upsertPoints(info.name, points, apiKey || undefined);
+          const r = await api.upsertPoints(info.name, points, auth);
           upsertedTotal += r.upserted;
         }
         setProgress((p) =>

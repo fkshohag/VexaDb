@@ -1,15 +1,15 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, type AuthHeaders } from "../api";
 
 interface Props {
-  apiKey: string;
+  auth: AuthHeaders;
   selected: string | null;
   onSelect: (name: string) => void;
   refreshKey: number;
   onCreate: () => void;
 }
 
-export function CollectionList({ apiKey, selected, onSelect, refreshKey, onCreate }: Props) {
+export function CollectionList({ auth, selected, onSelect, refreshKey, onCreate }: Props) {
   const [names, setNames] = useState<string[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [error, setError] = useState<string | null>(null);
@@ -18,7 +18,7 @@ export function CollectionList({ apiKey, selected, onSelect, refreshKey, onCreat
     let cancelled = false;
     (async () => {
       try {
-        const list = await api.listCollections(apiKey || undefined);
+        const list = await api.listCollections(auth);
         if (cancelled) return;
         setNames(list);
         setError(null);
@@ -26,6 +26,8 @@ export function CollectionList({ apiKey, selected, onSelect, refreshKey, onCreat
         // Stream counts in waves of 4 so the gateway doesn't get hammered
         // with 50+ parallel describe calls when the cluster is under load.
         // Counts appear incrementally instead of waiting for the slowest one.
+        // Prefer /stats since it returns a structured vector_count without
+        // pulling down the debug-formatted spec.
         const concurrency = 4;
         let cursor = 0;
         const next = async () => {
@@ -33,12 +35,20 @@ export function CollectionList({ apiKey, selected, onSelect, refreshKey, onCreat
             const i = cursor++;
             const name = list[i];
             try {
-              const d = await api.describeCollection(name, apiKey || undefined);
+              const s = await api.collectionStats(name, auth);
               if (cancelled) return;
-              setCounts((prev) => ({ ...prev, [name]: d.vector_count }));
+              setCounts((prev) => ({ ...prev, [name]: s.vector_count }));
             } catch {
               if (cancelled) return;
-              setCounts((prev) => ({ ...prev, [name]: -1 }));
+              // Fallback to describe if /stats fails (older gateway).
+              try {
+                const d = await api.describeCollection(name, auth);
+                if (cancelled) return;
+                setCounts((prev) => ({ ...prev, [name]: d.vector_count }));
+              } catch {
+                if (cancelled) return;
+                setCounts((prev) => ({ ...prev, [name]: -1 }));
+              }
             }
           }
         };
@@ -50,7 +60,7 @@ export function CollectionList({ apiKey, selected, onSelect, refreshKey, onCreat
     return () => {
       cancelled = true;
     };
-  }, [apiKey, refreshKey]);
+  }, [auth.apiKey, auth.bearer, refreshKey]);
 
   return (
     <aside className="sidebar">

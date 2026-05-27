@@ -60,6 +60,13 @@ export function CollectionDetail({ info }: Props) {
           {info.efConstruction != null ? `, ef_construction=${info.efConstruction}` : ""}
           {info.efSearch != null ? `, ef_search=${info.efSearch}` : ""}
         </div>
+
+        {info.payloadIndexCount != null && (
+          <>
+            <div className="k">Payload indexes</div>
+            <div className="v">{info.payloadIndexCount}</div>
+          </>
+        )}
       </div>
 
       <details style={{ marginTop: 14 }}>

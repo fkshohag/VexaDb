@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, type AuthHeaders } from "../api";
 
 interface Props {
-  apiKey: string;
+  auth: AuthHeaders;
 }
 
-export function HealthBar({ apiKey }: Props) {
+export function HealthBar({ auth }: Props) {
   const [status, setStatus] = useState<"unknown" | "ok" | "fail">("unknown");
   const [latency, setLatency] = useState<number | null>(null);
 
@@ -14,7 +14,7 @@ export function HealthBar({ apiKey }: Props) {
     const tick = async () => {
       const t = performance.now();
       try {
-        const r = await api.health(apiKey || undefined);
+        const r = await api.health(auth);
         if (cancelled) return;
         setStatus(r.status === "ok" ? "ok" : "fail");
         setLatency(Math.round(performance.now() - t));
@@ -31,7 +31,7 @@ export function HealthBar({ apiKey }: Props) {
       cancelled = true;
       clearInterval(id);
     };
-  }, [apiKey]);
+  }, [auth.apiKey, auth.bearer]);
 
   return (
     <span className={`health-pill ${status === "unknown" ? "" : status}`}>

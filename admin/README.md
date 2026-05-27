@@ -27,12 +27,24 @@ The browser calls `POST /embed` on the admin backend, which proxies to LM Studio
 ## Features
 
 - Health pill with live latency to the gateway
-- Browse collections with vector counts
+- **RBAC username/password login** (`POST /v1/auth/login`) — mints a bearer token
+  that is used for every subsequent call; falls back to an `x-api-key` if
+  RBAC is disabled or no user has been bootstrapped yet
+- Browse collections with vector counts (uses `/v1/collections/:name/stats`)
 - Create / delete collections (cosine, Euclidean, dot; optional BM25 text field)
-- Search panel with **dense**, **BM25**, **hybrid (RRF)**, and **hybrid (weighted)** modes,
-  optional JSON filter, and live result inspection (click a hit → see payload + vector preview)
-- Admin actions: reindex, WAL compaction (with optional snapshot first), snapshot list/create/delete
-- Persists API key per browser
+- Search panel with **dense**, **BM25**, **hybrid (RRF)**, **hybrid (weighted)**,
+  and **hybrid multi-AnnRequest** modes (Milvus parity reranker controls,
+  `with_payload` / `with_vector`, `output_fields`, JSON filter or expression),
+  with live result inspection (click a hit → see payload + vector preview)
+- **Browse tab** — cursor-paginated `POST /v1/collections/:name/scroll` for
+  walking every point in a collection (filter / partition / output-fields aware)
+- Admin tab:
+  - Reindex, WAL compaction (with optional snapshot first), snapshot list/create/delete
+  - **Delete points** by IDs and/or Milvus-style filter expression, optionally
+    scoped to a partition
+  - **Analyzer tester** — `POST /v1/admin/analyze` to see exactly how BM25
+    tokenizes a string (either the collection's analyzer or a custom one)
+- Persists API key and bearer-token session per browser
 
 ## Architecture
 
@@ -61,9 +73,15 @@ cd admin
 Open <http://127.0.0.1:5173>. The Go backend is on `:8090` and the gateway URL
 is read from `VECTORDB_URL` (default `http://127.0.0.1:8080`).
 
-If you have auth enabled, set `VECTORDB_API_KEY` once and the panel will
-forward it to the gateway. You can also paste the key in the top-right input;
-that is stored in `localStorage` per browser.
+If you have auth enabled, the recommended flow is to click **Log in** in the
+top-right corner and authenticate with the default local-dev credentials
+(`root` / `VexaDb!` — see `scripts/run-single.sh`). The minted bearer token is
+stored in `localStorage` and used for every gateway call.
+
+The `x-api-key` input still works as a fallback (e.g. for legacy keys, or when
+RBAC is disabled). When both are set the bearer token wins so RBAC roles are
+honoured. You can also set `VECTORDB_API_KEY` on the admin backend to inject a
+default key for unauthenticated browser requests.
 
 ## Production build
 
@@ -107,12 +125,15 @@ admin/
 │       ├── api.ts           # typed fetch client + parseCollectionInfo
 │       ├── types.ts
 │       ├── styles.css
+│       ├── auth.ts        # bearer-token + API-key state, shared across components
 │       └── components/
 │           ├── HealthBar.tsx
+│           ├── LoginDialog.tsx
 │           ├── CollectionList.tsx
 │           ├── CollectionDetail.tsx
-│           ├── SearchPanel.tsx
-│           ├── AdminPanel.tsx
+│           ├── SearchPanel.tsx    # dense / BM25 / hybrid (RRF, weighted, multi-AnnRequest)
+│           ├── BrowsePanel.tsx    # scroll iterator
+│           ├── AdminPanel.tsx     # reindex, WAL, snapshots, delete-by-filter, analyzer
 │           └── CreateCollectionDialog.tsx
 └── scripts/
     ├── dev.sh               # run backend + Vite together
@@ -121,11 +142,17 @@ admin/
 
 ## Notes & limitations
 
-- The gateway returns a collection's spec as a debug-formatted string today;
-  the frontend regex-parses it for the structured fields shown in *Overview*.
-  When the gateway exposes a structured spec we'll switch the parser off.
-- There is no "list points" endpoint in the gateway, so the panel surfaces
-  data via `Search` only. Use a zero-vector + BM25 query, or a random unit
-  vector, to browse a representative sample.
-- All destructive actions (`Delete collection`, `Delete snapshot`) go through
-  a `confirm()` prompt — there is no soft-delete / undo.
+- The collection *Overview* tab pulls structured data from
+  `GET /v1/collections/:name/stats` (dimension, metric, BM25 field,
+  sparse/quantization flags, payload index count, vector count) and only
+  falls back to regex-parsing the legacy debug spec for HNSW parameters
+  (`m`, `ef_construction`, `ef_search`), which aren't on `/stats` yet.
+- The **Browse** tab now lists every point via cursor-based `/scroll`
+  (Milvus parity), so you no longer need the old zero-vector / random-
+  unit-vector workaround.
+- All destructive actions (`Delete collection`, `Delete snapshot`,
+  `Delete points`) go through a `confirm()` prompt — there is no
+  soft-delete / undo.
+- The **Analyzer tester** can either reuse the collection's own analyzer
+  (when it has a BM25 text field) or run an ad-hoc Milvus-style
+  `analyzer_params` JSON block against a sample input.
