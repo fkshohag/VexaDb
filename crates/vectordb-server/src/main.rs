@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 use vectordb_proto::VectorServiceServer;
 use vectordb_router::{RebalanceCoordinator, RouterService};
 
-use vectordb_rbac::{RbacCache, RbacInterceptor};
+use vectordb_rbac::{GrpcMethodLayer, RbacCache, RbacInterceptor};
 use vectordb_server::authz::spawn_remote_refresh;
 use vectordb_server::config::{load_config, ServerConfig};
 use vectordb_server::metrics;
@@ -160,6 +160,10 @@ async fn main() -> anyhow::Result<()> {
         let coordinator: RebalanceCoordinator = router.rebalance();
         coordinator.spawn_loop();
         server
+            // `GrpcMethodLayer` captures the gRPC method name from the
+            // HTTP URI path so `RbacInterceptor` can read it (tonic 0.12
+            // does not insert `tonic::GrpcMethod` on the server side).
+            .layer(GrpcMethodLayer)
             .layer(tonic::service::interceptor(auth))
             .add_service(VectorServiceServer::new(router))
             .serve(addr)
@@ -227,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     server
+        .layer(GrpcMethodLayer)
         .layer(tonic::service::interceptor(auth))
         .add_service(VectorServiceServer::new(svc))
         .serve(addr)

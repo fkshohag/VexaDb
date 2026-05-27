@@ -22,5 +22,8 @@ pub use model::{
 };
 pub use ops::RbacOp;
 pub use password::{hash_secret, verify_secret, PasswordError};
-pub use grpc::{require_collection, require_global, method_priv, MethodPriv, RbacCache, RbacInterceptor};
+pub use grpc::{
+    require_collection, require_global, method_priv, GrpcMethodLayer, GrpcMethodName,
+    GrpcMethodService, MethodPriv, RbacCache, RbacInterceptor,
+};
 pub use state::{AuthzError, Principal, RbacError, RbacSnapshot, RbacState};

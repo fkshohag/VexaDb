@@ -4,16 +4,79 @@
 //! with a local engine refresh it directly, routers pull snapshots over gRPC.
 
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use base64::Engine as _;
 use parking_lot::RwLock;
 use tonic::{Request, Status};
+use tower::{Layer, Service};
 
 use vectordb_auth::{HEADER_API_KEY, HEADER_AUTHORIZATION};
 
 use crate::{
     AuthzError, ObjectType, Principal, Privilege, RbacSnapshot, RbacState,
 };
+
+/// Request extension holding the gRPC method name (the last path segment of
+/// the HTTP/2 request URI, e.g. `Health` for `/vectordb.v1.VectorService/Health`).
+///
+/// tonic 0.12 only inserts `tonic::GrpcMethod` on the **client** side, so
+/// server-side interceptors can't read the method directly. The
+/// [`GrpcMethodLayer`] Tower middleware below captures it from the HTTP URI
+/// before the interceptor runs.
+#[derive(Debug, Clone)]
+pub struct GrpcMethodName(pub Arc<str>);
+
+impl GrpcMethodName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Tower [`Layer`] that wraps an HTTP service and inserts a
+/// [`GrpcMethodName`] extension on every request based on the URI path.
+#[derive(Clone, Default)]
+pub struct GrpcMethodLayer;
+
+impl<S> Layer<S> for GrpcMethodLayer {
+    type Service = GrpcMethodService<S>;
+    fn layer(&self, inner: S) -> Self::Service {
+        GrpcMethodService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct GrpcMethodService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<http::Request<B>> for GrpcMethodService<S>
+where
+    S: Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
+        // gRPC URIs look like `/<service>/<method>`. Take the last
+        // non-empty segment as the method name.
+        let method: Option<Arc<str>> = req
+            .uri()
+            .path()
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .map(Arc::from);
+        if let Some(m) = method {
+            req.extensions_mut().insert(GrpcMethodName(m));
+        }
+        self.inner.call(req)
+    }
+}
 
 /// In-memory mirror of the cluster RBAC state (cheap to clone).
 #[derive(Clone)]
@@ -184,10 +247,19 @@ impl RbacInterceptor {
 
 impl tonic::service::Interceptor for RbacInterceptor {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        // Prefer the method name captured by `GrpcMethodLayer` (works on the
+        // server side). Fall back to `tonic::GrpcMethod` (client codegen) for
+        // completeness, though it isn't present in server requests.
         let method = request
             .extensions()
-            .get::<tonic::GrpcMethod<'_>>()
-            .map(|m| m.method().to_string())
+            .get::<GrpcMethodName>()
+            .map(|m| m.as_str().to_string())
+            .or_else(|| {
+                request
+                    .extensions()
+                    .get::<tonic::GrpcMethod<'_>>()
+                    .map(|m| m.method().to_string())
+            })
             .unwrap_or_default();
 
         if self.exempt_health && method == "Health" {
