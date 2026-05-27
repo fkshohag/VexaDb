@@ -69,6 +69,12 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 
 CONFIG_FILE="$DATA_DIR/server.toml"
 LOG_DIR="$DATA_DIR/logs"
+# Persisted legacy API key shared between server (config keys) and gateway
+# (upstream gRPC client). The gateway uses this as a superuser credential for
+# every gRPC call so it can keep working after RBAC turns itself on (once a
+# `root` user is bootstrapped). Survives restarts so existing data keeps
+# authenticating; regenerated only on --clean / FRESH=1.
+API_KEY_FILE="$DATA_DIR/.api-key"
 
 # ---------------------------------------------------------------------------
 # Colorized prefix logger
@@ -107,6 +113,17 @@ if [[ "$CLEAN" == "1" && -d "$DATA_DIR" ]]; then
   rm -rf "$DATA_DIR"
 fi
 mkdir -p "$DATA_DIR" "$LOG_DIR"
+
+# Generate (or reuse) the persistent dev API key after clean so --clean
+# always produces a fresh key alongside fresh data.
+if [[ -z "$API_KEY" ]]; then
+  if [[ -s "$API_KEY_FILE" ]]; then
+    API_KEY="$(cat "$API_KEY_FILE")"
+  else
+    API_KEY="dev-$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 32)"
+    printf '%s' "$API_KEY" > "$API_KEY_FILE"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Generate config (1 shard, RF=1, no Raft)
@@ -175,10 +192,10 @@ if [[ -n "$METRICS_PORT" ]]; then
 else
   METRICS_DISPLAY="(disabled)"
 fi
-if [[ -n "$API_KEY" ]]; then
+if [[ -n "$ROOT_PASSWORD" ]]; then
+  AUTH_DISPLAY="RBAC (login user=root) + api-key (x-api-key)"
+elif [[ -n "$API_KEY" ]]; then
   AUTH_DISPLAY="api-key (header x-api-key)"
-elif [[ -n "$ROOT_PASSWORD" ]]; then
-  AUTH_DISPLAY='RBAC (POST /v1/auth/login user=root)'
 else
   AUTH_DISPLAY="(open)"
 fi
@@ -295,13 +312,23 @@ done
 # Quick smoke output for the user.
 cat <<TRY
 ${C_INFO}
-Ready. Try:
-  curl http://127.0.0.1:${GATEWAY_PORT}/health
-  curl http://127.0.0.1:${GATEWAY_PORT}/v1/version
-  curl http://127.0.0.1:${GATEWAY_PORT}/v1/collections
-  curl -X POST http://127.0.0.1:${GATEWAY_PORT}/v1/auth/login \\
-    -H 'Content-Type: application/json' \\
-    -d '{"username":"root","password":"'"${ROOT_PASSWORD}"'"}'${C_OFF}
+Ready.
+
+  Root password : ${ROOT_PASSWORD}
+  API key       : ${API_KEY}
+                  (stored at ${API_KEY_FILE})
+
+Try:
+  curl -H "x-api-key: ${API_KEY}" http://127.0.0.1:${GATEWAY_PORT}/health
+  curl -H "x-api-key: ${API_KEY}" http://127.0.0.1:${GATEWAY_PORT}/v1/version
+  curl -H "x-api-key: ${API_KEY}" http://127.0.0.1:${GATEWAY_PORT}/v1/collections
+  curl -X POST -H "x-api-key: ${API_KEY}" \\
+       -H 'Content-Type: application/json' \\
+       -d '{"username":"root","password":"'"${ROOT_PASSWORD}"'"}' \\
+       http://127.0.0.1:${GATEWAY_PORT}/v1/auth/login
+
+Or bootstrap a fresh root via:
+  scripts/bootstrap-rbac.sh${C_OFF}
 
 TRY
 

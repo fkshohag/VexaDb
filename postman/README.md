@@ -15,22 +15,34 @@ REST endpoint exposed by the `vectordb-gateway` service.
    it elsewhere (`vectordb-gateway --http 0.0.0.0:18080 ...`).
 2. **Import** both JSON files in Postman (`File → Import…`). Pick the
    `VexaDb Local` environment in the top-right selector.
-3. **Login (when using `scripts/run-single.sh`).** The dev launcher sets
-   `VECTORDB_ROOT_PASSWORD=VexaDb!` by default and bootstraps a `root`
-   user. Run `Auth & RBAC → POST /v1/auth/login` once; the test script
-   stores the returned token in `apiToken` for Bearer auth on later calls.
-   Credentials in the request body: `{"username":"root","password":"VexaDb!"}`.
-   If you see **404** on login, RBAC is disabled — restart the gateway with
-   `VECTORDB_ROOT_PASSWORD` set. If you see **401**, the password does not
-   match the bootstrapped user (try `FRESH=1 ./scripts/run-single.sh --clean`
-   to reset local data).
+3. **Authenticate.** Two options:
+
+   **a. Bearer token via login** — run `Auth & RBAC → POST /v1/auth/login`
+   with `{"username":"root","password":"VexaDb!"}`. The test script stores
+   the returned token in `apiToken` for Bearer auth on later requests.
+   404 here means RBAC is disabled, 401 means the password is wrong (try
+   `FRESH=1 ./scripts/run-single.sh --clean` to reset).
+
+   **b. API key (legacy superuser)** — `scripts/run-single.sh` prints a
+   dev API key on every launch. Set the collection variable `apiToken`
+   to that key and switch the auth type on the collection root from
+   `Bearer Token` to `API Key` (header name `x-api-key`). Or run
+   `scripts/bootstrap-rbac.sh` to print both credentials again.
 
 ## How auth works
 
-* The collection has a collection-level **Bearer** auth that pulls from
-  `{{apiToken}}`. After `POST /v1/auth/login` the token is cached.
+* `scripts/run-single.sh` enables RBAC + creates a `root` user (password
+  `VexaDb!`) and also writes a persistent dev API key to
+  `run-data/single/.api-key`. **Both** auth flows work:
+  * **Bearer token** — `POST /v1/auth/login`, then every request uses
+    `Authorization: Bearer {{apiToken}}` (the login test script populates
+    `apiToken` automatically).
+  * **API key (legacy superuser)** — set `x-api-key: <key>` on any request
+    and you skip the login dance entirely. Useful for scripts and tests.
 * The `/health`, `/live`, `/ready`, `/metrics`, `/v1/version` and the
-  login endpoint use `noauth` so they always succeed on an open cluster.
+  login endpoint use `noauth` (HTTP-level), but on RBAC-on clusters the
+  gateway still needs an upstream-authorized gRPC channel — that's why
+  the script ships a persistent API key.
 * A pre-request script automatically injects `X-Database: {{dbName}}` on
   every request so you can swap databases by editing one variable.
 
