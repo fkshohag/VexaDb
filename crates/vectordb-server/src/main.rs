@@ -68,7 +68,15 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(metrics) = &cfg.metrics {
         let listen: SocketAddr = metrics.listen.parse().context("invalid metrics.listen")?;
-        metrics::spawn_metrics_server(listen).await?;
+        if let Err(e) = metrics::spawn_metrics_server(listen).await {
+            // Metrics are optional for local dev; don't abort gRPC when :9090 is
+            // still held by a stale process from a previous run-single.sh.
+            tracing::warn!(
+                error = %e,
+                %listen,
+                "prometheus metrics disabled (bind failed)"
+            );
+        }
     }
 
     let addr = cfg.server.listen.parse()?;

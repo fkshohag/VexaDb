@@ -9,6 +9,7 @@
 #   scripts/run-single.sh                       # debug build, default ports
 #   MODE=release scripts/run-single.sh          # optimized binaries
 #   scripts/run-single.sh --clean               # wipe ./run-data first
+#   scripts/run-single.sh --stop                # kill stale server/gateway on default ports
 #   GATEWAY_PORT=9000 GRPC_PORT=7000 scripts/run-single.sh
 #
 # Environment knobs (all optional):
@@ -33,11 +34,14 @@ set -euo pipefail
 # Args
 # ---------------------------------------------------------------------------
 CLEAN=0
+STOP_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --clean|-c|--fresh) CLEAN=1 ;;
+    --stop) STOP_ONLY=1 ;;
     --help|-h)
       sed -n '/^# Build /,/^# --clean (or FRESH=1)\./p' "$0" | sed 's/^# \{0,1\}//'
+      echo "  --stop            kill stale vectordb-server/gateway on default ports"
       exit 0
       ;;
     *)
@@ -92,6 +96,49 @@ fi
 
 log()  { printf "%s▶ %s%s\n" "$C_INFO" "$*" "$C_OFF"; }
 warn() { printf "%s! %s%s\n" "$C_WARN" "$*" "$C_OFF" >&2; }
+
+# Return PIDs listening on a TCP port (macOS/Linux via lsof).
+pids_on_port() {
+  local port="$1"
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true
+}
+
+# Stop vectordb-server / vectordb-gateway processes holding our ports.
+stop_stale_vexa() {
+  local port pid comm killed=0
+  for port in "$GRPC_PORT" "$GATEWAY_PORT" "${METRICS_PORT:-}"; do
+    [[ -z "$port" ]] && continue
+    for pid in $(pids_on_port "$port"); do
+      # macOS ps -o comm= may be a full path; match on basename only.
+      comm="$(basename "$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')")"
+      case "$comm" in
+        vectordb-server|vectordb-gateway)
+          warn "Stopping stale $comm (pid $pid) on port $port"
+          kill "$pid" 2>/dev/null || true
+          killed=1
+          ;;
+        *)
+          warn "Port $port is in use by '$comm' (pid $pid), not a VexaDb binary"
+          warn "Free the port or set GRPC_PORT / GATEWAY_PORT / METRICS_PORT"
+          exit 1
+          ;;
+      esac
+    done
+  done
+  if [[ "$killed" == "1" ]]; then
+    sleep 0.5
+  fi
+}
+
+ensure_ports_available() {
+  stop_stale_vexa
+}
+
+if [[ "$STOP_ONLY" == "1" ]]; then
+  stop_stale_vexa
+  log "Stopped stale VexaDb processes on ports ${GRPC_PORT}, ${GATEWAY_PORT}${METRICS_PORT:+, ${METRICS_PORT}}"
+  exit 0
+fi
 
 # Prefix every line of a stream with a colored tag + tee to a log file.
 # Pure-bash so it works on macOS's default bash 3.2 (no gawk strftime needed).
@@ -252,6 +299,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+ensure_ports_available
+
 # ---------------------------------------------------------------------------
 # Start vectordb-server
 # ---------------------------------------------------------------------------
@@ -265,13 +314,13 @@ SERVER_PID=$!
 # Wait for gRPC to come up (TCP connect probe).
 log "Waiting for gRPC :${GRPC_PORT} to accept connections…"
 for i in $(seq 1 60); do
-  if (echo >/dev/tcp/127.0.0.1/"$GRPC_PORT") 2>/dev/null; then
-    log "gRPC is up."
-    break
-  fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     warn "vectordb-server exited before becoming ready. See $LOG_DIR/server.log"
     exit 1
+  fi
+  if (echo >/dev/tcp/127.0.0.1/"$GRPC_PORT") 2>/dev/null; then
+    log "gRPC is up."
+    break
   fi
   sleep 0.5
   if [[ $i -eq 60 ]]; then
@@ -346,4 +395,10 @@ TRY
 while kill -0 "$SERVER_PID" 2>/dev/null && kill -0 "$GATEWAY_PID" 2>/dev/null; do
   sleep 1
 done
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  warn "vectordb-server exited — see $LOG_DIR/server.log"
+fi
+if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+  warn "vectordb-gateway exited — see $LOG_DIR/gateway.log"
+fi
 warn "One of the processes exited; tearing down."
