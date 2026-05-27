@@ -1,37 +1,12 @@
-// Load tester for VectorDB using the Go SDK.
+// Load tester for VexaDb using the Go SDK.
 //
 // Three phases run sequentially against a single collection:
 //
-//   1. SINGLE upsert  — many concurrent workers, small batches
-//      (simulates online, low-latency writes).
-//   2. BULK   upsert  — fewer workers, large chunks via /bulk
-//      (simulates batch ingestion).
-//   3. QUERY  search  — concurrent dense top-k searches.
+//  1. SINGLE upsert  — many concurrent workers, small batches
+//  2. BULK   upsert  — fewer workers, large chunks via /bulk
+//  3. QUERY  search  — concurrent dense top-k searches
 //
-// Tunable via env vars (defaults in parentheses):
-//
-//	VECTORDB_URL          (http://127.0.0.1:8080)
-//	VECTORDB_API_KEY      (unset)
-//	LT_COLLECTION         (loadtest)
-//	LT_DIM                (768)         vector dimension
-//	LT_TOTAL              (50000)       total points to insert per phase
-//	LT_SINGLE_CONCURRENCY (16)          concurrent workers in single-upsert phase
-//	LT_SINGLE_BATCH       (32)          points per /upsert request
-//	LT_BULK_CONCURRENCY   (4)           concurrent workers in bulk phase
-//	LT_BULK_CHUNK         (256)         points per /bulk request (server may sub-chunk)
-//	                                    NOTE: at dim=768 each point is ~6KB JSON,
-//	                                    so 256 points ≈ 1.5MB — safely under the
-//	                                    gateway's default 2MB body limit. Raise
-//	                                    only if your gateway's BodyLimit is larger.
-//	LT_QUERY_CONCURRENCY  (32)
-//	LT_QUERY_TOTAL        (10000)       number of search calls
-//	LT_QUERY_TOPK         (20)
-//	LT_HTTP_TIMEOUT_S     (60)
-//	LT_KEEP_COLLECTION    (0)           1 = leave the collection in place at end
-//	LT_PROGRESS_S         (5)           seconds between live progress lines
-//
-// Run:
-//   cd sdks/go && go run ./examples/loadtest
+// Run: cd sdks/go && go run ./examples/loadtest
 package main
 
 import (
@@ -46,7 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	vectordb "github.com/vectordb/vectordb/sdks/go"
+	"github.com/vectordb/vectordb/sdks/go/entity"
+	"github.com/vectordb/vectordb/sdks/go/vexaclient"
 )
 
 type config struct {
@@ -91,67 +67,59 @@ func main() {
 	cfg := loadConfig()
 	log.Printf("config: %+v", cfg)
 
-	c := vectordb.NewClient(cfg.url, cfg.apiKey)
-	c.HTTPClient.Timeout = time.Duration(cfg.httpTimeoutS) * time.Second
-
 	ctx := context.Background()
-	if h, err := c.Health(ctx); err != nil {
-		log.Fatalf("health check: %v", err)
-	} else {
-		log.Printf("connected: %s (%v)", cfg.url, h)
+	cli, err := vexaclient.New(ctx, &vexaclient.ClientConfig{
+		Address: cfg.url,
+		APIKey:  cfg.apiKey,
+		Timeout: time.Duration(cfg.httpTimeoutS) * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("connect: %v", err)
 	}
+	defer cli.Close(ctx)
 
 	if !cfg.keep {
-		_ = c.DeleteCollection(ctx, cfg.collection)
+		_ = cli.DropCollection(ctx, vexaclient.NewDropCollectionOption(cfg.collection))
 	}
 
-	if err := c.CreateCollection(ctx, cfg.collection, cfg.dim, vectordb.CreateCollectionOpts{
-		Metric: "cosine",
-		PayloadIndexes: []vectordb.PayloadIndex{
-			{Field: "shard_hint", Kind: "keyword"},
-			{Field: "i", Kind: "numeric"},
-		},
-	}); err != nil {
+	create := vexaclient.NewSimpleCreateCollectionOption(cfg.collection, int64(cfg.dim)).
+		WithMetricType(entity.COSINE).
+		WithPayloadIndexes(
+			entity.PayloadIndex{Field: "shard_hint", Kind: entity.IndexKeyword},
+			entity.PayloadIndex{Field: "i", Kind: entity.IndexNumeric},
+		)
+	if err := cli.CreateCollection(ctx, create); err != nil {
 		log.Fatalf("create collection: %v", err)
 	}
 	log.Printf("created %q (dim=%d)", cfg.collection, cfg.dim)
 
-	// Phase 1: single upsert
-	singleStats := runSingleUpsert(ctx, c, cfg)
+	singleStats := runSingleUpsert(ctx, cli, cfg)
 	singleStats.print("SINGLE upsert", cfg.total)
 
-	// Phase 2: bulk upsert (fresh ID range so we don't overwrite)
-	bulkStats := runBulkUpsert(ctx, c, cfg)
+	bulkStats := runBulkUpsert(ctx, cli, cfg)
 	bulkStats.print("BULK upsert", cfg.total)
 
-	// Phase 3: query
-	queryStats := runQuery(ctx, c, cfg)
+	queryStats := runQuery(ctx, cli, cfg)
 	queryStats.print("QUERY search", cfg.queryTotal)
 
-	// Final cluster + collection state
-	if cs, err := c.ClusterStatus(ctx); err == nil {
+	if cs, err := cli.ClusterStatus(ctx); err == nil {
 		log.Printf("cluster: %d shards x RF=%d, %d nodes", cs.ShardCount, cs.ReplicationFactor, len(cs.Nodes))
 	}
-	// describe is best-effort — don't fail the test if it 502s
-	_, _ = c.Health(ctx)
 
 	if !cfg.keep {
 		log.Printf("dropping collection %q (LT_KEEP_COLLECTION=1 to keep)", cfg.collection)
-		if err := c.DeleteCollection(ctx, cfg.collection); err != nil {
-			log.Printf("delete collection: %v", err)
+		if err := cli.DropCollection(ctx, vexaclient.NewDropCollectionOption(cfg.collection)); err != nil {
+			log.Printf("drop collection: %v", err)
 		}
 	}
 	log.Printf("done.")
 }
 
-// ---- workload: single upsert ----
-
-func runSingleUpsert(ctx context.Context, c *vectordb.Client, cfg config) *stats {
+func runSingleUpsert(ctx context.Context, cli *vexaclient.Client, cfg config) *stats {
 	log.Printf("[single] %d points across %d workers, batch=%d",
 		cfg.total, cfg.singleConc, cfg.singleBatch)
 	st := newStats()
 
-	// Worker queue: each task is one batch of point indices [start, end).
 	tasks := make(chan [2]int, 2*cfg.singleConc)
 	go func() {
 		for start := 0; start < cfg.total; start += cfg.singleBatch {
@@ -172,10 +140,10 @@ func runSingleUpsert(ctx context.Context, c *vectordb.Client, cfg config) *stats
 			defer wg.Done()
 			rng := rand.New(rand.NewPCG(seed, 0xfeedface))
 			for r := range tasks {
-				batch := makePoints(rng, cfg.dim, "s", r[0], r[1])
+				opt := makeInsertOpt(rng, cfg, "s", r[0], r[1])
 				t0 := time.Now()
-				_, err := c.Upsert(ctx, cfg.collection, batch)
-				st.record(time.Since(t0), len(batch), err)
+				_, err := cli.Upsert(ctx, opt)
+				st.record(time.Since(t0), r[1]-r[0], err)
 			}
 		}(uint64(w + 1))
 	}
@@ -184,9 +152,7 @@ func runSingleUpsert(ctx context.Context, c *vectordb.Client, cfg config) *stats
 	return st
 }
 
-// ---- workload: bulk upsert ----
-
-func runBulkUpsert(ctx context.Context, c *vectordb.Client, cfg config) *stats {
+func runBulkUpsert(ctx context.Context, cli *vexaclient.Client, cfg config) *stats {
 	log.Printf("[bulk] %d points across %d workers, chunk=%d",
 		cfg.total, cfg.bulkConc, cfg.bulkChunk)
 	st := newStats()
@@ -211,10 +177,10 @@ func runBulkUpsert(ctx context.Context, c *vectordb.Client, cfg config) *stats {
 			defer wg.Done()
 			rng := rand.New(rand.NewPCG(seed+1000, 0xcafebabe))
 			for r := range tasks {
-				batch := makePoints(rng, cfg.dim, "b", r[0], r[1])
+				opt := makeInsertOpt(rng, cfg, "b", r[0], r[1])
 				t0 := time.Now()
-				_, err := c.BulkUpsert(ctx, cfg.collection, batch, 256)
-				st.record(time.Since(t0), len(batch), err)
+				_, err := cli.BulkUpsert(ctx, cfg.collection, opt, 256)
+				st.record(time.Since(t0), r[1]-r[0], err)
 			}
 		}(uint64(w + 1))
 	}
@@ -223,9 +189,7 @@ func runBulkUpsert(ctx context.Context, c *vectordb.Client, cfg config) *stats {
 	return st
 }
 
-// ---- workload: query ----
-
-func runQuery(ctx context.Context, c *vectordb.Client, cfg config) *stats {
+func runQuery(ctx context.Context, cli *vexaclient.Client, cfg config) *stats {
 	log.Printf("[query] %d searches across %d workers, top_k=%d",
 		cfg.queryTotal, cfg.queryConc, cfg.queryTopK)
 	st := newStats()
@@ -251,7 +215,7 @@ func runQuery(ctx context.Context, c *vectordb.Client, cfg config) *stats {
 					vec[j] = float32(rng.NormFloat64())
 				}
 				t0 := time.Now()
-				_, err := c.Search(ctx, cfg.collection, vec, vectordb.SearchOpts{TopK: cfg.queryTopK})
+				_, err := cli.Search(ctx, vexaclient.NewSearchOption(cfg.collection, cfg.queryTopK, []entity.Vector{entity.FloatVector(vec)}))
 				st.record(time.Since(t0), 1, err)
 			}
 		}(uint64(w + 1))
@@ -261,26 +225,28 @@ func runQuery(ctx context.Context, c *vectordb.Client, cfg config) *stats {
 	return st
 }
 
-// ---- helpers ----
-
-func makePoints(rng *rand.Rand, dim int, prefix string, start, end int) []vectordb.Point {
-	out := make([]vectordb.Point, end-start)
-	for i := range out {
+func makeInsertOpt(rng *rand.Rand, cfg config, prefix string, start, end int) *vexaclient.ColumnBasedInsertOption {
+	n := end - start
+	ids := make([]string, n)
+	vectors := make([][]float32, n)
+	hints := make([]string, n)
+	idxs := make([]int64, n)
+	for i := 0; i < n; i++ {
 		idx := start + i
-		v := make([]float32, dim)
+		ids[i] = fmt.Sprintf("%s-%07d", prefix, idx)
+		v := make([]float32, cfg.dim)
 		for j := range v {
 			v[j] = float32(rng.NormFloat64())
 		}
-		out[i] = vectordb.Point{
-			ID:     fmt.Sprintf("%s-%07d", prefix, idx),
-			Values: v,
-			Payload: map[string]any{
-				"shard_hint": []string{"a", "b", "c", "d", "e"}[idx%5],
-				"i":          idx,
-			},
-		}
+		vectors[i] = v
+		hints[i] = []string{"a", "b", "c", "d", "e"}[idx%5]
+		idxs[i] = int64(idx)
 	}
-	return out
+	return vexaclient.NewColumnBasedInsertOption(cfg.collection).
+		WithIDs(ids).
+		WithFloatVectorColumn("vector", cfg.dim, vectors).
+		WithVarcharColumn("shard_hint", hints).
+		WithInt64Column("i", idxs)
 }
 
 func startProgress(st *stats, everySecs int, tag string) chan struct{} {
@@ -316,11 +282,9 @@ func startProgress(st *stats, everySecs int, tag string) chan struct{} {
 	return stop
 }
 
-// ---- stats ----
-
 type stats struct {
-	ops    uint64 // requests completed
-	items  uint64 // points (or searches) accounted
+	ops    uint64
+	items  uint64
 	errs   uint64
 	latMu  sync.Mutex
 	lat    []time.Duration
@@ -342,7 +306,6 @@ func (s *stats) record(d time.Duration, n int, err error) {
 	if err != nil {
 		atomic.AddUint64(&s.errs, 1)
 		s.latMu.Lock()
-		// Truncate error key to avoid map blow-up on long messages.
 		key := err.Error()
 		if len(key) > 80 {
 			key = key[:80]

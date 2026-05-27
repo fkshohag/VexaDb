@@ -6,11 +6,22 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 use vectordb_auth::HEADER_API_KEY;
 use vectordb_proto::vectordb::v1::{
-    BulkUpsertRequest, CollectionSpec, CompactWalRequest, CompactWalResponse, CreateCollectionRequest,
-    CreateSnapshotRequest, DeleteCollectionRequest, DeleteRequest, DeleteSnapshotRequest,
-    DescribeCollectionRequest, DistanceMetric, GetRequest, HealthRequest, HealthResponse,
-    ImportChunk, ListCollectionsRequest, ListSnapshotsRequest, ReindexCollectionRequest,
-    ReindexCollectionResponse, SearchRequest, SnapshotInfo, UpsertRequest, VectorPoint,
+    AddPayloadIndexRequest, AlterDatabaseRequest, ApplyRbacRequest, BulkUpsertRequest,
+    CollectionSpec, CompactCollectionRequest, CompactWalRequest, CompactWalResponse,
+    CreateCollectionRequest, CreateDatabaseRequest, CreatePartitionRequest,
+    CreateResourceGroupRequest, CreateSnapshotRequest, DatabaseInfo, DeleteCollectionRequest,
+    DeleteRequest, DeleteSnapshotRequest, DescribeAliasRequest, DescribeCollectionRequest,
+    DescribeDatabaseRequest, DescribeReplicaRequest, DescribeReplicaResponse,
+    DescribeResourceGroupRequest, DescribeResourceGroupResponse, DistanceMetric,
+    DropDatabaseRequest, DropPartitionRequest, DropPayloadIndexRequest, DropResourceGroupRequest,
+    FlushCollectionRequest, FlushCollectionResponse, GetCompactionStateRequest,
+    GetCompactionStateResponse, GetPartitionStatsRequest, GetRbacSnapshotRequest, GetRequest,
+    HasPartitionRequest, HealthRequest, HealthResponse, ImportChunk, ListAliasesRequest,
+    ListCollectionsRequest, ListDatabasesRequest, ListPartitionsRequest,
+    ListPersistentSegmentsRequest, ListPersistentSegmentsResponse, ListResourceGroupsRequest,
+    ListSnapshotsRequest, MutateCollectionMetaRequest, QueryRequest, QueryResponse,
+    ReindexCollectionRequest, ReindexCollectionResponse, SearchRequest, SnapshotInfo, StatsRequest,
+    StatsResponse, TransferReplicaRequest, UpdateResourceGroupRequest, UpsertRequest, VectorPoint,
 };
 use vectordb_proto::VectorServiceClient;
 
@@ -135,6 +146,16 @@ impl VectorDbClient {
         &mut self,
         name: &str,
     ) -> anyhow::Result<(CollectionSpec, u64)> {
+        let (spec, count, _) = self.describe_collection_full(name).await?;
+        Ok((spec, count))
+    }
+
+    /// Same as [`describe_collection`] but also returns the list of aliases
+    /// pointing to this collection.
+    pub async fn describe_collection_full(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<(CollectionSpec, u64, Vec<String>)> {
         let resp = self
             .inner
             .describe_collection(self.authed(DescribeCollectionRequest {
@@ -142,7 +163,310 @@ impl VectorDbClient {
             }))
             .await?
             .into_inner();
-        Ok((resp.spec.context("missing spec")?, resp.vector_count))
+        Ok((
+            resp.spec.context("missing spec")?,
+            resp.vector_count,
+            resp.aliases,
+        ))
+    }
+
+    /// Apply a collection-meta mutation (rename / alias / properties) via gRPC.
+    /// `op` is a `vectordb_storage::MetaOp` serialized to JSON by the caller.
+    pub async fn mutate_collection_meta(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .mutate_collection_meta(self.authed(MutateCollectionMetaRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_aliases(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let resp = self
+            .inner
+            .list_aliases(self.authed(ListAliasesRequest {
+                collection: collection.into(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp
+            .aliases
+            .into_iter()
+            .map(|a| (a.alias, a.collection))
+            .collect())
+    }
+
+    pub async fn describe_alias(&mut self, alias: &str) -> anyhow::Result<String> {
+        let resp = self
+            .inner
+            .describe_alias(self.authed(DescribeAliasRequest {
+                alias: alias.into(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.collection)
+    }
+
+    // ---- Database management (Milvus v2 parity) ---------------------------
+
+    /// Create a database via `MetaOp::CreateDatabase` JSON payload.
+    pub async fn create_database(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .create_database(self.authed(CreateDatabaseRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a database via `MetaOp::DropDatabase` JSON payload.
+    pub async fn drop_database(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_database(self.authed(DropDatabaseRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Alter a database's properties via `MetaOp::AlterDatabaseProperties`.
+    pub async fn alter_database(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .alter_database(self.authed(AlterDatabaseRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_databases(&mut self) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .inner
+            .list_databases(self.authed(ListDatabasesRequest {}))
+            .await?
+            .into_inner();
+        Ok(resp.names)
+    }
+
+    pub async fn describe_database(&mut self, name: &str) -> anyhow::Result<DatabaseInfo> {
+        let resp = self
+            .inner
+            .describe_database(self.authed(DescribeDatabaseRequest { name: name.into() }))
+            .await?
+            .into_inner();
+        resp.info.context("missing database info")
+    }
+
+    // ---- Management (Milvus v2 parity) ------------------------------------
+
+    /// Add a payload (scalar) index via `MetaOp::AddPayloadIndex`.
+    pub async fn add_payload_index(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .add_payload_index(self.authed(AddPayloadIndexRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a payload (scalar) index via `MetaOp::DropPayloadIndex`.
+    pub async fn drop_payload_index(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_payload_index(self.authed(DropPayloadIndexRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Flush a collection's pending writes — Milvus parity.
+    pub async fn flush_collection(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<FlushCollectionResponse> {
+        let resp = self
+            .inner
+            .flush_collection(self.authed(FlushCollectionRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// Trigger collection-scoped compaction and return the job ID.
+    pub async fn compact_collection(&mut self, collection: &str) -> anyhow::Result<u64> {
+        let resp = self
+            .inner
+            .compact_collection(self.authed(CompactCollectionRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.compaction_id)
+    }
+
+    /// Poll the state of a compaction job minted by [`Self::compact_collection`].
+    pub async fn get_compaction_state(
+        &mut self,
+        compaction_id: u64,
+    ) -> anyhow::Result<GetCompactionStateResponse> {
+        let resp = self
+            .inner
+            .get_compaction_state(self.authed(GetCompactionStateRequest { compaction_id }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    /// List persistent segments for a collection.
+    pub async fn list_persistent_segments(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<ListPersistentSegmentsResponse> {
+        let resp = self
+            .inner
+            .list_persistent_segments(self.authed(ListPersistentSegmentsRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    // ---- Partition management (Milvus parity) -------------------------------
+
+    /// Create a partition via a JSON-encoded `MetaOp::CreatePartition`.
+    pub async fn create_partition(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .create_partition(self.authed(CreatePartitionRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a partition via a JSON-encoded `MetaOp::DropPartition`. Cascades:
+    /// the engine deletes every point tagged with the partition.
+    pub async fn drop_partition(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_partition(self.authed(DropPartitionRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn has_partition(
+        &mut self,
+        collection: &str,
+        partition: &str,
+    ) -> anyhow::Result<bool> {
+        let resp = self
+            .inner
+            .has_partition(self.authed(HasPartitionRequest {
+                collection: collection.to_string(),
+                partition: partition.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.exists)
+    }
+
+    pub async fn list_partitions(&mut self, collection: &str) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .inner
+            .list_partitions(self.authed(ListPartitionsRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.partitions)
+    }
+
+    pub async fn get_partition_stats(
+        &mut self,
+        collection: &str,
+        partition: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let resp = self
+            .inner
+            .get_partition_stats(self.authed(GetPartitionStatsRequest {
+                collection: collection.to_string(),
+                partition: partition.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp.stats)
+    }
+
+    // ---- Resource groups (Milvus parity) ------------------------------------
+
+    /// Create a resource group via a JSON-encoded `MetaOp::CreateResourceGroup`.
+    pub async fn create_resource_group(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .create_resource_group(self.authed(CreateResourceGroupRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    /// Drop a resource group via a JSON-encoded `MetaOp::DropResourceGroup`.
+    pub async fn drop_resource_group(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .drop_resource_group(self.authed(DropResourceGroupRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_resource_group(&mut self, op_json: Vec<u8>) -> anyhow::Result<()> {
+        self.inner
+            .update_resource_group(self.authed(UpdateResourceGroupRequest { op_json }))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_resource_groups(&mut self) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .inner
+            .list_resource_groups(self.authed(ListResourceGroupsRequest {}))
+            .await?
+            .into_inner();
+        Ok(resp.names)
+    }
+
+    pub async fn describe_resource_group(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<DescribeResourceGroupResponse> {
+        let resp = self
+            .inner
+            .describe_resource_group(self.authed(DescribeResourceGroupRequest {
+                name: name.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn describe_replica(
+        &mut self,
+        collection: &str,
+    ) -> anyhow::Result<DescribeReplicaResponse> {
+        let resp = self
+            .inner
+            .describe_replica(self.authed(DescribeReplicaRequest {
+                collection: collection.to_string(),
+            }))
+            .await?
+            .into_inner();
+        Ok(resp)
+    }
+
+    pub async fn transfer_replica(
+        &mut self,
+        collection: &str,
+        source_group: &str,
+        target_group: &str,
+        replica_num: i64,
+        database: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .transfer_replica(self.authed(TransferReplicaRequest {
+                collection: collection.to_string(),
+                source_group: source_group.to_string(),
+                target_group: target_group.to_string(),
+                replica_num,
+                database: database.to_string(),
+            }))
+            .await?;
+        Ok(())
     }
 
     pub async fn upsert(
@@ -188,8 +512,21 @@ impl VectorDbClient {
         filter_ids: Vec<String>,
         filter_json: String,
     ) -> anyhow::Result<Vec<vectordb_proto::vectordb::v1::ScoredPoint>> {
-        self.search_hybrid(collection, query, top_k, filter_ids, filter_json, None, None, "", 0.5)
-            .await
+        self.search_hybrid(
+            collection,
+            query,
+            top_k,
+            filter_ids,
+            filter_json,
+            None,
+            None,
+            "",
+            0.5,
+            vec![],
+            false,
+            false,
+        )
+        .await
     }
 
     /// Full search including sparse/BM25/hybrid modes.
@@ -204,6 +541,9 @@ impl VectorDbClient {
         text_query: Option<String>,
         search_mode: &str,
         hybrid_alpha: f32,
+        output_fields: Vec<String>,
+        with_payload: bool,
+        with_vector: bool,
     ) -> anyhow::Result<Vec<vectordb_proto::vectordb::v1::ScoredPoint>> {
         Ok(self
             .inner
@@ -217,21 +557,107 @@ impl VectorDbClient {
                 text_query: text_query.unwrap_or_default(),
                 search_mode: search_mode.into(),
                 hybrid_alpha,
+                output_fields,
+                with_payload,
+                with_vector,
             }))
             .await?
             .into_inner()
             .hits)
     }
 
+    /// Filter-only retrieval (no query vector).
+    pub async fn query(
+        &mut self,
+        collection: &str,
+        filter_json: String,
+        ids: Vec<String>,
+        limit: u32,
+        offset: u32,
+        output_fields: Vec<String>,
+        with_payload: bool,
+        with_vector: bool,
+    ) -> anyhow::Result<QueryResponse> {
+        Ok(self
+            .inner
+            .query(self.authed(QueryRequest {
+                collection: collection.into(),
+                filter_json,
+                ids,
+                limit,
+                offset,
+                output_fields,
+                with_payload,
+                with_vector,
+            }))
+            .await?
+            .into_inner())
+    }
+
+    pub async fn stats(&mut self, collection: &str) -> anyhow::Result<StatsResponse> {
+        Ok(self
+            .inner
+            .stats(self.authed(StatsRequest {
+                collection: collection.into(),
+            }))
+            .await?
+            .into_inner())
+    }
+
+    /// Apply one RBAC mutation. `op_json` must be a JSON-serialized
+    /// [`vectordb_rbac::RbacOp`]. Followers redirect to the leader.
+    pub async fn apply_rbac(&mut self, op_json: Vec<u8>) -> Result<(), Status> {
+        self.redirect_on_leader(|mut c| {
+            let op_json = op_json.clone();
+            async move {
+                c.inner
+                    .apply_rbac(c.authed(ApplyRbacRequest { op_json }))
+                    .await?;
+                Ok(())
+            }
+        })
+        .await
+    }
+
+    /// Fetch the current RBAC snapshot as JSON bytes (decode into
+    /// [`vectordb_rbac::RbacSnapshot`]).
+    pub async fn get_rbac_snapshot(&mut self) -> Result<Vec<u8>, Status> {
+        Ok(self
+            .inner
+            .get_rbac_snapshot(self.authed(GetRbacSnapshotRequest {}))
+            .await?
+            .into_inner()
+            .snapshot_json)
+    }
+
     pub async fn delete(&mut self, collection: &str, ids: Vec<String>) -> anyhow::Result<u64> {
+        self.delete_full(collection, ids, String::new(), String::new()).await
+    }
+
+    /// Delete points by ID list, filter expression, partition scope, or any
+    /// combination thereof. Empty fields are no-ops on the server side.
+    pub async fn delete_full(
+        &mut self,
+        collection: &str,
+        ids: Vec<String>,
+        filter: String,
+        partition: String,
+    ) -> anyhow::Result<u64> {
         let collection = collection.to_string();
         self.redirect_on_leader(|mut c| {
             let collection = collection.clone();
             let ids = ids.clone();
+            let filter = filter.clone();
+            let partition = partition.clone();
             async move {
                 let resp = c
                     .inner
-                    .delete(c.authed(DeleteRequest { collection, ids }))
+                    .delete(c.authed(DeleteRequest {
+                        collection,
+                        ids,
+                        filter,
+                        partition,
+                    }))
                     .await?
                     .into_inner();
                 Ok(resp.deleted)
@@ -291,16 +717,60 @@ impl VectorDbClient {
         cursor: &str,
         limit: u32,
     ) -> anyhow::Result<(Vec<VectorPoint>, String)> {
+        self.scroll_filtered(collection, cursor, limit, "", "", &[], true, false).await
+    }
+
+    /// Filter-aware scroll. Used by `QueryIterator` in the SDKs.
+    pub async fn scroll_filtered(
+        &mut self,
+        collection: &str,
+        cursor: &str,
+        limit: u32,
+        filter: &str,
+        partition: &str,
+        output_fields: &[String],
+        with_payload: bool,
+        with_vector: bool,
+    ) -> anyhow::Result<(Vec<VectorPoint>, String)> {
         let resp = self
             .inner
             .scroll(self.authed(vectordb_proto::vectordb::v1::ScrollRequest {
                 collection: collection.into(),
                 cursor: cursor.into(),
                 limit,
+                filter: filter.to_string(),
+                partition: partition.to_string(),
+                output_fields: output_fields.to_vec(),
+                with_payload,
+                with_vector,
             }))
             .await?
             .into_inner();
         Ok((resp.points, resp.next_cursor))
+    }
+
+    /// Multi-leg ANN search (Milvus-parity HybridSearch).
+    pub async fn hybrid_search(
+        &mut self,
+        req: vectordb_proto::vectordb::v1::HybridSearchRequest,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::HybridSearchResponse> {
+        Ok(self
+            .inner
+            .hybrid_search(self.authed(req))
+            .await?
+            .into_inner())
+    }
+
+    /// Run the configured text analyzer over one or more inputs.
+    pub async fn run_analyzer(
+        &mut self,
+        req: vectordb_proto::vectordb::v1::RunAnalyzerRequest,
+    ) -> anyhow::Result<vectordb_proto::vectordb::v1::RunAnalyzerResponse> {
+        Ok(self
+            .inner
+            .run_analyzer(self.authed(req))
+            .await?
+            .into_inner())
     }
 
     /// Trigger a one-shot rebalance sweep on the router.
@@ -458,5 +928,8 @@ pub fn cosine_collection(name: &str, dimension: u32) -> CollectionSpec {
         sparse_enabled: false,
         bm25_text_field: String::new(),
         scalar_quantization: false,
+        properties: std::collections::HashMap::new(),
+        // Empty string → server-side defaults to "default".
+        database: String::new(),
     }
 }

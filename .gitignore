@@ -16,6 +16,8 @@ Cargo.lock.bak
 /wal
 **/snapshots/
 **/wal/
+# Storage + logs produced by scripts/run-single.sh (raw-binary single-instance).
+/run-data/
 
 # Cluster shape (user-local). docker-compose.yml + config/cluster/*.toml
 # are regenerated from this by scripts/cluster.py.
@@ -169,3 +171,7 @@ $RECYCLE.BIN/
 graphify-out/
 agent-transcripts/
 .graphify_python
+
+# Go SDK
+# =============================================================================
+sdks/go/milvus-sdk-go/

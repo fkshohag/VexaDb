@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, ApiError, parseCollectionInfo } from "./api";
+import { api, ApiError, buildCollectionInfo } from "./api";
+import { useAuth } from "./auth";
 import type { CollectionInfo, ServerConfig } from "./types";
 import { HealthBar } from "./components/HealthBar";
 import { CollectionList } from "./components/CollectionList";
@@ -7,23 +8,21 @@ import { CollectionDetail } from "./components/CollectionDetail";
 import { SearchPanel } from "./components/SearchPanel";
 import { UpsertPanel } from "./components/UpsertPanel";
 import { PdfUploadPanel } from "./components/PdfUploadPanel";
+import { BrowsePanel } from "./components/BrowsePanel";
 import { AdminPanel } from "./components/AdminPanel";
 import { CreateCollectionDialog } from "./components/CreateCollectionDialog";
+import { LoginDialog } from "./components/LoginDialog";
 
-type Tab = "overview" | "search" | "upsert" | "pdf" | "admin";
+type Tab = "overview" | "search" | "browse" | "upsert" | "pdf" | "admin";
 
 interface Toast {
   level: "error" | "success";
   message: string;
 }
 
-const API_KEY_STORAGE = "vectordb-admin-api-key";
-
 export default function App() {
+  const auth = useAuth();
   const [config, setConfig] = useState<ServerConfig | null>(null);
-  const [apiKey, setApiKey] = useState<string>(
-    () => localStorage.getItem(API_KEY_STORAGE) ?? ""
-  );
 
   const [selected, setSelected] = useState<string | null>(null);
   const [info, setInfo] = useState<CollectionInfo | null>(null);
@@ -31,19 +30,16 @@ export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [toast, setToast] = useState<Toast | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
-
-  // Persist API key for convenience.
-  useEffect(() => {
-    if (apiKey) localStorage.setItem(API_KEY_STORAGE, apiKey);
-    else localStorage.removeItem(API_KEY_STORAGE);
-  }, [apiKey]);
+  const [loginOpen, setLoginOpen] = useState(false);
 
   // Load /config.json from the Go backend.
   useEffect(() => {
     api.config().then(setConfig).catch(() => setConfig(null));
   }, []);
 
-  // Load the selected collection details.
+  // Load the selected collection details. We pull both /stats (structured)
+  // and the legacy describe (debug spec — needed for HNSW params) in parallel
+  // and merge them so we always show as much as possible.
   useEffect(() => {
     if (!selected) {
       setInfo(null);
@@ -52,8 +48,18 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
-        const desc = await api.describeCollection(selected, apiKey || undefined);
-        if (!cancelled) setInfo(parseCollectionInfo(selected, desc));
+        const [statsRes, descRes] = await Promise.allSettled([
+          api.collectionStats(selected, auth.headers),
+          api.describeCollection(selected, auth.headers),
+        ]);
+        if (cancelled) return;
+        const stats = statsRes.status === "fulfilled" ? statsRes.value : null;
+        const desc = descRes.status === "fulfilled" ? descRes.value : null;
+        if (!stats && !desc) {
+          const err = descRes.status === "rejected" ? descRes.reason : statsRes.status === "rejected" ? statsRes.reason : null;
+          throw err ?? new Error("collection lookup failed");
+        }
+        setInfo(buildCollectionInfo(selected, stats, desc));
       } catch (e) {
         if (!cancelled) {
           const msg = e instanceof ApiError ? e.body : (e as Error).message;
@@ -65,7 +71,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [selected, apiKey, refreshKey]);
+  }, [selected, auth.headers, refreshKey]);
 
   // Auto-dismiss toasts.
   useEffect(() => {
@@ -82,6 +88,20 @@ export default function App() {
     [config]
   );
 
+  const handleLogout = async () => {
+    const tokenId = auth.session?.tokenId;
+    auth.logout();
+    if (tokenId) {
+      // Best-effort revoke — works as long as the bearer is still valid.
+      try {
+        await api.revokeToken(tokenId, auth.headers);
+      } catch {
+        /* token may already be revoked or the gateway is down */
+      }
+    }
+    showSuccess("Logged out");
+  };
+
   return (
     <div className="layout">
       <header className="topbar">
@@ -95,19 +115,43 @@ export default function App() {
 
         <span className="spacer" />
 
+        {auth.session ? (
+          <span className="auth-badge user" title={`Token ${auth.session.tokenId}`}>
+            <span className="dot" />
+            <span className="user-name">{auth.session.user}</span>
+            <button
+              type="button"
+              className="linklike"
+              onClick={handleLogout}
+              title="Revoke this token and log out"
+            >
+              log out
+            </button>
+          </span>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setLoginOpen(true)}
+            title="Log in with username + password (RBAC)"
+          >
+            Log in…
+          </button>
+        )}
+
         <input
           type="password"
-          placeholder="API key (optional)"
-          value={apiKey}
-          onChange={(e) => setApiKey(e.target.value)}
+          placeholder="API key (fallback)"
+          value={auth.apiKey}
+          onChange={(e) => auth.setApiKey(e.target.value)}
           style={{ width: 220 }}
           aria-label="API key"
+          title="Legacy x-api-key fallback. Bearer token from login takes precedence when set."
         />
-        <HealthBar apiKey={apiKey} />
+        <HealthBar auth={auth.headers} />
       </header>
 
       <CollectionList
-        apiKey={apiKey}
+        auth={auth.headers}
         selected={selected}
         onSelect={setSelected}
         refreshKey={refreshKey}
@@ -123,9 +167,35 @@ export default function App() {
             </p>
             <ul style={{ color: "var(--text-muted)", margin: 0, paddingLeft: 20 }}>
               <li>Browse collection metadata: dimension, metric, indexes, vector count.</li>
-              <li>Run dense, BM25, and hybrid searches; click any hit to inspect its payload.</li>
-              <li>Create snapshots, compact the WAL, or trigger a reindex.</li>
+              <li>
+                Run dense, BM25, hybrid (RRF / weighted), and multi-vector
+                hybrid searches; click any hit to inspect its payload.
+              </li>
+              <li>
+                Paginate every point in a collection with the new <strong>Browse</strong> tab
+                (cursor-based scroll).
+              </li>
+              <li>
+                Create snapshots, compact the WAL, run a reindex, delete by filter
+                expression, or test the BM25 tokenizer.
+              </li>
             </ul>
+            {!auth.configured && (
+              <p
+                style={{
+                  marginTop: 14,
+                  padding: "10px 12px",
+                  borderRadius: 8,
+                  border: "1px solid rgba(245,158,11,0.45)",
+                  background: "rgba(245,158,11,0.06)",
+                  color: "var(--amber)",
+                  fontSize: 13,
+                }}
+              >
+                No credentials configured. Click <strong>Log in</strong> (default
+                <code> root</code> / <code>VexaDb!</code>) or paste your API key.
+              </p>
+            )}
           </div>
         )}
 
@@ -143,26 +213,42 @@ export default function App() {
             </div>
 
             <div className="tabs">
-              {(["overview", "search", "upsert", "pdf", "admin"] as const).map((t) => (
-                <div
-                  key={t}
-                  className={`tab ${tab === t ? "active" : ""}`}
-                  onClick={() => setTab(t)}
-                >
-                  {t === "pdf" ? "PDF" : t.charAt(0).toUpperCase() + t.slice(1)}
-                </div>
-              ))}
+              {(["overview", "search", "browse", "upsert", "pdf", "admin"] as const).map(
+                (t) => (
+                  <div
+                    key={t}
+                    className={`tab ${tab === t ? "active" : ""}`}
+                    onClick={() => setTab(t)}
+                  >
+                    {t === "pdf" ? "PDF" : t.charAt(0).toUpperCase() + t.slice(1)}
+                  </div>
+                )
+              )}
             </div>
 
             {tab === "overview" && <CollectionDetail info={info} />}
 
             {tab === "search" && (
-              <SearchPanel apiKey={apiKey} info={info} onError={showError} onSuccess={showSuccess} />
+              <SearchPanel
+                auth={auth.headers}
+                info={info}
+                onError={showError}
+                onSuccess={showSuccess}
+              />
+            )}
+
+            {tab === "browse" && (
+              <BrowsePanel
+                auth={auth.headers}
+                info={info}
+                onError={showError}
+                onSuccess={showSuccess}
+              />
             )}
 
             {tab === "upsert" && (
               <UpsertPanel
-                apiKey={apiKey}
+                auth={auth.headers}
                 info={info}
                 onError={showError}
                 onSuccess={showSuccess}
@@ -172,7 +258,7 @@ export default function App() {
 
             {tab === "pdf" && (
               <PdfUploadPanel
-                apiKey={apiKey}
+                auth={auth.headers}
                 info={info}
                 onError={showError}
                 onSuccess={showSuccess}
@@ -182,7 +268,7 @@ export default function App() {
 
             {tab === "admin" && (
               <AdminPanel
-                apiKey={apiKey}
+                auth={auth.headers}
                 info={info}
                 onError={showError}
                 onSuccess={showSuccess}
@@ -203,13 +289,23 @@ export default function App() {
       </main>
 
       <CreateCollectionDialog
-        apiKey={apiKey}
+        auth={auth.headers}
         open={createOpen}
         onClose={() => setCreateOpen(false)}
         onCreated={(name) => {
           setRefreshKey((k) => k + 1);
           setSelected(name);
           showSuccess(`created ${name}`);
+        }}
+        onError={showError}
+      />
+
+      <LoginDialog
+        open={loginOpen}
+        onClose={() => setLoginOpen(false)}
+        onLogin={(session) => {
+          auth.setSession(session);
+          showSuccess(`Logged in as ${session.user}`);
         }}
         onError={showError}
       />

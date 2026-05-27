@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 vectordb-proto.workspace = true
 vectordb-auth.workspace = true
+vectordb-rbac.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

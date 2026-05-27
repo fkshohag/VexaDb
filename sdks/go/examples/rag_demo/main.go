@@ -8,7 +8,8 @@ import (
 	"math"
 	"os"
 
-	"github.com/vectordb/vectordb/sdks/go"
+	"github.com/vectordb/vectordb/sdks/go/rag"
+	"github.com/vectordb/vectordb/sdks/go/vexaclient"
 )
 
 const dim = 32
@@ -38,11 +39,19 @@ func main() {
 	if base == "" {
 		base = "http://127.0.0.1:8080"
 	}
-	client := vectordb.NewClient(base, os.Getenv("VECTORDB_API_KEY"))
-	rag := vectordb.NewRagPipeline(client, "rag_demo_go", dim, fakeEmbed)
-
 	ctx := context.Background()
-	_, err := rag.Ingest(ctx, []vectordb.Document{
+	cli, err := vexaclient.New(ctx, &vexaclient.ClientConfig{
+		Address: base,
+		APIKey:  os.Getenv("VECTORDB_API_KEY"),
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer cli.Close(ctx)
+
+	pipe := rag.NewPipeline(cli, "rag_demo_go", dim, fakeEmbed)
+
+	_, err = pipe.Ingest(ctx, []rag.Document{
 		{
 			ID: "intro",
 			Text: "Vector databases store high-dimensional embeddings for similarity search. " +
@@ -50,7 +59,7 @@ func main() {
 		},
 		{
 			ID: "ops",
-			Text: "VectorDB supports HNSW indexing, metadata filters, hybrid BM25+dense search, " +
+			Text: "VexaDb supports HNSW indexing, metadata filters, hybrid BM25+dense search, " +
 				"and Raft replication.",
 		},
 	}, true)
@@ -58,7 +67,7 @@ func main() {
 		panic(err)
 	}
 
-	hits, err := rag.Query(ctx, "hybrid search and replication", vectordb.QueryOpts{
+	hits, err := pipe.Query(ctx, "hybrid search and replication", rag.QueryOpts{
 		TopK:   3,
 		Rerank: true,
 	})

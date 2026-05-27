@@ -17,6 +17,7 @@ vectordb-proto.workspace = true
 vectordb-router.workspace = true
 vectordb-replication.workspace = true
 vectordb-auth.workspace = true
+vectordb-rbac.workspace = true
 vectordb-client.workspace = true
 
 anyhow.workspace = true

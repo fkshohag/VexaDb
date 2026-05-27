@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 vectordb-core.workspace = true
+vectordb-rbac.workspace = true
 anyhow.workspace = true
 bincode.workspace = true
 memmap2.workspace = true

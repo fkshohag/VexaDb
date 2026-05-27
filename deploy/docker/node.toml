@@ -1,0 +1,22 @@
+# Single-node VectorDB config (all-in-one role: data + routing in one process).
+# Mounted into the container at /etc/vectordb/node.toml.
+
+[server]
+listen = "0.0.0.0:6334"
+
+[storage]
+data_dir = "/data"
+sync_wal = true
+
+[cluster]
+node_id = "node-1"
+role = "all_in_one"
+shard_count = 1
+shard_id = 0
+peers = []
+
+# Auto-snapshot every 5 minutes (compacts WAL, speeds future cold starts).
+[snapshot]
+interval_secs = 300
+compact_wal = true
+min_wal_entries = 100

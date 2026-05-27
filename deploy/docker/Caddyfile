@@ -1,0 +1,20 @@
+# Used only when docker-compose.caddy.yml is layered in.
+# Variables are substituted by Caddy's env-var support at startup.
+#
+# Routes EVERYTHING to the admin panel — the admin transparently proxies
+# /api/* and /v1/* to the gateway, while serving the React UI at /.
+
+{$PUBLIC_HOSTNAME} {
+    encode zstd gzip
+    reverse_proxy admin:8090
+    tls {$ACME_EMAIL}
+
+    # Optional: lock the whole admin panel behind HTTP Basic auth. Generate
+    # a hashed password with:
+    #   docker run --rm caddy:2-alpine caddy hash-password
+    # Then uncomment + paste below:
+    #
+    # basicauth {
+    #     admin $2a$14$...
+    # }
+}

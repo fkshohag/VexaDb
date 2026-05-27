@@ -6,23 +6,45 @@ use futures::future::join_all;
 use vectordb_cluster::{merge_top_k, ClusterConfig};
 use tonic::{Request, Response, Status, Streaming};
 use vectordb_proto::vectordb::v1::{
-    vector_service_server::VectorService, BulkUpsertRequest, BulkUpsertResponse, CollectionSpec,
-    ClusterStatusRequest, ClusterStatusResponse, ClusterNodeStatus, CompactWalRequest,
-    CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
-    CreateSnapshotRequest, CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse,
-    DeleteRequest, DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse,
-    DescribeCollectionRequest, DescribeCollectionResponse, GetRequest, GetResponse, HealthRequest,
-    HealthResponse, ImportChunk, ImportStreamResponse, ListCollectionsRequest,
-    ListCollectionsResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    RebalanceCollectionReport, RebalanceRequest, RebalanceResponse, RebalanceStatusRequest,
-    RebalanceStatusResponse, RegisterNodeRequest, RegisterNodeResponse,
-    ReindexCollectionRequest, ReindexCollectionResponse, ScrollRequest, ScrollResponse,
-    SearchRequest, SearchResponse, UpsertRequest, UpsertResponse, VectorPoint,
+    vector_service_server::VectorService, AddPayloadIndexRequest, AddPayloadIndexResponse,
+    AliasEntry, AlterDatabaseRequest, AlterDatabaseResponse, ApplyRbacRequest, ApplyRbacResponse,
+    BulkUpsertRequest, BulkUpsertResponse, ClusterNodeStatus, ClusterStatusRequest,
+    ClusterStatusResponse, CollectionSpec, CompactCollectionRequest, CompactCollectionResponse,
+    CompactWalRequest, CompactWalResponse, CreateCollectionRequest, CreateCollectionResponse,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreatePartitionRequest, CreatePartitionResponse,
+    CreateResourceGroupRequest, CreateResourceGroupResponse, CreateSnapshotRequest,
+    CreateSnapshotResponse, DeleteCollectionRequest, DeleteCollectionResponse, DeleteRequest,
+    DeleteResponse, DeleteSnapshotRequest, DeleteSnapshotResponse, DescribeAliasRequest,
+    DescribeAliasResponse, DescribeCollectionRequest, DescribeCollectionResponse,
+    DescribeDatabaseRequest, DescribeDatabaseResponse, DescribeReplicaRequest,
+    DescribeReplicaResponse, DescribeResourceGroupRequest, DescribeResourceGroupResponse,
+    DropDatabaseRequest, DropDatabaseResponse, DropPartitionRequest, DropPartitionResponse,
+    DropPayloadIndexRequest, DropPayloadIndexResponse, DropResourceGroupRequest,
+    DropResourceGroupResponse, FlushCollectionRequest, FlushCollectionResponse,
+    GetCompactionStateRequest, GetCompactionStateResponse, GetPartitionStatsRequest,
+    GetPartitionStatsResponse, GetRbacSnapshotRequest, GetRbacSnapshotResponse, GetRequest,
+    GetResponse, HasPartitionRequest, HasPartitionResponse, HealthRequest, HealthResponse,
+    ImportChunk, ImportStreamResponse, ListAliasesRequest, ListAliasesResponse,
+    ListCollectionsRequest, ListCollectionsResponse, ListDatabasesRequest, ListDatabasesResponse,
+    ListPartitionsRequest, ListPartitionsResponse, ListPersistentSegmentsRequest,
+    ListPersistentSegmentsResponse, ListResourceGroupsRequest, ListResourceGroupsResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, MutateCollectionMetaRequest,
+    MutateCollectionMetaResponse, QueryRequest, QueryResponse, RebalanceCollectionReport,
+    RebalanceRequest, RebalanceResponse, RebalanceStatusRequest, RebalanceStatusResponse,
+    RegisterNodeRequest, RegisterNodeResponse, ReindexCollectionRequest, ReindexCollectionResponse,
+    ReplicaInfo, ReplicaShard, RunAnalyzerRequest, RunAnalyzerResponse, ScrollRequest,
+    ScrollResponse, ScoredPoint as ScoredPointProto, SearchRequest, SearchResponse,
+    HybridSearchRequest, HybridSearchResponse,
+    StatsRequest, StatsResponse, TransferReplicaRequest, TransferReplicaResponse,
+    UpdateResourceGroupRequest, UpdateResourceGroupResponse, UpsertRequest, UpsertResponse,
+    VectorPoint,
 };
 
 use crate::pool::ClientPool;
 use crate::rebalance::RebalanceCoordinator;
 use crate::topology::TopologyManager;
+use vectordb_rbac::{require_collection, Privilege, RbacCache};
+
 use crate::{RebalanceConfig, TopologyConfig};
 
 pub struct RouterService {
@@ -30,9 +52,14 @@ pub struct RouterService {
     topology: Arc<TopologyManager>,
     node_id: String,
     rebalance: RebalanceCoordinator,
+    rbac: RbacCache,
 }
 
 impl RouterService {
+    pub fn set_rbac_cache(&mut self, cache: RbacCache) {
+        self.rbac = cache;
+    }
+
     pub fn new(node_id: impl Into<String>, cluster: &ClusterConfig, shard_count: u32) -> Self {
         Self::with_rebalance(node_id, cluster, shard_count, RebalanceConfig::default())
     }
@@ -77,6 +104,7 @@ impl RouterService {
             topology: topology.clone(),
             node_id: node_id.into(),
             rebalance,
+            rbac: RbacCache::new(vec![]),
         };
         (svc, topology)
     }
@@ -162,6 +190,37 @@ impl RouterService {
             .await
             .map_err(|e| Status::unavailable(e.to_string()))
     }
+
+    /// Fan a database management `MetaOp` payload to every shard. Mirrors the
+    /// fan-out logic used by `mutate_collection_meta` so the per-shard meta
+    /// DB stays consistent.
+    async fn fanout_database_op(
+        &self,
+        op_json: &[u8],
+        rpc: &'static str,
+    ) -> Result<(), Status> {
+        let bytes = op_json.to_vec();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            let bytes = bytes.clone();
+            let res = match rpc {
+                "create_database" => client.create_database(bytes).await,
+                "drop_database" => client.drop_database(bytes).await,
+                "alter_database" => client.alter_database(bytes).await,
+                _ => unreachable!(),
+            };
+            match res {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable(format!("no shard accepted {rpc}"))));
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -202,6 +261,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<DeleteCollectionRequest>,
     ) -> Result<Response<DeleteCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().name, Privilege::DropCollection)?;
         let name = request.into_inner().name;
         for (_, mut client) in self.clients_for_all_shards().await? {
             client
@@ -267,6 +327,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<DescribeCollectionRequest>,
     ) -> Result<Response<DescribeCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().name, Privilege::DescribeCollection)?;
         let name = request.into_inner().name;
         let clients = self.clients_for_shards_best_effort().await;
         if clients.is_empty() {
@@ -280,14 +341,18 @@ impl VectorService for RouterService {
         let mut ok_shards = 0usize;
         let mut failures = 0usize;
         let mut last_err: Option<String> = None;
+        let mut alias_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (shard, mut client) in clients {
-            match client.describe_collection(&name).await {
-                Ok((s, count)) => {
+            match client.describe_collection_full(&name).await {
+                Ok((s, count, aliases)) => {
                     ok_shards += 1;
                     if spec.is_none() {
                         spec = Some(s);
                     }
                     total += count;
+                    for a in aliases {
+                        alias_set.insert(a);
+                    }
                 }
                 Err(e) => {
                     failures += 1;
@@ -318,6 +383,7 @@ impl VectorService for RouterService {
         Ok(Response::new(DescribeCollectionResponse {
             spec,
             vector_count: total,
+            aliases: alias_set.into_iter().collect(),
         }))
     }
 
@@ -325,6 +391,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<UpsertRequest>,
     ) -> Result<Response<UpsertResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Upsert)?;
         let req = request.into_inner();
         let collection = req.collection;
 
@@ -447,6 +514,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Search)?;
         let req = request.into_inner();
         let top_k = req.top_k.max(1) as usize;
         let collection = req.collection.clone();
@@ -458,6 +526,9 @@ impl VectorService for RouterService {
         let text_query = req.text_query.clone();
         let search_mode = req.search_mode.clone();
         let hybrid_alpha = req.hybrid_alpha;
+        let output_fields = req.output_fields.clone();
+        let with_payload = req.with_payload;
+        let with_vector = req.with_vector;
         let futures: Vec<_> = self
             .clients_for_all_shards()
             .await?
@@ -470,6 +541,7 @@ impl VectorService for RouterService {
                 let sparse_query = sparse_query.clone();
                 let text_query = text_query.clone();
                 let search_mode = search_mode.clone();
+                let output_fields = output_fields.clone();
                 async move {
                     let per_shard_k = (top_k * 2).max(top_k) as u32;
                     client
@@ -487,6 +559,9 @@ impl VectorService for RouterService {
                             },
                             &search_mode,
                             hybrid_alpha,
+                            output_fields,
+                            with_payload,
+                            with_vector,
                         )
                         .await
                 }
@@ -533,16 +608,725 @@ impl VectorService for RouterService {
         Ok(Response::new(SearchResponse {
             hits: merged
                 .into_iter()
-                .map(|(id, score)| vectordb_proto::vectordb::v1::ScoredPoint { id, score })
+                .map(|(id, score)| vectordb_proto::vectordb::v1::ScoredPoint {
+                    id,
+                    score,
+                    payload: vec![],
+                    vector: vec![],
+                })
                 .collect(),
         }))
+    }
+
+    async fn query(
+        &self,
+        request: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Query)?;
+        let req = request.into_inner();
+        let limit = if req.limit == 0 { 100 } else { req.limit as usize };
+        let offset = req.offset as usize;
+        let collection = req.collection.clone();
+        let filter_json = req.filter_json.clone();
+        let ids = req.ids.clone();
+        let output_fields = req.output_fields.clone();
+        let with_payload = req.with_payload;
+        let with_vector = req.with_vector;
+
+        let futures: Vec<_> = self
+            .clients_for_all_shards()
+            .await?
+            .into_iter()
+            .map(|(_, mut client)| {
+                let collection = collection.clone();
+                let filter_json = filter_json.clone();
+                let ids = ids.clone();
+                let output_fields = output_fields.clone();
+                async move {
+                    client
+                        .query(
+                            &collection,
+                            filter_json,
+                            ids,
+                            limit.saturating_add(offset) as u32,
+                            0,
+                            output_fields,
+                            with_payload,
+                            with_vector,
+                        )
+                        .await
+                }
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+        let mut all_points = Vec::new();
+        for res in results {
+            if let Ok(resp) = res {
+                all_points.extend(resp.points);
+            }
+        }
+        all_points.sort_by(|a, b| a.id.cmp(&b.id));
+        all_points.dedup_by(|a, b| a.id == b.id);
+        let page: Vec<VectorPoint> = all_points.into_iter().skip(offset).take(limit).collect();
+        Ok(Response::new(QueryResponse {
+            points: page,
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn stats(
+        &self,
+        request: Request<StatsRequest>,
+    ) -> Result<Response<StatsResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::CollectionStats)?;
+        let name = request.into_inner().collection;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut total = 0u64;
+        let mut first: Option<StatsResponse> = None;
+        for (_, mut client) in clients {
+            if let Ok(s) = client.stats(&name).await {
+                total += s.vector_count;
+                if first.is_none() {
+                    first = Some(s);
+                }
+            }
+        }
+        let mut out = first.ok_or_else(|| Status::not_found(format!("collection {name}")))?;
+        out.vector_count = total;
+        Ok(Response::new(out))
+    }
+
+    async fn apply_rbac(
+        &self,
+        request: Request<ApplyRbacRequest>,
+    ) -> Result<Response<ApplyRbacResponse>, Status> {
+        let req = request.into_inner();
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            client
+                .apply_rbac(req.op_json.clone())
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        Ok(Response::new(ApplyRbacResponse {}))
+    }
+
+    async fn get_rbac_snapshot(
+        &self,
+        _request: Request<GetRbacSnapshotRequest>,
+    ) -> Result<Response<GetRbacSnapshotResponse>, Status> {
+        let clients = self.clients_for_shards_best_effort().await;
+        for (_, mut client) in clients {
+            if let Ok(snap) = client.get_rbac_snapshot().await {
+                return Ok(Response::new(GetRbacSnapshotResponse { snapshot_json: snap }));
+            }
+        }
+        Err(Status::unavailable("no shard returned an RBAC snapshot"))
+    }
+
+    async fn mutate_collection_meta(
+        &self,
+        request: Request<MutateCollectionMetaRequest>,
+    ) -> Result<Response<MutateCollectionMetaResponse>, Status> {
+        // Authorize at the router before fan-out so we fail fast and don't
+        // partially apply on shards. Per-handler check on each data node
+        // is still in place as defense-in-depth.
+        let op: vectordb_storage::MetaOp = serde_json::from_slice(&request.get_ref().op_json)
+            .map_err(|e| Status::invalid_argument(format!("invalid MetaOp JSON: {e}")))?;
+        let (target, priv_kind) = match &op {
+            vectordb_storage::MetaOp::RenameCollection { old, database, .. } => {
+                (format!("{database}/{old}"), Privilege::AlterCollection)
+            }
+            vectordb_storage::MetaOp::CreateAlias {
+                collection, database, ..
+            }
+            | vectordb_storage::MetaOp::AlterAlias {
+                collection, database, ..
+            } => (format!("{database}/{collection}"), Privilege::AlterAlias),
+            vectordb_storage::MetaOp::DropAlias { alias, database } => {
+                (format!("{database}/{alias}"), Privilege::AlterAlias)
+            }
+            vectordb_storage::MetaOp::AlterCollectionProperties { name, database, .. } => {
+                (format!("{database}/{name}"), Privilege::AlterCollection)
+            }
+            vectordb_storage::MetaOp::CreateDatabase { .. }
+            | vectordb_storage::MetaOp::DropDatabase { .. }
+            | vectordb_storage::MetaOp::AlterDatabaseProperties { .. } => {
+                return Err(Status::invalid_argument(
+                    "database management ops must use the CreateDatabase / DropDatabase / AlterDatabase RPCs",
+                ));
+            }
+            vectordb_storage::MetaOp::AddPayloadIndex { .. }
+            | vectordb_storage::MetaOp::DropPayloadIndex { .. } => {
+                return Err(Status::invalid_argument(
+                    "payload-index ops must use the AddPayloadIndex / DropPayloadIndex RPCs",
+                ));
+            }
+            vectordb_storage::MetaOp::CreatePartition { .. }
+            | vectordb_storage::MetaOp::DropPartition { .. } => {
+                return Err(Status::invalid_argument(
+                    "partition ops must use the CreatePartition / DropPartition RPCs",
+                ));
+            }
+            vectordb_storage::MetaOp::CreateResourceGroup { .. }
+            | vectordb_storage::MetaOp::DropResourceGroup { .. }
+            | vectordb_storage::MetaOp::UpdateResourceGroup { .. } => {
+                return Err(Status::invalid_argument(
+                    "resource-group ops must use the CreateResourceGroup / DropResourceGroup / UpdateResourceGroup RPCs",
+                ));
+            }
+        };
+        require_collection(&self.rbac, &request, &target, priv_kind)?;
+        let req = request.into_inner();
+        // Fan-out to all shards: meta is Raft-replicated but each shard's
+        // engine has its own meta-DB (collection list lives per shard).
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.mutate_collection_meta(req.op_json.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err.unwrap_or_else(|| {
+                Status::unavailable("no shard accepted mutate_collection_meta")
+            }));
+        }
+        Ok(Response::new(MutateCollectionMetaResponse {}))
+    }
+
+    async fn list_aliases(
+        &self,
+        request: Request<ListAliasesRequest>,
+    ) -> Result<Response<ListAliasesResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut merged: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (_, mut client) in clients {
+            if let Ok(rows) = client.list_aliases(&collection).await {
+                for (alias, coll) in rows {
+                    merged.entry(alias).or_insert(coll);
+                }
+            }
+        }
+        Ok(Response::new(ListAliasesResponse {
+            aliases: merged
+                .into_iter()
+                .map(|(alias, collection)| AliasEntry { alias, collection })
+                .collect(),
+        }))
+    }
+
+    async fn describe_alias(
+        &self,
+        request: Request<DescribeAliasRequest>,
+    ) -> Result<Response<DescribeAliasResponse>, Status> {
+        let alias = request.into_inner().alias;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut last_err: Option<String> = None;
+        for (_, mut client) in clients {
+            match client.describe_alias(&alias).await {
+                Ok(coll) => return Ok(Response::new(DescribeAliasResponse { collection: coll })),
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        Err(Status::not_found(format!(
+            "alias not found: {alias} ({})",
+            last_err.unwrap_or_else(|| "no shards reachable".into())
+        )))
+    }
+
+    // ---- Database management (Milvus parity) -----------------------------
+    //
+    // Databases are Raft-replicated metadata so a single shard's response is
+    // authoritative for reads. Mutations fan out to every shard for the same
+    // reason `mutate_collection_meta` does: each shard maintains its own
+    // local meta-DB.
+
+    async fn create_database(
+        &self,
+        request: Request<CreateDatabaseRequest>,
+    ) -> Result<Response<CreateDatabaseResponse>, Status> {
+        self.fanout_database_op(&request.get_ref().op_json, "create_database")
+            .await?;
+        Ok(Response::new(CreateDatabaseResponse {}))
+    }
+
+    async fn drop_database(
+        &self,
+        request: Request<DropDatabaseRequest>,
+    ) -> Result<Response<DropDatabaseResponse>, Status> {
+        self.fanout_database_op(&request.get_ref().op_json, "drop_database")
+            .await?;
+        Ok(Response::new(DropDatabaseResponse {}))
+    }
+
+    async fn alter_database(
+        &self,
+        request: Request<AlterDatabaseRequest>,
+    ) -> Result<Response<AlterDatabaseResponse>, Status> {
+        self.fanout_database_op(&request.get_ref().op_json, "alter_database")
+            .await?;
+        Ok(Response::new(AlterDatabaseResponse {}))
+    }
+
+    async fn list_databases(
+        &self,
+        _request: Request<ListDatabasesRequest>,
+    ) -> Result<Response<ListDatabasesResponse>, Status> {
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, mut client) in clients {
+            if let Ok(names) = client.list_databases().await {
+                merged.extend(names.into_iter());
+            }
+        }
+        Ok(Response::new(ListDatabasesResponse {
+            names: merged.into_iter().collect(),
+        }))
+    }
+
+    async fn describe_database(
+        &self,
+        request: Request<DescribeDatabaseRequest>,
+    ) -> Result<Response<DescribeDatabaseResponse>, Status> {
+        let name = request.into_inner().name;
+        let clients = self.clients_for_shards_best_effort().await;
+        let mut last_err: Option<String> = None;
+        for (_, mut client) in clients {
+            match client.describe_database(&name).await {
+                Ok(info) => {
+                    return Ok(Response::new(DescribeDatabaseResponse {
+                        info: Some(info),
+                    }))
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        Err(Status::not_found(format!(
+            "database not found: {name} ({})",
+            last_err.unwrap_or_else(|| "no shards reachable".into())
+        )))
+    }
+
+    // ---- Management RPCs (Milvus parity) ----------------------------------
+
+    async fn add_payload_index(
+        &self,
+        request: Request<AddPayloadIndexRequest>,
+    ) -> Result<Response<AddPayloadIndexResponse>, Status> {
+        let op_json = request.into_inner().op_json;
+        let bytes = op_json.clone();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.add_payload_index(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted add_payload_index")));
+        }
+        Ok(Response::new(AddPayloadIndexResponse {}))
+    }
+
+    async fn drop_payload_index(
+        &self,
+        request: Request<DropPayloadIndexRequest>,
+    ) -> Result<Response<DropPayloadIndexResponse>, Status> {
+        let op_json = request.into_inner().op_json;
+        let bytes = op_json.clone();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.drop_payload_index(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted drop_payload_index")));
+        }
+        Ok(Response::new(DropPayloadIndexResponse {}))
+    }
+
+    async fn flush_collection(
+        &self,
+        request: Request<FlushCollectionRequest>,
+    ) -> Result<Response<FlushCollectionResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let mut merged = FlushCollectionResponse {
+            collection: collection.clone(),
+            flush_ts_ms: 0,
+            segment_ids: vec![],
+            flushed_segment_ids: vec![],
+            wal_entries: 0,
+        };
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.flush_collection(&collection).await {
+                Ok(resp) => {
+                    ok += 1;
+                    if resp.flush_ts_ms > merged.flush_ts_ms {
+                        merged.flush_ts_ms = resp.flush_ts_ms;
+                    }
+                    merged.segment_ids.extend(resp.segment_ids);
+                    merged.flushed_segment_ids.extend(resp.flushed_segment_ids);
+                    merged.wal_entries += resp.wal_entries;
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted flush_collection")));
+        }
+        Ok(Response::new(merged))
+    }
+
+    async fn compact_collection(
+        &self,
+        request: Request<CompactCollectionRequest>,
+    ) -> Result<Response<CompactCollectionResponse>, Status> {
+        // VexaDb's compaction is per-shard. To honour Milvus's
+        // single-ID contract, route to the first reachable shard and
+        // return its compaction ID. Clients should call `get_compaction_state`
+        // on the same router; the router fans out the lookup until it
+        // finds the matching shard.
+        let collection = request.into_inner().collection;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.compact_collection(&collection).await {
+                Ok(id) => return Ok(Response::new(CompactCollectionResponse { compaction_id: id })),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted compact_collection")))
+    }
+
+    async fn get_compaction_state(
+        &self,
+        request: Request<GetCompactionStateRequest>,
+    ) -> Result<Response<GetCompactionStateResponse>, Status> {
+        let id = request.into_inner().compaction_id;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.get_compaction_state(id).await {
+                Ok(resp) => return Ok(Response::new(resp)),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::not_found(format!("compaction {id} not found"))))
+    }
+
+    async fn list_persistent_segments(
+        &self,
+        request: Request<ListPersistentSegmentsRequest>,
+    ) -> Result<Response<ListPersistentSegmentsResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let mut merged: Vec<vectordb_proto::vectordb::v1::SegmentEntry> = vec![];
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.list_persistent_segments(&collection).await {
+                Ok(resp) => {
+                    ok += 1;
+                    merged.extend(resp.segments);
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err.unwrap_or_else(|| {
+                Status::unavailable("no shard accepted list_persistent_segments")
+            }));
+        }
+        Ok(Response::new(ListPersistentSegmentsResponse { segments: merged }))
+    }
+
+    // ---- Partitions (Milvus parity) -----------------------------------------
+
+    async fn create_partition(
+        &self,
+        request: Request<CreatePartitionRequest>,
+    ) -> Result<Response<CreatePartitionResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.create_partition(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted create_partition")));
+        }
+        Ok(Response::new(CreatePartitionResponse {}))
+    }
+
+    async fn drop_partition(
+        &self,
+        request: Request<DropPartitionRequest>,
+    ) -> Result<Response<DropPartitionResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.drop_partition(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted drop_partition")));
+        }
+        Ok(Response::new(DropPartitionResponse {}))
+    }
+
+    async fn has_partition(
+        &self,
+        request: Request<HasPartitionRequest>,
+    ) -> Result<Response<HasPartitionResponse>, Status> {
+        let req = request.into_inner();
+        // All shards share replicated meta — first responder wins.
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.has_partition(&req.collection, &req.partition).await {
+                Ok(exists) => return Ok(Response::new(HasPartitionResponse { exists })),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted has_partition")))
+    }
+
+    async fn list_partitions(
+        &self,
+        request: Request<ListPartitionsRequest>,
+    ) -> Result<Response<ListPartitionsResponse>, Status> {
+        let collection = request.into_inner().collection;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.list_partitions(&collection).await {
+                Ok(parts) => {
+                    return Ok(Response::new(ListPartitionsResponse { partitions: parts }))
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted list_partitions")))
+    }
+
+    async fn get_partition_stats(
+        &self,
+        request: Request<GetPartitionStatsRequest>,
+    ) -> Result<Response<GetPartitionStatsResponse>, Status> {
+        let req = request.into_inner();
+        // Sum row_count across shards; carry non-numeric stats from the first
+        // shard that reports them so callers still see partition_name etc.
+        let mut total_rows: u64 = 0;
+        let mut merged: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client
+                .get_partition_stats(&req.collection, &req.partition)
+                .await
+            {
+                Ok(stats) => {
+                    ok += 1;
+                    for (k, v) in stats {
+                        if k == "row_count" {
+                            if let Ok(n) = v.parse::<u64>() {
+                                total_rows = total_rows.saturating_add(n);
+                            }
+                        } else {
+                            merged.entry(k).or_insert(v);
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted get_partition_stats")));
+        }
+        merged.insert("row_count".into(), total_rows.to_string());
+        Ok(Response::new(GetPartitionStatsResponse { stats: merged }))
+    }
+
+    // ---- Resource groups (Milvus parity) ------------------------------------
+
+    async fn create_resource_group(
+        &self,
+        request: Request<CreateResourceGroupRequest>,
+    ) -> Result<Response<CreateResourceGroupResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.create_resource_group(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted create_resource_group")));
+        }
+        Ok(Response::new(CreateResourceGroupResponse {}))
+    }
+
+    async fn drop_resource_group(
+        &self,
+        request: Request<DropResourceGroupRequest>,
+    ) -> Result<Response<DropResourceGroupResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.drop_resource_group(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted drop_resource_group")));
+        }
+        Ok(Response::new(DropResourceGroupResponse {}))
+    }
+
+    async fn update_resource_group(
+        &self,
+        request: Request<UpdateResourceGroupRequest>,
+    ) -> Result<Response<UpdateResourceGroupResponse>, Status> {
+        let bytes = request.into_inner().op_json;
+        let mut last_err: Option<Status> = None;
+        let mut ok = 0usize;
+        for (_, mut client) in self.clients_for_all_shards().await? {
+            match client.update_resource_group(bytes.clone()).await {
+                Ok(()) => ok += 1,
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        if ok == 0 {
+            return Err(last_err
+                .unwrap_or_else(|| Status::unavailable("no shard accepted update_resource_group")));
+        }
+        Ok(Response::new(UpdateResourceGroupResponse {}))
+    }
+
+    async fn list_resource_groups(
+        &self,
+        _request: Request<ListResourceGroupsRequest>,
+    ) -> Result<Response<ListResourceGroupsResponse>, Status> {
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.list_resource_groups().await {
+                Ok(names) => return Ok(Response::new(ListResourceGroupsResponse { names })),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| Status::unavailable("no shard accepted list_resource_groups")))
+    }
+
+    async fn describe_resource_group(
+        &self,
+        request: Request<DescribeResourceGroupRequest>,
+    ) -> Result<Response<DescribeResourceGroupResponse>, Status> {
+        let name = request.into_inner().name;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client.describe_resource_group(&name).await {
+                Ok(resp) => return Ok(Response::new(resp)),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::not_found(format!("resource group {name}"))))
+    }
+
+    async fn describe_replica(
+        &self,
+        request: Request<DescribeReplicaRequest>,
+    ) -> Result<Response<DescribeReplicaResponse>, Status> {
+        // Registry-only model: VexaDb has a single logical replica per
+        // collection composed of every shard's primary node. We synthesize
+        // that view from topology so callers get a useful layout even
+        // without per-RG enforcement.
+        let collection = request.into_inner().collection;
+        let st = self.topology.status();
+        let mut shards: Vec<ReplicaShard> = Vec::new();
+        for node in st.nodes {
+            for shard_id in &node.primary_for_shards {
+                shards.push(ReplicaShard {
+                    shard_id: *shard_id,
+                    node_id: node.id.clone(),
+                    node_address: node.grpc.clone(),
+                });
+            }
+        }
+        shards.sort_by_key(|s| s.shard_id);
+        let replica = ReplicaInfo {
+            replica_id: 0,
+            collection,
+            // Mirror `vectordb_core::DEFAULT_RESOURCE_GROUP`; inlined to
+            // avoid pulling the core crate into the router.
+            resource_group: "__default_resource_group".to_string(),
+            shards,
+        };
+        Ok(Response::new(DescribeReplicaResponse {
+            replicas: vec![replica],
+        }))
+    }
+
+    async fn transfer_replica(
+        &self,
+        request: Request<TransferReplicaRequest>,
+    ) -> Result<Response<TransferReplicaResponse>, Status> {
+        let req = request.into_inner();
+        // Forward to the first reachable shard so RBAC + validation runs
+        // server-side. The server treats this as a no-op success in
+        // registry-only mode.
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in self.clients_for_shards_best_effort().await {
+            match client
+                .transfer_replica(
+                    &req.collection,
+                    &req.source_group,
+                    &req.target_group,
+                    req.replica_num,
+                    &req.database,
+                )
+                .await
+            {
+                Ok(()) => return Ok(Response::new(TransferReplicaResponse {})),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| Status::unavailable("no shard accepted transfer_replica")))
     }
 
     async fn delete(
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Delete)?;
         let req = request.into_inner();
+        let collection = req.collection.clone();
+        let filter = req.filter.clone();
+        let partition = req.partition.clone();
         let mut by_endpoint: HashMap<String, Vec<String>> = HashMap::new();
         for id in req.ids {
             let ep = self
@@ -562,9 +1346,21 @@ impl VectorService for RouterService {
                 .await
                 .map_err(|e| Status::unavailable(e.to_string()))?;
             deleted += client
-                .delete(&req.collection, ids)
+                .delete(&collection, ids)
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
+        }
+        // Filter / partition-scoped delete: fan out to every shard so each
+        // can scan its local payloads. Tolerate per-shard failures and
+        // return the partial total — the caller can retry to converge.
+        if !filter.is_empty() || !partition.is_empty() {
+            for (_, mut client) in self.clients_for_all_shards().await? {
+                let n = client
+                    .delete_full(&collection, vec![], filter.clone(), partition.clone())
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                deleted += n;
+            }
         }
         Ok(Response::new(DeleteResponse { deleted }))
     }
@@ -573,6 +1369,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<GetRequest>,
     ) -> Result<Response<GetResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Get)?;
         let req = request.into_inner();
         let mut client = self.client_for_point(&req.id).await?;
         let point = client
@@ -631,6 +1428,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<BulkUpsertRequest>,
     ) -> Result<Response<BulkUpsertResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Insert)?;
         let req = request.into_inner();
         let mut by_endpoint: HashMap<String, Vec<VectorPoint>> = HashMap::new();
         for point in req.points {
@@ -742,6 +1540,7 @@ impl VectorService for RouterService {
         &self,
         request: Request<ReindexCollectionRequest>,
     ) -> Result<Response<ReindexCollectionResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Reindex)?;
         let name = request.into_inner().collection;
         let mut total = 0u64;
         for (_, mut client) in self.clients_for_all_shards().await? {
@@ -758,15 +1557,145 @@ impl VectorService for RouterService {
 
     async fn scroll(
         &self,
-        _request: Request<ScrollRequest>,
+        request: Request<ScrollRequest>,
     ) -> Result<Response<ScrollResponse>, Status> {
-        // Scroll is a *per-shard* operation — call shards directly via the
-        // rebalance tooling, not through the router. Returning an error
-        // keeps the router from accidentally aggregating across shards
-        // and breaking cursor semantics.
-        Err(Status::failed_precondition(
-            "Scroll is per-shard; rebalance tools should connect to shard nodes directly",
-        ))
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Query)?;
+        let req = request.into_inner();
+        // Cursor format: "<shard_idx>|<per_shard_cursor>" (back-compat: an
+        // empty cursor starts at shard 0). The router walks shards in
+        // index order; when a shard reports an empty next_cursor we move
+        // to the next shard until all are drained.
+        let (mut shard_idx, mut per_cursor) = if req.cursor.is_empty() {
+            (0usize, String::new())
+        } else {
+            let mut it = req.cursor.splitn(2, '|');
+            let s = it.next().unwrap_or("0");
+            let c = it.next().unwrap_or("").to_string();
+            (s.parse::<usize>().unwrap_or(0), c)
+        };
+        let mut shards = self.clients_for_all_shards().await?;
+        if shards.is_empty() {
+            return Ok(Response::new(ScrollResponse {
+                points: vec![],
+                next_cursor: String::new(),
+            }));
+        }
+        while shard_idx < shards.len() {
+            let (_, client) = &mut shards[shard_idx];
+            let (points, next) = client
+                .scroll_filtered(
+                    &req.collection,
+                    &per_cursor,
+                    req.limit,
+                    &req.filter,
+                    &req.partition,
+                    &req.output_fields,
+                    req.with_payload,
+                    req.with_vector,
+                )
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if !points.is_empty() {
+                let cur = if next.is_empty() {
+                    if shard_idx + 1 >= shards.len() {
+                        String::new()
+                    } else {
+                        format!("{}|", shard_idx + 1)
+                    }
+                } else {
+                    format!("{shard_idx}|{next}")
+                };
+                return Ok(Response::new(ScrollResponse {
+                    points,
+                    next_cursor: cur,
+                }));
+            }
+            shard_idx += 1;
+            per_cursor.clear();
+        }
+        Ok(Response::new(ScrollResponse {
+            points: vec![],
+            next_cursor: String::new(),
+        }))
+    }
+
+    async fn hybrid_search(
+        &self,
+        request: Request<HybridSearchRequest>,
+    ) -> Result<Response<HybridSearchResponse>, Status> {
+        require_collection(&self.rbac, &request, &request.get_ref().collection, Privilege::Search)?;
+        let req = request.into_inner();
+        let limit = req.limit.max(1) as usize;
+        // Fan-out: each shard returns up to `2 * limit` candidates so the
+        // router has enough to rerank across shards. We re-apply the same
+        // reranker policy on the unioned results.
+        let mut per_shard_req = req.clone();
+        // Oversample per shard so the router has enough headroom.
+        per_shard_req.limit = (req.limit * 2).max(req.limit);
+        let futures: Vec<_> = self
+            .clients_for_all_shards()
+            .await?
+            .into_iter()
+            .map(|(_, mut client)| {
+                let req = per_shard_req.clone();
+                async move { client.hybrid_search(req).await }
+            })
+            .collect();
+        let results = join_all(futures).await;
+        let mut merged: HashMap<String, ScoredPointProto> = HashMap::new();
+        let mut total = 0usize;
+        let mut failed = 0usize;
+        let mut last_err: Option<String> = None;
+        for res in results {
+            total += 1;
+            match res {
+                Ok(resp) => {
+                    for h in resp.hits {
+                        merged
+                            .entry(h.id.clone())
+                            .and_modify(|cur| {
+                                if h.score > cur.score {
+                                    *cur = h.clone();
+                                }
+                            })
+                            .or_insert(h);
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    last_err = Some(e.to_string());
+                    tracing::warn!(error = %e, "shard hybrid_search failed (partial results)");
+                }
+            }
+        }
+        if failed == total && total > 0 {
+            return Err(Status::internal(format!(
+                "all {total} shards failed; last error: {}",
+                last_err.unwrap_or_default()
+            )));
+        }
+        let mut hits: Vec<ScoredPointProto> = merged.into_values().collect();
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
+        Ok(Response::new(HybridSearchResponse { hits }))
+    }
+
+    async fn run_analyzer(
+        &self,
+        request: Request<RunAnalyzerRequest>,
+    ) -> Result<Response<RunAnalyzerResponse>, Status> {
+        // The analyzer is deterministic per-input; forward to the first
+        // healthy shard and return its response unchanged.
+        let req = request.into_inner();
+        let shards = self.clients_for_all_shards().await?;
+        let mut last_err: Option<Status> = None;
+        for (_, mut client) in shards {
+            match client.run_analyzer(req.clone()).await {
+                Ok(resp) => return Ok(Response::new(resp)),
+                Err(e) => last_err = Some(Status::internal(e.to_string())),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Status::unavailable("no shard accepted run_analyzer")))
     }
 
     async fn rebalance(

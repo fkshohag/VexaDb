@@ -11,10 +11,17 @@ path = "src/main.rs"
 
 [dependencies]
 vectordb-client.workspace = true
+vectordb-core.workspace = true
 vectordb-proto.workspace = true
 vectordb-auth.workspace = true
+vectordb-rbac.workspace = true
 
 anyhow.workspace = true
+tonic.workspace = true
+base64 = "0.22"
+parking_lot.workspace = true
+rand.workspace = true
+uuid.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 clap.workspace = true

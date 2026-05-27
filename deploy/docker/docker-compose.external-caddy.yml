@@ -1,0 +1,33 @@
+# Use this overlay when you ALREADY have Caddy (or any other reverse proxy)
+# running in another docker container, and you want it to proxy traffic to
+# the admin panel WITHOUT publishing admin on the host network.
+#
+#   # 1. find the network your existing Caddy is on:
+#   docker inspect <caddy-container-name> \
+#     --format '{{range $n,$_ := .NetworkSettings.Networks}}{{$n}}{{"\n"}}{{end}}'
+#   # (e.g. "hetzner_default" or "caddy_net")
+#
+#   # 2. bring up VectorDB attached to that network:
+#   EXTERNAL_PROXY_NETWORK=hetzner_default \
+#     docker compose -f docker-compose.yml -f docker-compose.external-caddy.yml up -d --build
+#
+#   # 3. add this stanza to your existing Caddyfile and reload Caddy.
+#   #    NOTE: use the container_name (vectordb-admin), not the service name
+#   #    (admin) — docker DNS only resolves container_name across networks.
+#   db.example.com {
+#       reverse_proxy vectordb-admin:8090
+#   }
+
+name: vectordb
+
+services:
+  admin:
+    ports: !reset []          # do NOT publish on host; rely on the proxy network
+    networks:
+      - default
+      - proxy
+
+networks:
+  proxy:
+    name: ${EXTERNAL_PROXY_NETWORK:?set EXTERNAL_PROXY_NETWORK to your Caddy network}
+    external: true

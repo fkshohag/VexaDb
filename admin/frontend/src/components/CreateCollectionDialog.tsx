@@ -1,16 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError } from "../api";
+import { api, ApiError, type AuthHeaders } from "../api";
 import { NOMIC_V15_DIM } from "../embeddingSettings";
 
 interface Props {
-  apiKey: string;
+  auth: AuthHeaders;
   open: boolean;
   onClose: () => void;
   onCreated: (name: string) => void;
   onError: (msg: string) => void;
 }
 
-export function CreateCollectionDialog({ apiKey, open, onClose, onCreated, onError }: Props) {
+export function CreateCollectionDialog({ auth, open, onClose, onCreated, onError }: Props) {
   const ref = useRef<HTMLDialogElement | null>(null);
   const [name, setName] = useState("");
   const [dim, setDim] = useState(128);
@@ -38,7 +38,7 @@ export function CreateCollectionDialog({ apiKey, open, onClose, onCreated, onErr
           metric,
           bm25_text_field: enableBm25 ? bm25 : undefined,
         },
-        apiKey || undefined
+        auth
       );
       onCreated(name.trim());
       onClose();

@@ -114,7 +114,13 @@ async fn elects_leader_and_replicates_write() {
 
     for engine in [&e1, &e2, &e3] {
         let hits = engine
-            .search("docs", &[1.0, 0.0, 0.0], 1, None)
+            .search(
+                "docs",
+                &[1.0, 0.0, 0.0],
+                1,
+                None,
+                vectordb_core::OutputOptions::default(),
+            )
             .unwrap();
         assert_eq!(hits[0].id, "vec-1");
     }

@@ -351,6 +351,39 @@ label {
 .toast.error { border-color: var(--red); color: #ffd0d3; }
 .toast.success { border-color: var(--green); color: #c8f3d2; }
 
+.auth-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.auth-badge.user {
+  color: var(--violet);
+  border-color: rgba(139, 92, 246, 0.45);
+}
+.auth-badge.user .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--violet);
+  box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.15);
+}
+.auth-badge .user-name {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.auth-badge button.linklike {
+  background: transparent;
+  border: none;
+  padding: 0 0 0 2px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.auth-badge button.linklike:hover { color: var(--red); }
+
 .hint {
   color: var(--text-faint);
   font-size: 12px;

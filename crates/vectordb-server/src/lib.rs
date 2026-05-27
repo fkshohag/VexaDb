@@ -3,6 +3,7 @@
 //! stand up real services in-process.
 
 pub mod auth_interceptor;
+pub mod authz;
 pub mod config;
 pub mod leader;
 pub mod metrics;

@@ -87,7 +87,12 @@ fn bench_engine_search(c: &mut Criterion) {
     for k in [10usize, 50] {
         group.bench_with_input(BenchmarkId::new(format!("n={n}"), format!("k={k}")), &k, |bencher, &k| {
             bencher.iter(|| {
-                black_box(bench.engine.search("bench", black_box(&query), k, None).unwrap());
+                black_box(
+                    bench
+                        .engine
+                        .search("bench", black_box(&query), k, None, Default::default())
+                        .unwrap(),
+                );
             });
         });
     }

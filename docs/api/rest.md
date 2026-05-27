@@ -5,7 +5,7 @@ default it listens on `:8080` and proxies to a gRPC server or router.
 
 - **Auth** (when enabled): `x-api-key: <key>` *or* `Authorization: Bearer <key>`
 - **Content-Type**: `application/json`
-- **Probes** (no auth required): `/health`, `/live`, `/ready`, `/metrics`
+- **Probes** (no auth required): `/health`, `/live`, `/ready`, `/metrics`, `/v1/version`
 
 > All payloads are pretty-printed in this doc; production calls don’t need
 > whitespace.
@@ -20,8 +20,28 @@ default it listens on `:8080` and proxies to a gRPC server or router.
 | `GET` | `/live` | `200` if process up. |
 | `GET` | `/ready` | `200` only if `HealthResponse.ready` (leader, if Raft). |
 | `GET` | `/metrics` | Prometheus text format (gateway counters). |
+| `GET` | `/v1/version` | Returns `{ "version", "server", "git_commit" }` — used by SDKs as a connectivity probe (Milvus-compatible). |
 
 Server-side Prometheus is at `[metrics].listen` (default `:9090`).
+
+---
+
+## Collection metadata (Milvus parity)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/v1/collections/:name/rename` | Body `{ "new_name": "…" }`; renames atomically and re-targets aliases. |
+| `PATCH` | `/v1/collections/:name/properties` | Body `{ "set": {…}, "unset": ["…"] }`; merge / remove opaque properties (TTL, `mmap.enabled`, etc.). |
+| `GET` | `/v1/collections/:name/aliases` | List aliases pointing to this collection. |
+| `GET` | `/v1/aliases` | List all aliases. |
+| `POST` | `/v1/aliases` | Body `{ "alias", "collection" }` — create. |
+| `GET` | `/v1/aliases/:alias` | Resolve alias → `{ "alias", "collection" }`. |
+| `PUT` | `/v1/aliases/:alias` | Body `{ "collection" }` — reassign. |
+| `DELETE` | `/v1/aliases/:alias` | Drop alias (idempotent). |
+
+Required privileges: `AlterCollection` for rename/properties, `AlterAlias` for alias mutations. The `admin` and `read_write` built-in roles include both.
+
+`GET /v1/collections/:name` now returns `properties` and `aliases` in the body.
 
 ---
 
@@ -69,6 +89,23 @@ Response: `201 Created`.
 {
   "spec": "...debug-formatted CollectionSpec...",
   "vector_count": 12345
+}
+```
+
+### `GET /v1/collections/:name/stats`
+
+Structured collection statistics (preferred over parsing `describe`).
+
+```json
+{
+  "name": "embeddings",
+  "vector_count": 12345,
+  "dimension": 1536,
+  "metric": "cosine",
+  "sparse_enabled": false,
+  "bm25_text_field": "text",
+  "payload_index_count": 2,
+  "scalar_quantization": false
 }
 ```
 
@@ -121,17 +158,18 @@ Dense / hybrid / lexical search.
 {
   "vector": [0.1, 0.2, 0.3],
   "top_k": 10,
-  "filter": {
-    "must": [{"key": "category", "match": {"value": "books"}}],
-    "must_not": [],
-    "should": [{"key": "price", "range": {"lte": 50}}]
-  },
+  "filter": "category == 'books' && price <= 50",
   "sparse_query": {"indices": [10], "values": [1.0]},
   "text_query": "vector database",
   "search_mode": "hybrid_rrf",
-  "hybrid_alpha": 0.5
+  "hybrid_alpha": 0.5,
+  "output_fields": ["category", "text"],
+  "with_payload": true,
+  "with_vector": false
 }
 ```
+
+`filter` accepts **either** a string expression (Milvus-style) **or** the JSON Filter DSL object.
 
 | `search_mode` | Behaviour |
 |---------------|-----------|
@@ -145,12 +183,40 @@ Response:
 
 ```json
 [
-  {"id": "doc-1", "score": 0.97},
-  {"id": "doc-2", "score": 0.85}
+  {"id": "doc-1", "score": 0.97, "payload": {"category": "books", "text": "..."}},
+  {"id": "doc-2", "score": 0.85, "payload": {"category": "books", "text": "..."}}
 ]
 ```
 
-See [`filter-dsl.md`](filter-dsl.md) for filter syntax.
+When `with_payload` is false, `payload` is omitted. When `with_vector` is true, a `vector` field is included.
+
+### `POST /v1/collections/:name/query`
+
+Filter-only retrieval (no query vector). Milvus `Query()` equivalent.
+
+```json
+{
+  "filter": "category == 'books'",
+  "ids": [],
+  "limit": 100,
+  "offset": 0,
+  "output_fields": ["category", "text"],
+  "with_payload": true,
+  "with_vector": false
+}
+```
+
+Response:
+
+```json
+{
+  "points": [
+    {"id": "doc-1", "payload": {"category": "books", "text": "..."}, "values": null}
+  ]
+}
+```
+
+See [`filter-dsl.md`](filter-dsl.md) for the JSON filter shape; string expressions use `==`, `!=`, `&&`, `||`, `in [...]`, `not in [...]`, and `exists(field)`.
 
 ### `DELETE /v1/collections/:name/points`
 
@@ -205,6 +271,89 @@ Response: `{ "deleted": 2 }`.
 
 ---
 
+## Authentication & RBAC
+
+VexaDb supports three credential types:
+
+| Header | Example | Use |
+|--------|---------|-----|
+| `Authorization: Basic <b64>` | `Basic cm9vdDpodW50ZXIy` | Username + password |
+| `Authorization: Bearer <token>` | `Bearer 7c61...:secret` | API token (`tokenid:secret`) or legacy key |
+| `x-api-key: <token>` | `x-api-key: 7c61...:secret` | Same as Bearer |
+
+### Bootstrap
+
+On first start, set `VECTORDB_ROOT_PASSWORD` to create a `root` superuser
+(role: `admin`). Subsequent restarts skip bootstrap if any user exists.
+
+For backward compatibility, `VECTORDB_API_KEYS` (comma-separated) continues to
+grant superuser access without an associated user account.
+
+### Built-in roles
+
+| Role | Grants |
+|------|--------|
+| `admin` | `*` on `Global` and `Collection` (everything) |
+| `read_write` | List/Describe/Stats + Search/Query/Get/Insert/Upsert/Delete |
+| `read_only` | List/Describe/Stats + Search/Query/Get |
+
+### Login & tokens
+
+```
+POST /v1/auth/login          {"username":"root","password":"..."} -> {token_id, token, user}
+POST /v1/auth/tokens         {"description":"..."}               -> {token_id, token, user}
+DELETE /v1/auth/tokens/:id
+```
+
+The plaintext `token` is shown **once**; pass it as `Bearer <token>` or
+`x-api-key: <token>` afterward.
+
+### Users
+
+```
+POST   /v1/users               {"name","password","roles":[]}
+GET    /v1/users               -> ["alice", ...]
+GET    /v1/users/:name         -> {name, disabled, created_at_ms, roles}
+DELETE /v1/users/:name
+PATCH  /v1/users/:name/password  {"old","new"}
+POST   /v1/users/:name/roles/:role     (grant)
+DELETE /v1/users/:name/roles/:role     (revoke)
+```
+
+### Roles
+
+```
+POST   /v1/roles               {"name","description"}
+GET    /v1/roles               -> ["admin", ...]
+GET    /v1/roles/:name         -> {name, description, grants: [...]}
+DELETE /v1/roles/:name
+POST   /v1/roles/:role/grants   {"object_type":"Collection","object_name":"books","privilege":"Search"}
+DELETE /v1/roles/:role/grants   (same body)
+```
+
+Privileges: `CreateCollection`, `DropCollection`, `ListCollections`,
+`DescribeCollection`, `CollectionStats`, `Search`, `Query`, `Insert`, `Upsert`,
+`Delete`, `Get`, `Reindex`, `Snapshot`, `Rebalance`, `CompactWal`,
+`ClusterStatus`, `ManageRbac`. `"*"` matches all.
+
+### Privilege groups
+
+```
+POST   /v1/privilege-groups    {"name","privileges":["Search","Query"]}
+GET    /v1/privilege-groups
+DELETE /v1/privilege-groups/:name
+PATCH  /v1/privilege-groups/:name   {"add":[],"remove":[]}
+```
+
+### Backup / restore
+
+```
+POST /v1/admin/rbac/backup     -> RBACMeta JSON snapshot
+POST /v1/admin/rbac/restore    RBACMeta JSON
+```
+
+---
+
 ## Errors
 
 The gateway returns standard HTTP status codes:
@@ -212,7 +361,8 @@ The gateway returns standard HTTP status codes:
 | Status | Meaning |
 |--------|---------|
 | `400` | Invalid request body or filter |
-| `401` | Auth missing or wrong API key |
+| `401` | Auth missing or wrong credentials |
+| `403` | Authenticated but not authorized for this object/privilege |
 | `404` | Collection or point not found |
 | `409` | Collection already exists |
 | `412` | Wrong shard (router or leader required) |

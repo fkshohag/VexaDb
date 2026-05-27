@@ -1,8 +1,8 @@
 use serde_json::json;
 use tempfile::tempdir;
 use vectordb_core::{
-    CollectionConfig, DistanceMetric, Filter, PayloadFieldIndex, PayloadIndexKind, SearchMode,
-    SparseVector, Vector,
+    CollectionConfig, DistanceMetric, Filter, OutputOptions, PayloadFieldIndex, PayloadIndexKind,
+    SearchMode, SparseVector, Vector,
 };
 use vectordb_storage::search::SearchParams;
 use vectordb_storage::{CollectionEngine, EngineConfig};
@@ -28,7 +28,9 @@ fn wal_survives_reopen() {
     }
 
     let engine = CollectionEngine::open(cfg).unwrap();
-    let hits = engine.search("docs", &[1.0, 0.0, 0.0], 1, None).unwrap();
+    let hits = engine
+        .search("docs", &[1.0, 0.0, 0.0], 1, None, OutputOptions::default())
+        .unwrap();
     assert_eq!(hits[0].id, "a");
 }
 
@@ -75,7 +77,13 @@ fn filtered_search_with_payload_indexes() {
     .unwrap();
 
     let hits = engine
-        .search("books", &[1.0, 0.0, 0.0], 5, Some(&filter))
+        .search(
+            "books",
+            &[1.0, 0.0, 0.0],
+            5,
+            Some(&filter),
+            OutputOptions::default(),
+        )
         .unwrap();
     let ids: Vec<_> = hits.iter().map(|h| h.id.as_str()).collect();
     assert_eq!(ids, vec!["a"]);
@@ -148,6 +156,7 @@ fn hybrid_bm25_rrf_search() {
                 filter: None,
             },
             2,
+            OutputOptions::default(),
         )
         .unwrap();
     assert!(!hits.is_empty());
@@ -193,6 +202,7 @@ fn sparse_vector_search() {
                 filter: None,
             },
             1,
+            OutputOptions::default(),
         )
         .unwrap();
     assert_eq!(hits[0].id, "a");

@@ -1,0 +1,100 @@
+# Single-node VectorDB (RF=1, 1 shard) + admin panel.
+# One command, one URL. Database is INTERNAL to the docker network — only
+# the admin panel is published on the host.
+#
+#   cd deploy/docker
+#   echo "VECTORDB_API_KEY=$(openssl rand -hex 32)" > .env
+#   docker compose up -d
+#
+# Topology:
+#
+#   ┌─────────────────────────────── docker network ───────────────────────────────┐
+#   │                                                                              │
+#   │    server (all_in_one,                                                       │
+#   │     RF=1, 1 shard)  <───  gateway (HTTP/JSON)  <───  admin (web UI + API)    │
+#   │     :6334 internal       :8080 internal             :8090  ←  PUBLISHED      │
+#   │                                                                              │
+#   └──────────────────────────────────────────────────────────────────────────────┘
+#                                                                  ↓
+#                                                         host:${ADMIN_PORT:-8090}
+
+name: vectordb
+
+services:
+
+  # All-in-one data + router. The `all_in_one` role makes a single binary
+  # serve everything — no separate router, no Raft, no peer discovery.
+  server:
+    build:
+      context: ../..       # repo root, so the existing Dockerfile is reused
+    image: vectordb:single-node
+    container_name: vectordb-server
+    restart: unless-stopped
+    command: ["vectordb-server", "--config", "/etc/vectordb/node.toml"]
+    volumes:
+      - ./node.toml:/etc/vectordb/node.toml:ro
+      - vectordb_data:/data
+    expose:
+      - "6334"             # internal gRPC; only the gateway reaches it
+    healthcheck:
+      test: ["CMD", "vectordb", "--endpoint", "http://localhost:6334", "health"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # HTTP/JSON gateway — INTERNAL ONLY. Not published to the host. The admin
+  # panel reaches it over the docker network at http://gateway:8080.
+  gateway:
+    build:
+      context: ../..       # same image as `server`; Compose builds it once
+    image: vectordb:single-node
+    container_name: vectordb-gateway
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    command: ["vectordb-gateway"]
+    environment:
+      VECTORDB_GRPC: http://server:6334
+      VECTORDB_HTTP: 0.0.0.0:8080
+      VECTORDB_API_KEYS: ${VECTORDB_API_KEY:?set VECTORDB_API_KEY in .env}
+      RUST_LOG: info
+    expose:
+      - "8080"             # internal only — no `ports:` mapping
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
+  # Admin web UI + ingest helpers. This is the ONLY service exposed on the host.
+  # The admin backend transparently injects VECTORDB_API_KEY into every request
+  # it forwards to the gateway, so the end user opens the admin URL with no
+  # API key in their browser and the gateway still enforces auth at the
+  # network boundary.
+  admin:
+    build:
+      context: ../..
+      dockerfile: admin/Dockerfile
+    image: vectordb:admin
+    container_name: vectordb-admin
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      VECTORDB_URL: http://gateway:8080
+      VECTORDB_API_KEY: ${VECTORDB_API_KEY:?set VECTORDB_API_KEY in .env}
+      ADMIN_LISTEN: ":8090"
+      # Local-LMStudio default; override or unset for a remote embedding server.
+      EMBED_DEFAULT_URL: ${EMBED_DEFAULT_URL:-http://host.docker.internal:1234/v1}
+      EMBED_DEFAULT_MODEL: ${EMBED_DEFAULT_MODEL:-text-embedding-nomic-embed-text-v1.5}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${ADMIN_PORT:-8090}:8090"
+
+volumes:
+  vectordb_data:

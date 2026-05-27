@@ -1,0 +1,23 @@
+[package]
+name = "vectordb-rbac"
+description = "Users, roles, privileges, and Argon2id credentials for VexaDb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["alloc", "rand_core"] }
+rand = { workspace = true, features = ["std", "std_rng"] }
+base64 = "0.22"
+uuid = { workspace = true }
+vectordb-auth.workspace = true
+parking_lot.workspace = true
+tonic.workspace = true
+tower = { version = "0.4", default-features = false }
+http = "1"
+
+[dev-dependencies]

@@ -252,6 +252,7 @@ impl HnswIndex {
                 ScoredPoint {
                     id: nodes[idx].id.clone(),
                     score: Distance::to_score(self.config.metric, dist),
+                    ..Default::default()
                 }
             })
             .collect())

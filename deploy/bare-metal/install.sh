@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# One-command bare-metal install for VectorDB (single-node, RF=1, no Docker).
+#
+# What it does, idempotently:
+#   1. Installs build deps via the host's package manager (apt / dnf / pacman).
+#   2. Installs rustup + the toolchain pinned by rust-toolchain.toml (or stable).
+#   3. cargo build --release for vectordb-server, vectordb-gateway, vectordb-cli.
+#   4. Installs binaries to /usr/local/bin.
+#   5. Writes /etc/vectordb/node.toml (all_in_one role, RF=1, 1 shard).
+#   6. Creates a vectordb system user and /var/lib/vectordb (data dir).
+#   7. Installs systemd units for vectordb-server and vectordb-gateway.
+#   8. Starts both services and waits for /health.
+#
+# Usage (run from the cloned repo root):
+#
+#   sudo ./deploy/bare-metal/install.sh
+#
+# Tunables (env vars):
+#   VECTORDB_PREFIX        /usr/local       install prefix for binaries
+#   VECTORDB_USER          vectordb         system user the daemons run as
+#   VECTORDB_DATA_DIR      /var/lib/vectordb data + WAL location
+#   VECTORDB_CONFIG_DIR    /etc/vectordb    config files
+#   VECTORDB_GRPC_PORT     6334
+#   VECTORDB_HTTP_PORT     8080
+#   VECTORDB_API_KEY       (auto-generated) require this on every gateway request
+#   VECTORDB_BIND_HTTP     0.0.0.0:8080     gateway HTTP listen addr
+#   VECTORDB_BIND_GRPC     0.0.0.0:6334     server gRPC listen addr
+#   SKIP_BUILD             0                set to 1 to skip cargo build (binaries already in PATH)
+
+set -euo pipefail
+
+# ---------- 0. preflight ----------------------------------------------------
+if [ "$(id -u)" != "0" ]; then
+  echo "ERROR: run with sudo (this writes /usr/local/bin, /etc/vectordb, /var/lib/vectordb)." >&2
+  exit 2
+fi
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+[ -f "$REPO_ROOT/Cargo.toml" ] || { echo "ERROR: $REPO_ROOT does not look like the VectorDB repo (no Cargo.toml)." >&2; exit 2; }
+
+PREFIX="${VECTORDB_PREFIX:-/usr/local}"
+DAEMON_USER="${VECTORDB_USER:-vectordb}"
+DATA_DIR="${VECTORDB_DATA_DIR:-/var/lib/vectordb}"
+CFG_DIR="${VECTORDB_CONFIG_DIR:-/etc/vectordb}"
+GRPC_PORT="${VECTORDB_GRPC_PORT:-6334}"
+HTTP_PORT="${VECTORDB_HTTP_PORT:-8080}"
+BIND_HTTP="${VECTORDB_BIND_HTTP:-0.0.0.0:${HTTP_PORT}}"
+BIND_GRPC="${VECTORDB_BIND_GRPC:-0.0.0.0:${GRPC_PORT}}"
+API_KEY="${VECTORDB_API_KEY:-}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
+
+# ---------- 1. install system deps -----------------------------------------
+echo "→ installing build dependencies"
+if   command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    build-essential pkg-config curl ca-certificates git
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y gcc gcc-c++ make pkgconfig curl ca-certificates git
+elif command -v pacman >/dev/null 2>&1; then
+  pacman -Sy --noconfirm base-devel pkgconf curl ca-certificates git
+else
+  echo "WARNING: unknown package manager; skipping system-deps step." >&2
+fi
+
+# ---------- 2. rustup -------------------------------------------------------
+# Build as the invoking sudo user so the toolchain ends up in their HOME, not
+# root's HOME. Falls back to root when SUDO_USER isn't set.
+BUILD_USER="${SUDO_USER:-root}"
+BUILD_HOME="$(getent passwd "$BUILD_USER" | cut -d: -f6)"
+[ -n "$BUILD_HOME" ] || BUILD_HOME="$HOME"
+
+run_as_build() { sudo -u "$BUILD_USER" -H bash -lc "$*"; }
+
+if ! run_as_build "command -v cargo >/dev/null 2>&1"; then
+  echo "→ installing rustup as $BUILD_USER"
+  run_as_build "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
+fi
+CARGO_BIN="$BUILD_HOME/.cargo/bin"
+
+# ---------- 3. build --------------------------------------------------------
+if [ "$SKIP_BUILD" != "1" ]; then
+  echo "→ cargo build --release (this is the slow step, ~5-10 min on first run)"
+  run_as_build "cd '$REPO_ROOT' && PATH='$CARGO_BIN':\$PATH cargo build --release \
+    -p vectordb-server -p vectordb-gateway -p vectordb-cli"
+else
+  echo "→ SKIP_BUILD=1, skipping cargo build"
+fi
+
+# ---------- 4. install binaries --------------------------------------------
+echo "→ installing binaries to $PREFIX/bin"
+install -m 0755 "$REPO_ROOT/target/release/vectordb-server"  "$PREFIX/bin/vectordb-server"
+install -m 0755 "$REPO_ROOT/target/release/vectordb-gateway" "$PREFIX/bin/vectordb-gateway"
+install -m 0755 "$REPO_ROOT/target/release/vectordb"         "$PREFIX/bin/vectordb"
+
+# ---------- 5. user, data dir, config --------------------------------------
+if ! id "$DAEMON_USER" >/dev/null 2>&1; then
+  echo "→ creating system user '$DAEMON_USER'"
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$DAEMON_USER"
+fi
+install -d -m 0750 -o "$DAEMON_USER" -g "$DAEMON_USER" "$DATA_DIR"
+install -d -m 0755 "$CFG_DIR"
+
+if [ -z "$API_KEY" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    API_KEY="$(openssl rand -hex 32)"
+  else
+    API_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)"
+  fi
+fi
+
+cat >"$CFG_DIR/node.toml" <<EOF
+# Auto-generated by deploy/bare-metal/install.sh
+# Single-node, RF=1, all-in-one role: one binary serves data, routing, and
+# everything else. No Raft replication.
+
+[server]
+listen = "${BIND_GRPC}"
+
+[storage]
+data_dir = "${DATA_DIR}"
+sync_wal = true
+
+[cluster]
+node_id = "node-1"
+role = "all_in_one"
+shard_count = 1
+shard_id = 0
+peers = []
+
+# Uncomment for periodic auto-snapshots (compacts WAL).
+# [snapshot]
+# interval_secs = 300
+# compact_wal = true
+# min_wal_entries = 100
+EOF
+chmod 0640 "$CFG_DIR/node.toml"
+chown root:"$DAEMON_USER" "$CFG_DIR/node.toml"
+
+cat >"$CFG_DIR/gateway.env" <<EOF
+# Environment for vectordb-gateway. Mode 0640.
+VECTORDB_GRPC=http://127.0.0.1:${GRPC_PORT}
+VECTORDB_HTTP=${BIND_HTTP}
+VECTORDB_API_KEYS=${API_KEY}
+RUST_LOG=info
+EOF
+chmod 0640 "$CFG_DIR/gateway.env"
+chown root:"$DAEMON_USER" "$CFG_DIR/gateway.env"
+
+# ---------- 6. systemd units -----------------------------------------------
+echo "→ writing systemd units"
+
+cat >/etc/systemd/system/vectordb-server.service <<EOF
+[Unit]
+Description=VectorDB single-node server (data + router, all-in-one)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${DAEMON_USER}
+Group=${DAEMON_USER}
+ExecStart=${PREFIX}/bin/vectordb-server --config ${CFG_DIR}/node.toml
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=${DATA_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat >/etc/systemd/system/vectordb-gateway.service <<EOF
+[Unit]
+Description=VectorDB HTTP/JSON gateway
+After=vectordb-server.service network-online.target
+Requires=vectordb-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${DAEMON_USER}
+Group=${DAEMON_USER}
+EnvironmentFile=${CFG_DIR}/gateway.env
+ExecStart=${PREFIX}/bin/vectordb-gateway
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now vectordb-server.service
+systemctl enable --now vectordb-gateway.service
+
+# ---------- 7. wait for /health --------------------------------------------
+echo "→ waiting for /health on http://127.0.0.1:${HTTP_PORT}"
+ok=0
+for i in $(seq 1 60); do
+  if curl -fsS --connect-timeout 2 "http://127.0.0.1:${HTTP_PORT}/health" >/dev/null 2>&1; then
+    ok=1; break
+  fi
+  sleep 1
+done
+
+# ---------- 8. report ------------------------------------------------------
+PUBLIC_IP="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || echo "<your-server-ip>")"
+
+cat <<EOF
+
+──────────────────────────────────────────────────────────────────
+  VectorDB single-node (RF=1) — installed
+──────────────────────────────────────────────────────────────────
+  Status:        $( [ "$ok" = 1 ] && echo "✓ /health 200 OK" || echo "⚠ not ready yet (check 'journalctl -u vectordb-server -e')" )
+  Binaries:      ${PREFIX}/bin/{vectordb-server, vectordb-gateway, vectordb}
+  Config:        ${CFG_DIR}/node.toml
+  Data dir:      ${DATA_DIR}
+  User:          ${DAEMON_USER}
+  Gateway HTTP:  http://${PUBLIC_IP}:${HTTP_PORT}   (listen=${BIND_HTTP})
+  gRPC:          ${BIND_GRPC}  (loopback only by default — see /etc/vectordb/gateway.env)
+  API key:       ${API_KEY}
+
+  Smoke test:
+    curl -sS -H "x-api-key: ${API_KEY}" http://127.0.0.1:${HTTP_PORT}/health
+    curl -sS -H "x-api-key: ${API_KEY}" http://127.0.0.1:${HTTP_PORT}/v1/admin/cluster | jq
+
+  Service control:
+    systemctl status   vectordb-server vectordb-gateway
+    journalctl -u vectordb-server -f
+    systemctl restart  vectordb-server vectordb-gateway
+
+  Open the firewall (Ubuntu/Debian):
+    ufw allow ${HTTP_PORT}/tcp
+
+──────────────────────────────────────────────────────────────────
+EOF
+
+[ "$ok" = 1 ]

@@ -1,4 +1,4 @@
-// Quickstart: end-to-end VectorDB example using the Go SDK.
+// Quickstart: end-to-end VexaDb example using the Go SDK.
 //
 //	cd sdks/go
 //	go run ./examples/quickstart
@@ -15,7 +15,8 @@ import (
 	"os"
 	"time"
 
-	vectordb "github.com/vectordb/vectordb/sdks/go"
+	"github.com/vectordb/vectordb/sdks/go/entity"
+	"github.com/vectordb/vectordb/sdks/go/vexaclient"
 )
 
 const (
@@ -28,64 +29,72 @@ func main() {
 	baseURL := getenv("VECTORDB_URL", "http://127.0.0.1:8080")
 	apiKey := os.Getenv("VECTORDB_API_KEY")
 
-	c := vectordb.NewClient(baseURL, apiKey)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	if h, err := c.Health(ctx); err != nil {
-		log.Fatalf("health check failed: %v", err)
-	} else {
-		log.Printf("connected: %s (%v)", baseURL, h)
+	cli, err := vexaclient.New(ctx, &vexaclient.ClientConfig{Address: baseURL, APIKey: apiKey})
+	if err != nil {
+		log.Fatalf("connect: %v", err)
 	}
+	defer cli.Close(ctx)
 
-	if err := c.DeleteCollection(ctx, collectionName); err != nil {
-		if e, ok := err.(*vectordb.VectorDbError); !ok || (e.StatusCode != 404 && e.StatusCode != 502) {
-			log.Printf("(ignoring) cleanup delete: %v", err)
+	log.Printf("connected: %s", baseURL)
+
+	if err := cli.DropCollection(ctx, vexaclient.NewDropCollectionOption(collectionName)); err != nil {
+		if e, ok := err.(*vexaclient.VexaError); !ok || (e.StatusCode != 404 && e.StatusCode != 502) {
+			log.Printf("(ignoring) cleanup drop: %v", err)
 		}
 	}
 
-	if err := c.CreateCollection(ctx, collectionName, dimension, vectordb.CreateCollectionOpts{
-		Metric: "cosine",
-		PayloadIndexes: []vectordb.PayloadIndex{
-			{Field: "category", Kind: "keyword"},
-			{Field: "score", Kind: "numeric"},
-		},
-		BM25TextField: "text",
-	}); err != nil {
+	create := vexaclient.NewSimpleCreateCollectionOption(collectionName, dimension).
+		WithMetricType(entity.COSINE).
+		WithPayloadIndexes(
+			entity.PayloadIndex{Field: "category", Kind: entity.IndexKeyword},
+			entity.PayloadIndex{Field: "score", Kind: entity.IndexNumeric},
+		).
+		WithBM25TextField("text")
+	if err := cli.CreateCollection(ctx, create); err != nil {
 		log.Fatalf("create collection: %v", err)
 	}
 	log.Printf("created collection %q (dim=%d)", collectionName, dimension)
 
 	rng := rand.New(rand.NewPCG(42, 0xdeadbeef))
-	points := make([]vectordb.Point, numPoints)
-	for i := range points {
+	ids := make([]string, numPoints)
+	vectors := make([][]float32, numPoints)
+	categories := make([]string, numPoints)
+	scores := make([]int64, numPoints)
+	texts := make([]string, numPoints)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("doc-%03d", i)
 		v := make([]float32, dimension)
 		for j := range v {
 			v[j] = float32(rng.NormFloat64())
 		}
-		points[i] = vectordb.Point{
-			ID:     fmt.Sprintf("doc-%03d", i),
-			Values: v,
-			Payload: map[string]any{
-				"category": []string{"news", "blog", "paper"}[i%3],
-				"score":    i,
-				"text":     fmt.Sprintf("document %d about quickstart", i),
-			},
-		}
+		vectors[i] = v
+		categories[i] = []string{"news", "blog", "paper"}[i%3]
+		scores[i] = int64(i)
+		texts[i] = fmt.Sprintf("document %d about quickstart", i)
 	}
 
-	upserted, err := c.BulkUpsert(ctx, collectionName, points, 32)
+	insert := vexaclient.NewColumnBasedInsertOption(collectionName).
+		WithIDs(ids).
+		WithFloatVectorColumn("vector", dimension, vectors).
+		WithVarcharColumn("category", categories).
+		WithInt64Column("score", scores).
+		WithVarcharColumn("text", texts)
+
+	res, err := cli.BulkUpsert(ctx, collectionName, insert, 32)
 	if err != nil {
 		log.Fatalf("bulk upsert: %v", err)
 	}
-	log.Printf("upserted %d points", upserted)
+	log.Printf("upserted %d points", res.Upserted)
 
 	queryVec := make([]float32, dimension)
 	for j := range queryVec {
 		queryVec[j] = float32(rng.NormFloat64())
 	}
 
-	hits, err := c.Search(ctx, collectionName, queryVec, vectordb.SearchOpts{TopK: 5})
+	hits, err := cli.Search(ctx, vexaclient.NewSearchOption(collectionName, 5, []entity.Vector{entity.FloatVector(queryVec)}))
 	if err != nil {
 		log.Fatalf("dense search: %v", err)
 	}
@@ -94,14 +103,12 @@ func main() {
 		log.Printf("  %s  score=%.4f", h.ID, h.Score)
 	}
 
-	hits, err = c.Search(ctx, collectionName, queryVec, vectordb.SearchOpts{
-		TopK: 5,
-		Filter: map[string]any{
+	hits, err = cli.Search(ctx, vexaclient.NewSearchOption(collectionName, 5, []entity.Vector{entity.FloatVector(queryVec)}).
+		WithFilterJSON(map[string]any{
 			"must": []map[string]any{
 				{"key": "category", "match": map[string]any{"value": "news"}},
 			},
-		},
-	})
+		}))
 	if err != nil {
 		log.Fatalf("filtered search: %v", err)
 	}
@@ -110,12 +117,10 @@ func main() {
 		log.Printf("  %s  score=%.4f", h.ID, h.Score)
 	}
 
-	hits, err = c.Search(ctx, collectionName, queryVec, vectordb.SearchOpts{
-		TopK:        5,
-		TextQuery:   "quickstart",
-		SearchMode:  "hybrid_rrf",
-		HybridAlpha: 0.5,
-	})
+	hits, err = cli.Search(ctx, vexaclient.NewSearchOption(collectionName, 5, []entity.Vector{entity.FloatVector(queryVec)}).
+		WithTextQuery("quickstart").
+		WithSearchMode("hybrid_rrf").
+		WithHybridAlpha(0.5))
 	if err != nil {
 		log.Fatalf("hybrid search: %v", err)
 	}
@@ -124,25 +129,25 @@ func main() {
 		log.Printf("  %s  score=%.4f", h.ID, h.Score)
 	}
 
-	if pt, err := c.GetPoint(ctx, collectionName, "doc-000"); err != nil {
+	if pt, err := cli.GetByID(ctx, vexaclient.NewGetOption(collectionName, "doc-000")); err != nil {
 		log.Fatalf("get point: %v", err)
 	} else if pt != nil {
 		log.Printf("get doc-000: payload=%v", pt["payload"])
 	}
 
-	if status, err := c.ClusterStatus(ctx); err == nil {
+	if status, err := cli.ClusterStatus(ctx); err == nil {
 		log.Printf("cluster: %d shards x RF=%d, %d nodes",
 			status.ShardCount, status.ReplicationFactor, len(status.Nodes))
 	}
 
-	if del, err := c.DeletePoints(ctx, collectionName, []string{"doc-000", "doc-001"}); err != nil {
+	if del, err := cli.Delete(ctx, vexaclient.NewDeleteOption(collectionName, "doc-000", "doc-001")); err != nil {
 		log.Fatalf("delete points: %v", err)
 	} else {
-		log.Printf("deleted %d points", del)
+		log.Printf("deleted %d points", del.Deleted)
 	}
 
-	if err := c.DeleteCollection(ctx, collectionName); err != nil {
-		log.Printf("(cleanup) delete collection: %v", err)
+	if err := cli.DropCollection(ctx, vexaclient.NewDropCollectionOption(collectionName)); err != nil {
+		log.Printf("(cleanup) drop collection: %v", err)
 	}
 	log.Printf("done.")
 }

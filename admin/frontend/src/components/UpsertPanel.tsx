@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { api, ApiError } from "../api";
+import { api, ApiError, type AuthHeaders } from "../api";
 import { hashEmbed } from "../embed";
 import { pickEmbedStrategy, embedSmart } from "../embeddingStrategy";
 import { NOMIC_V15_DIM } from "../embeddingSettings";
@@ -7,7 +7,7 @@ import { EmbeddingModelCard } from "./EmbeddingModelCard";
 import type { CollectionInfo } from "../types";
 
 interface Props {
-  apiKey: string;
+  auth: AuthHeaders;
   info: CollectionInfo;
   onError: (msg: string) => void;
   onSuccess: (msg: string) => void;
@@ -55,7 +55,7 @@ function makeExamplePoints(dim: number, bm25Field: string | null) {
   ];
 }
 
-export function UpsertPanel({ apiKey, info, onError, onSuccess, onUpserted }: Props) {
+export function UpsertPanel({ auth, info, onError, onSuccess, onUpserted }: Props) {
   const dim = info.dimension ?? 0;
 
   // ── Single point ───────────────────────────────────────────────────────
@@ -186,7 +186,7 @@ export function UpsertPanel({ apiKey, info, onError, onSuccess, onUpserted }: Pr
       await api.upsertPoints(
         info.name,
         [{ id: singleId.trim(), values, payload }],
-        apiKey || undefined
+        auth
       );
       onSuccess(`Upserted 1 point into ${info.name}`);
       setSingleId("");
@@ -267,7 +267,7 @@ export function UpsertPanel({ apiKey, info, onError, onSuccess, onUpserted }: Pr
           values: p.values as number[],
           payload: p.payload,
         })),
-        apiKey || undefined
+        auth
       );
       const ms = Math.round(performance.now() - t);
       const note = embedded > 0 ? ` (auto-embedded ${embedded} from payload.${info.bm25TextField})` : "";
@@ -335,7 +335,7 @@ export function UpsertPanel({ apiKey, info, onError, onSuccess, onUpserted }: Pr
           }
           points.push(point);
         }
-        const r = await api.upsertPoints(info.name, points, apiKey || undefined);
+        const r = await api.upsertPoints(info.name, points, auth);
         inserted += r.upserted;
         setGenProgress({ done: end, total });
       }

@@ -46,6 +46,150 @@ pub enum WalEntry {
     Checkpoint {
         snapshot_id: String,
     },
+    /// Mutate the replicated RBAC state (users, tokens, roles, grants).
+    ///
+    /// Appended last so bincode's variant-index encoding stays
+    /// backwards-compatible with WAL files written before RBAC existed.
+    Rbac { op: vectordb_rbac::RbacOp },
+    /// Replicated collection-metadata mutations (rename, aliases, properties).
+    /// Appended after `Rbac` for the same compat reason.
+    Meta { op: MetaOp },
+}
+
+/// Replicated metadata operation. Applied through Raft so all replicas
+/// converge.
+///
+/// Collection-scoped variants implicitly operate within the request's active
+/// database. Database management lives at the bottom — new variants are
+/// appended to keep bincode's variant-index encoding wire-compatible with
+/// older WAL files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MetaOp {
+    /// Rename an existing collection. Fails if `new_name` already exists or
+    /// collides with an existing alias in the same database.
+    RenameCollection {
+        old: String,
+        new: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
+    /// Create a new alias pointing to `collection`. Fails if `alias` exists
+    /// or collides with a collection name in the same database.
+    CreateAlias {
+        alias: String,
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
+    /// Drop an alias (no-op if missing).
+    DropAlias {
+        alias: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
+    /// Reassign an alias to a different collection.
+    AlterAlias {
+        alias: String,
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+    },
+    /// Merge `set` into the collection's properties, then remove `unset` keys.
+    AlterCollectionProperties {
+        name: String,
+        #[serde(default = "default_database")]
+        database: String,
+        #[serde(default)]
+        set: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        unset: Vec<String>,
+    },
+    // ---- Database management (Milvus-parity) -----------------------------
+    /// Create a new database. Idempotent only if `name` does not already
+    /// exist — otherwise fails so callers see a clean conflict.
+    CreateDatabase {
+        name: String,
+        #[serde(default)]
+        properties: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        created_at_ms: u64,
+    },
+    /// Drop a database. `force=false` requires the database to be empty
+    /// (no collections, no aliases). `force=true` cascade-drops every
+    /// collection and alias inside it. The built-in `default` database
+    /// cannot be dropped.
+    DropDatabase {
+        name: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Merge `set` into the database's properties, then remove `unset` keys.
+    AlterDatabaseProperties {
+        name: String,
+        #[serde(default)]
+        set: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        unset: Vec<String>,
+    },
+    // ---- Index management (Milvus-parity) -------------------------------
+    /// Attach a payload (scalar) index to a field. Replaces any existing
+    /// entry for the same field — payload indexes are uniqued per-field.
+    AddPayloadIndex {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        field: String,
+        kind: String,
+    },
+    /// Detach a payload index from a field. No-op when the field has no
+    /// index, so callers can safely retry.
+    DropPayloadIndex {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        field: String,
+    },
+    // ---- Partition management (Milvus-parity) ---------------------------
+    /// Create a new logical partition inside a collection. Partitions live
+    /// in `CollectionConfig::partitions` and gate upserts via the
+    /// `_partition` payload field.
+    CreatePartition {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        partition: String,
+    },
+    /// Drop a partition. Removes the partition name from the config and
+    /// deletes every point whose `_partition` payload equals `partition`.
+    /// Dropping [`vectordb_core::DEFAULT_PARTITION`] is rejected.
+    DropPartition {
+        collection: String,
+        #[serde(default = "default_database")]
+        database: String,
+        partition: String,
+    },
+    // ---- Resource group management (Milvus-parity) ----------------------
+    /// Create a new resource group. Names are unique cluster-wide; the
+    /// built-in `__default_resource_group` cannot be re-created.
+    CreateResourceGroup {
+        name: String,
+        #[serde(default)]
+        config: vectordb_core::ResourceGroupConfig,
+        #[serde(default)]
+        created_at_ms: u64,
+    },
+    /// Drop a resource group. Rejected for the built-in default group.
+    DropResourceGroup { name: String },
+    /// Replace the config of an existing resource group. The previous
+    /// config is overwritten in full (Milvus semantics).
+    UpdateResourceGroup {
+        name: String,
+        config: vectordb_core::ResourceGroupConfig,
+    },
+}
+
+fn default_database() -> String {
+    vectordb_core::DEFAULT_DATABASE.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +302,15 @@ impl WriteAheadLog {
         self.append(&WalEntry::Checkpoint {
             snapshot_id: snapshot_id.into(),
         })
+    }
+
+    /// Flush buffered data and force an `fsync` regardless of the
+    /// `fsync_on_append` mode. Used by [`crate::engine::CollectionEngine::flush_collection`]
+    /// to honour Milvus's strict durability contract on Flush.
+    pub fn force_sync(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()?;
+        Ok(())
     }
 }
 

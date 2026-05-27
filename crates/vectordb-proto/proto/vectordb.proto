@@ -28,6 +28,102 @@ service VectorService {
   rpc RebalanceStatus(RebalanceStatusRequest) returns (RebalanceStatusResponse);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  // M6: SDK-friendly surface — filter-only retrieval and per-collection stats.
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  // M7: RBAC — users, tokens, roles, grants, privilege groups.
+  // The op/snapshot payloads are JSON-encoded to keep this surface
+  // forward-compatible (new privilege names, new fields, new RbacOp variants).
+  rpc ApplyRbac(ApplyRbacRequest) returns (ApplyRbacResponse);
+  rpc GetRbacSnapshot(GetRbacSnapshotRequest) returns (GetRbacSnapshotResponse);
+
+  // Collection-metadata mutations (rename / aliases / properties).
+  // op_json is the JSON-encoded MetaOp enum (see vectordb_storage::MetaOp).
+  rpc MutateCollectionMeta(MutateCollectionMetaRequest) returns (MutateCollectionMetaResponse);
+  // Read-side helpers.
+  rpc ListAliases(ListAliasesRequest) returns (ListAliasesResponse);
+  rpc DescribeAlias(DescribeAliasRequest) returns (DescribeAliasResponse);
+
+  // ---- Database management (Milvus parity) -------------------------------
+  // Mutations are routed through Raft via op_json (CreateDatabase /
+  // DropDatabase / AlterDatabaseProperties variants of MetaOp). The read-side
+  // RPCs are direct.
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc DropDatabase(DropDatabaseRequest) returns (DropDatabaseResponse);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
+  rpc DescribeDatabase(DescribeDatabaseRequest) returns (DescribeDatabaseResponse);
+  rpc AlterDatabase(AlterDatabaseRequest) returns (AlterDatabaseResponse);
+
+  // ---- Management (Milvus parity) ----------------------------------------
+  // Indexes (add/drop go through MetaOp::AddPayloadIndex/DropPayloadIndex
+  // via op_json so the wire stays stable as future field types land).
+  rpc AddPayloadIndex(AddPayloadIndexRequest) returns (AddPayloadIndexResponse);
+  rpc DropPayloadIndex(DropPayloadIndexRequest) returns (DropPayloadIndexResponse);
+  // Flush / compaction tracking / segment introspection.
+  rpc FlushCollection(FlushCollectionRequest) returns (FlushCollectionResponse);
+  rpc CompactCollection(CompactCollectionRequest) returns (CompactCollectionResponse);
+  rpc GetCompactionState(GetCompactionStateRequest) returns (GetCompactionStateResponse);
+  rpc ListPersistentSegments(ListPersistentSegmentsRequest) returns (ListPersistentSegmentsResponse);
+  // Partitions (Create/Drop go through MetaOp::CreatePartition/DropPartition
+  // via op_json; read-side RPCs return data directly).
+  rpc CreatePartition(CreatePartitionRequest) returns (CreatePartitionResponse);
+  rpc DropPartition(DropPartitionRequest) returns (DropPartitionResponse);
+  rpc HasPartition(HasPartitionRequest) returns (HasPartitionResponse);
+  rpc ListPartitions(ListPartitionsRequest) returns (ListPartitionsResponse);
+  rpc GetPartitionStats(GetPartitionStatsRequest) returns (GetPartitionStatsResponse);
+  // Resource groups (Milvus parity, registry-only on VexaDb).
+  rpc CreateResourceGroup(CreateResourceGroupRequest) returns (CreateResourceGroupResponse);
+  rpc DropResourceGroup(DropResourceGroupRequest) returns (DropResourceGroupResponse);
+  rpc UpdateResourceGroup(UpdateResourceGroupRequest) returns (UpdateResourceGroupResponse);
+  rpc ListResourceGroups(ListResourceGroupsRequest) returns (ListResourceGroupsResponse);
+  rpc DescribeResourceGroup(DescribeResourceGroupRequest) returns (DescribeResourceGroupResponse);
+  // Replica info (collection-level introspection used by ResourceGroup tooling).
+  rpc DescribeReplica(DescribeReplicaRequest) returns (DescribeReplicaResponse);
+  rpc TransferReplica(TransferReplicaRequest) returns (TransferReplicaResponse);
+  // Multi-vector / multi-leg ANN search (Milvus-parity HybridSearch).
+  rpc HybridSearch(HybridSearchRequest) returns (HybridSearchResponse);
+  // Text analyzer diagnostics (Milvus RunAnalyzer).
+  rpc RunAnalyzer(RunAnalyzerRequest) returns (RunAnalyzerResponse);
+}
+
+message ApplyRbacRequest {
+  bytes op_json = 1;
+}
+
+message ApplyRbacResponse {}
+
+message GetRbacSnapshotRequest {}
+
+message GetRbacSnapshotResponse {
+  bytes snapshot_json = 1;
+}
+
+message MutateCollectionMetaRequest {
+  bytes op_json = 1;
+}
+
+message MutateCollectionMetaResponse {}
+
+message ListAliasesRequest {
+  // When empty, returns all aliases across all collections.
+  string collection = 1;
+}
+
+message AliasEntry {
+  string alias = 1;
+  string collection = 2;
+}
+
+message ListAliasesResponse {
+  repeated AliasEntry aliases = 1;
+}
+
+message DescribeAliasRequest {
+  string alias = 1;
+}
+
+message DescribeAliasResponse {
+  string collection = 1;
 }
 
 enum DistanceMetric {
@@ -75,6 +171,10 @@ message CollectionSpec {
   bool sparse_enabled = 8;
   string bm25_text_field = 9;
   bool scalar_quantization = 10;
+  // User-defined opaque properties (TTL, mmap.enabled, ...).
+  map<string, string> properties = 11;
+  // Parent database. Empty defaults to "default" server-side.
+  string database = 12;
 }
 
 message SparseVector {
@@ -107,6 +207,8 @@ message DescribeCollectionRequest {
 message DescribeCollectionResponse {
   CollectionSpec spec = 1;
   uint64 vector_count = 2;
+  // Aliases pointing to this collection.
+  repeated string aliases = 3;
 }
 
 message VectorPoint {
@@ -139,20 +241,74 @@ message SearchRequest {
   // dense | sparse | bm25 | hybrid_rrf | hybrid_weighted
   string search_mode = 8;
   float hybrid_alpha = 9;
+  // When non-empty, only these payload fields are returned (top-level keys).
+  // Empty + with_payload=true means "all fields".
+  repeated string output_fields = 10;
+  // Include the JSON payload on each hit (default: false to keep wire small).
+  bool with_payload = 11;
+  // Include the dense vector on each hit (default: false). Heavy — opt in.
+  bool with_vector = 12;
 }
 
 message ScoredPoint {
   string id = 1;
   float score = 2;
+  // Populated when SearchRequest.with_payload is true.
+  // JSON-encoded; gateway converts to a structured object.
+  bytes payload = 3;
+  // Populated when SearchRequest.with_vector is true.
+  repeated float vector = 4;
 }
 
 message SearchResponse {
   repeated ScoredPoint hits = 1;
 }
 
+// Filter-only retrieval. Like Search but without a query vector — useful for
+// "give me every point in this collection where category == 'books'".
+message QueryRequest {
+  string collection = 1;
+  // Structured filter encoded as JSON. Mutually compatible with `filter_expr`;
+  // the gateway parses string expressions and forwards them as JSON here.
+  string filter_json = 2;
+  // Limit results to these IDs (used to reimplement Get-many in one round-trip).
+  repeated string ids = 3;
+  uint32 limit = 4;
+  uint32 offset = 5;
+  repeated string output_fields = 6;
+  bool with_payload = 7;
+  bool with_vector = 8;
+}
+
+message QueryResponse {
+  repeated VectorPoint points = 1;
+  // Set when pagination might have more results. Empty otherwise.
+  string next_cursor = 2;
+}
+
+message StatsRequest {
+  string collection = 1;
+}
+
+message StatsResponse {
+  string name = 1;
+  uint64 vector_count = 2;
+  uint32 dimension = 3;
+  DistanceMetric metric = 4;
+  bool sparse_enabled = 5;
+  string bm25_text_field = 6;
+  uint32 payload_index_count = 7;
+  bool scalar_quantization = 8;
+}
+
 message DeleteRequest {
   string collection = 1;
   repeated string ids = 2;
+  // Optional filter expression. When set together with `ids`, the engine
+  // deletes the union of both.
+  string filter = 3;
+  // Optional partition scope (Milvus-parity). Empty = all partitions.
+  string partition = 4;
 }
 
 message DeleteResponse {
@@ -222,6 +378,16 @@ message ScrollRequest {
   string collection = 1;
   string cursor = 2;
   uint32 limit = 3;
+  // Optional filter expression (Milvus parity). Empty = no filter.
+  string filter = 4;
+  // Optional partition scope. Empty = all partitions.
+  string partition = 5;
+  // Output controls. `output_fields` is informational on the server today
+  // (every field of the payload is returned); the SDK uses it to slice
+  // the result.
+  repeated string output_fields = 6;
+  bool with_payload = 7;
+  bool with_vector = 8;
 }
 
 message ScrollResponse {
@@ -320,4 +486,330 @@ message ReindexCollectionRequest {
 
 message ReindexCollectionResponse {
   uint64 vectors_reindexed = 1;
+}
+
+// ---- Database management messages (Milvus v2 parity) ---------------------
+//
+// Mutations are encoded as JSON `MetaOp` payloads on the wire — same pattern
+// used by RBAC and collection-meta. This keeps the RPC surface stable as new
+// fields land in MetaOp.
+
+message DatabaseInfo {
+  string name = 1;
+  map<string, string> properties = 2;
+  uint64 created_at_ms = 3;
+}
+
+message CreateDatabaseRequest {
+  // JSON-encoded MetaOp::CreateDatabase { name, properties, created_at_ms }.
+  bytes op_json = 1;
+}
+message CreateDatabaseResponse {}
+
+message DropDatabaseRequest {
+  // JSON-encoded MetaOp::DropDatabase { name, force }.
+  bytes op_json = 1;
+}
+message DropDatabaseResponse {}
+
+message AlterDatabaseRequest {
+  // JSON-encoded MetaOp::AlterDatabaseProperties { name, set, unset }.
+  bytes op_json = 1;
+}
+message AlterDatabaseResponse {}
+
+message ListDatabasesRequest {}
+message ListDatabasesResponse {
+  repeated string names = 1;
+}
+
+message DescribeDatabaseRequest {
+  string name = 1;
+}
+message DescribeDatabaseResponse {
+  DatabaseInfo info = 1;
+}
+
+// ---- Management messages (Milvus parity) ---------------------------------
+
+message AddPayloadIndexRequest {
+  // JSON-encoded MetaOp::AddPayloadIndex { collection, database, field, kind }.
+  bytes op_json = 1;
+}
+message AddPayloadIndexResponse {}
+
+message DropPayloadIndexRequest {
+  // JSON-encoded MetaOp::DropPayloadIndex { collection, database, field }.
+  bytes op_json = 1;
+}
+message DropPayloadIndexResponse {}
+
+message FlushCollectionRequest {
+  // FQN of the target collection (`db/name`). Empty database = "default".
+  string collection = 1;
+}
+
+message FlushCollectionResponse {
+  string collection = 1;
+  uint64 flush_ts_ms = 2;
+  repeated uint64 segment_ids = 3;
+  repeated uint64 flushed_segment_ids = 4;
+  uint64 wal_entries = 5;
+}
+
+message CompactCollectionRequest {
+  string collection = 1;
+}
+
+message CompactCollectionResponse {
+  uint64 compaction_id = 1;
+}
+
+message GetCompactionStateRequest {
+  uint64 compaction_id = 1;
+}
+
+enum CompactionState {
+  COMPACTION_STATE_UNSPECIFIED = 0;
+  COMPACTION_STATE_RUNNING = 1;
+  COMPACTION_STATE_COMPLETED = 2;
+  COMPACTION_STATE_FAILED = 3;
+}
+
+message GetCompactionStateResponse {
+  uint64 compaction_id = 1;
+  string collection = 2;
+  CompactionState state = 3;
+  uint64 entries_before = 4;
+  uint64 entries_after = 5;
+  uint64 started_ms = 6;
+  uint64 finished_ms = 7;
+  string error = 8;
+}
+
+message ListPersistentSegmentsRequest {
+  string collection = 1;
+}
+
+enum SegmentState {
+  SEGMENT_STATE_UNSPECIFIED = 0;
+  SEGMENT_STATE_GROWING = 1;
+  SEGMENT_STATE_SEALED = 2;
+  SEGMENT_STATE_FLUSHED = 3;
+}
+
+message SegmentEntry {
+  uint64 id = 1;
+  string collection = 2;
+  uint64 num_rows = 3;
+  SegmentState state = 4;
+  string source = 5;
+}
+
+message ListPersistentSegmentsResponse {
+  repeated SegmentEntry segments = 1;
+}
+
+// ---- Partition management (Milvus parity) --------------------------------
+
+message CreatePartitionRequest {
+  // JSON-encoded MetaOp::CreatePartition { collection, database, partition }.
+  bytes op_json = 1;
+}
+message CreatePartitionResponse {}
+
+message DropPartitionRequest {
+  // JSON-encoded MetaOp::DropPartition { collection, database, partition }.
+  bytes op_json = 1;
+}
+message DropPartitionResponse {}
+
+message HasPartitionRequest {
+  string collection = 1;
+  string partition = 2;
+}
+message HasPartitionResponse {
+  bool exists = 1;
+}
+
+message ListPartitionsRequest {
+  string collection = 1;
+}
+message ListPartitionsResponse {
+  repeated string partitions = 1;
+}
+
+message GetPartitionStatsRequest {
+  string collection = 1;
+  string partition = 2;
+}
+message GetPartitionStatsResponse {
+  // Free-form key/value stats: at minimum {row_count, partition_name, collection}.
+  map<string, string> stats = 1;
+}
+
+// ---- Resource groups (Milvus parity) --------------------------------------
+
+message ResourceGroupLimit {
+  int32 node_num = 1;
+}
+
+message ResourceGroupTransfer {
+  string resource_group = 1;
+}
+
+message ResourceGroupNodeFilter {
+  map<string, string> node_labels = 1;
+}
+
+message ResourceGroupConfig {
+  ResourceGroupLimit requests = 1;
+  ResourceGroupLimit limits = 2;
+  repeated ResourceGroupTransfer transfer_from = 3;
+  repeated ResourceGroupTransfer transfer_to = 4;
+  ResourceGroupNodeFilter node_filter = 5;
+}
+
+message ResourceGroupInfo {
+  string name = 1;
+  ResourceGroupConfig config = 2;
+  int32 num_available_node = 3;
+  map<string, int32> num_loaded_replica = 4;
+  map<string, int32> num_incoming_node = 5;
+  map<string, int32> num_outgoing_node = 6;
+  uint64 created_at_ms = 7;
+}
+
+message CreateResourceGroupRequest {
+  // JSON-encoded MetaOp::CreateResourceGroup { name, config, created_at_ms }.
+  bytes op_json = 1;
+}
+message CreateResourceGroupResponse {}
+
+message DropResourceGroupRequest {
+  // JSON-encoded MetaOp::DropResourceGroup { name }.
+  bytes op_json = 1;
+}
+message DropResourceGroupResponse {}
+
+message UpdateResourceGroupRequest {
+  // JSON-encoded MetaOp::UpdateResourceGroup { name, config }.
+  bytes op_json = 1;
+}
+message UpdateResourceGroupResponse {}
+
+message ListResourceGroupsRequest {}
+message ListResourceGroupsResponse {
+  repeated string names = 1;
+}
+
+message DescribeResourceGroupRequest {
+  string name = 1;
+}
+message DescribeResourceGroupResponse {
+  ResourceGroupInfo info = 1;
+}
+
+// ---- Replica introspection (Milvus parity) -------------------------------
+
+message ReplicaShard {
+  uint32 shard_id = 1;
+  string node_id = 2;
+  string node_address = 3;
+}
+
+message ReplicaInfo {
+  uint64 replica_id = 1;
+  string collection = 2;
+  string resource_group = 3;
+  repeated ReplicaShard shards = 4;
+}
+
+message DescribeReplicaRequest {
+  string collection = 1;
+}
+message DescribeReplicaResponse {
+  repeated ReplicaInfo replicas = 1;
+}
+
+message TransferReplicaRequest {
+  string collection = 1;
+  string source_group = 2;
+  string target_group = 3;
+  int64 replica_num = 4;
+  string database = 5;
+}
+message TransferReplicaResponse {}
+
+// ---- HybridSearch (Milvus parity) ---------------------------------------
+
+message AnnRequest {
+  // Vector field name. Informational on VexaDb today; the server picks the
+  // physical index based on which of `dense_query`/`sparse_query`/`text_query`
+  // is set.
+  string field = 1;
+  uint32 limit = 2;
+  // Exactly one of the three should be set.
+  repeated float dense_query = 3;
+  SparseVector sparse_query = 4;
+  string text_query = 5;
+  // Optional per-leg filter expression.
+  string filter = 6;
+}
+
+message HybridSearchRequest {
+  string collection = 1;
+  uint32 limit = 2;
+  repeated AnnRequest requests = 3;
+  // Reranker selection. `kind` is one of `rrf`, `weighted`, `function`.
+  // `weights` is only honored when kind == `weighted`; length must match
+  // `requests.len()` (missing entries default to 1.0).
+  string reranker_kind = 4;
+  repeated float reranker_weights = 5;
+  // Output controls (same shape as Search).
+  repeated string output_fields = 6;
+  bool with_payload = 7;
+  bool with_vector = 8;
+  // Optional partition scope.
+  repeated string partitions = 9;
+}
+
+message HybridSearchResponse {
+  repeated ScoredPoint hits = 1;
+}
+
+// ---- RunAnalyzer (Milvus parity) ----------------------------------------
+
+message RunAnalyzerRequest {
+  // One or more input strings.
+  repeated string text = 1;
+  // Optional analyzer params (JSON-encoded for forward compat).
+  string analyzer_params_json = 2;
+  // Comma-separated analyzer names (Milvus collection / field analyzer).
+  // VexaDb uses BM25 tokenizer regardless; the field is preserved for
+  // forward compatibility.
+  repeated string analyzer_name = 3;
+  // Optional collection + field reference (mirrors WithField in Milvus).
+  string collection = 4;
+  string field = 5;
+  // Include per-token detail (offsets, position, hash). Always populated
+  // by VexaDb; the field is kept for source compatibility.
+  bool with_detail = 6;
+  bool with_hash = 7;
+}
+
+message AnalyzerToken {
+  string token = 1;
+  uint64 start_offset = 2;
+  uint64 end_offset = 3;
+  uint64 position = 4;
+  uint64 hash = 5;
+}
+
+message AnalyzerResult {
+  repeated AnalyzerToken tokens = 1;
+}
+
+message RunAnalyzerResponse {
+  repeated AnalyzerResult results = 1;
 }

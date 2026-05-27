@@ -18,7 +18,11 @@ pub fn rrf_fusion(lists: &[Vec<(PointId, f32)>], final_k: usize) -> Vec<ScoredPo
 
     let mut out: Vec<ScoredPoint> = scores
         .into_iter()
-        .map(|(id, score)| ScoredPoint { id, score })
+        .map(|(id, score)| ScoredPoint {
+            id,
+            score,
+            ..Default::default()
+        })
         .collect();
     out.sort_by(|a, b| {
         b.score
@@ -61,7 +65,11 @@ pub fn weighted_fusion(
 
     let mut out: Vec<ScoredPoint> = ids
         .into_iter()
-        .map(|(id, score)| ScoredPoint { id, score })
+        .map(|(id, score)| ScoredPoint {
+            id,
+            score,
+            ..Default::default()
+        })
         .collect();
     out.sort_by(|a, b| {
         b.score
