@@ -120,7 +120,14 @@ if [[ -z "$API_KEY" ]]; then
   if [[ -s "$API_KEY_FILE" ]]; then
     API_KEY="$(cat "$API_KEY_FILE")"
   else
-    API_KEY="dev-$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom 2>/dev/null | head -c 32)"
+    # Do NOT use `tr | head` here: with `set -o pipefail`, `head` closing the
+    # pipe early makes `tr` exit 141 (SIGPIPE) and the whole script dies
+    # silently before any log output.
+    if command -v openssl >/dev/null 2>&1; then
+      API_KEY="dev-$(openssl rand -hex 16)"
+    else
+      API_KEY="dev-$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    fi
     printf '%s' "$API_KEY" > "$API_KEY_FILE"
   fi
 fi
