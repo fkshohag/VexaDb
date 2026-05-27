@@ -76,12 +76,23 @@ impl RbacContext {
         client
             .apply_rbac(bytes)
             .await
-            .map_err(|s| match s.code() {
-                tonic::Code::AlreadyExists => StatusCode::CONFLICT,
-                tonic::Code::NotFound => StatusCode::NOT_FOUND,
-                tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
-                tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
-                _ => StatusCode::BAD_GATEWAY,
+            .map_err(|s| {
+                let status = match s.code() {
+                    tonic::Code::AlreadyExists => StatusCode::CONFLICT,
+                    tonic::Code::NotFound => StatusCode::NOT_FOUND,
+                    tonic::Code::InvalidArgument => StatusCode::BAD_REQUEST,
+                    tonic::Code::PermissionDenied => StatusCode::FORBIDDEN,
+                    tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
+                    _ => StatusCode::BAD_GATEWAY,
+                };
+                if status == StatusCode::BAD_GATEWAY {
+                    tracing::warn!(
+                        code = ?s.code(),
+                        message = %s.message(),
+                        "rbac apply_rbac failed"
+                    );
+                }
+                status
             })?;
         drop(client);
         let _ = self.refresh().await;
@@ -459,14 +470,32 @@ pub async fn login(
     Json(body): Json<LoginBody>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
     if !state.rbac.enabled {
+        tracing::warn!(
+            "POST /v1/auth/login rejected: RBAC is disabled; set VECTORDB_ROOT_PASSWORD \
+             (or VECTORDB_API_KEYS) and restart the gateway"
+        );
         return Err(StatusCode::NOT_FOUND);
+    }
+    // Sync the in-memory cache with the server's authoritative snapshot so
+    // password checks and the subsequent CreateToken mutation see the same
+    // user registry (avoids 502s when the cache is stale after bootstrap).
+    if let Err(e) = state.rbac.refresh().await {
+        tracing::warn!(error = %e, "login: rbac refresh failed (using cached state)");
     }
     {
         let s = state.rbac.state.read();
         s.authenticate_password(&body.username, &body.password)
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
     }
-    issue_token(&state.rbac, &body.username, "login").await
+    issue_token(&state.rbac, &body.username, "login").await.map_err(|status| {
+        if status == StatusCode::BAD_GATEWAY {
+            tracing::warn!(
+                user = %body.username,
+                "login: token mint failed (upstream apply_rbac error — see gateway log)"
+            );
+        }
+        status
+    })
 }
 
 #[derive(Deserialize)]

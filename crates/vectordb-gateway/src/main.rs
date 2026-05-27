@@ -18,7 +18,9 @@ use prometheus::{Encoder, IntCounter, TextEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tower_http::trace::TraceLayer;
+use tower_http::classify::ServerErrorsFailureClass;
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tracing::Span;
 use tracing_subscriber::EnvFilter;
 use vectordb_client::{cosine_collection, VectorDbClient};
 use vectordb_proto::vectordb::v1::{
@@ -389,7 +391,25 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/admin/rbac/backup", post(rbac::backup_rbac))
         .route("/v1/admin/rbac/restore", post(rbac::restore_rbac))
         .layer(from_fn_with_state(state.clone(), rbac::rbac_middleware))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                // Record method + URI on the per-request span so the
+                // on_failure log below can name the exact route that 5xx'd.
+                .make_span_with(
+                    DefaultMakeSpan::new()
+                        .level(tracing::Level::INFO)
+                        .include_headers(false),
+                )
+                .on_failure(
+                    |error: ServerErrorsFailureClass, latency: Duration, _span: &Span| {
+                        tracing::error!(
+                            error = %error,
+                            latency_ms = latency.as_millis() as u64,
+                            "response failed"
+                        );
+                    },
+                ),
+        )
         .with_state(state);
 
     let addr: SocketAddr = cli.listen.parse()?;
@@ -1747,7 +1767,7 @@ async fn transfer_replica_route(
 
 fn map_index_grpc_err(e: anyhow::Error) -> StatusCode {
     let msg = e.to_string();
-    if msg.contains("collection not found") {
+    let status = if msg.contains("collection not found") {
         StatusCode::NOT_FOUND
     } else if msg.contains("InvalidArgument") || msg.contains("invalid meta") {
         StatusCode::BAD_REQUEST
@@ -1755,7 +1775,14 @@ fn map_index_grpc_err(e: anyhow::Error) -> StatusCode {
         StatusCode::FORBIDDEN
     } else {
         StatusCode::BAD_GATEWAY
+    };
+    // Keep the upstream gRPC message in the log so 5xx responses are
+    // diagnosable from the gateway log alone — the HTTP response itself
+    // intentionally drops detail to avoid leaking internals.
+    if status.is_server_error() {
+        tracing::warn!(error = %msg, status = status.as_u16(), "gateway: grpc call failed");
     }
+    status
 }
 
 fn compaction_state_to_string(s: i32) -> &'static str {
@@ -1780,7 +1807,7 @@ fn segment_state_to_string(s: i32) -> &'static str {
 
 fn map_db_grpc_err(e: anyhow::Error) -> StatusCode {
     let msg = e.to_string();
-    if msg.contains("database not found") {
+    let status = if msg.contains("database not found") {
         StatusCode::NOT_FOUND
     } else if msg.contains("database exists") || msg.contains("AlreadyExists") {
         StatusCode::CONFLICT
@@ -1792,7 +1819,11 @@ fn map_db_grpc_err(e: anyhow::Error) -> StatusCode {
         StatusCode::FORBIDDEN
     } else {
         StatusCode::BAD_GATEWAY
+    };
+    if status.is_server_error() {
+        tracing::warn!(error = %msg, status = status.as_u16(), "gateway: grpc call failed");
     }
+    status
 }
 
 fn now_ms() -> u64 {
@@ -1802,7 +1833,25 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Map any gRPC client error to 502 while leaving a single log line with the
+/// upstream error message so operators can diagnose 502s from the gateway
+/// log alone. Use in `.map_err(bad_gateway("op"))` instead of bare
+/// `.map_err(|_| StatusCode::BAD_GATEWAY)`.
+fn bad_gateway<'a>(op: &'a str) -> impl FnOnce(anyhow::Error) -> StatusCode + 'a {
+    move |e| {
+        tracing::warn!(op = %op, error = %e, "gateway: grpc call failed");
+        StatusCode::BAD_GATEWAY
+    }
+}
+
 async fn forward_meta_op(state: &AppState, op: serde_json::Value) -> Result<(), StatusCode> {
+    // Capture the op kind for diagnostics (the JSON outer key like
+    // "CreateAlias", "AlterCollectionProperties", …). Cheap because
+    // forward_meta_op is only used for control-plane operations.
+    let op_kind = op
+        .as_object()
+        .and_then(|m| m.keys().next().cloned())
+        .unwrap_or_else(|| "<unknown>".into());
     let bytes = serde_json::to_vec(&op).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut client = state.client.lock().await;
     client
@@ -1811,7 +1860,7 @@ async fn forward_meta_op(state: &AppState, op: serde_json::Value) -> Result<(), 
         .map_err(|e| {
             let msg = e.to_string();
             // Map a few well-known gRPC errors back to HTTP statuses.
-            if msg.contains("alias not found") || msg.contains("collection not found") {
+            let status = if msg.contains("alias not found") || msg.contains("collection not found") {
                 StatusCode::NOT_FOUND
             } else if msg.contains("alias exists")
                 || msg.contains("collection exists")
@@ -1827,7 +1876,16 @@ async fn forward_meta_op(state: &AppState, op: serde_json::Value) -> Result<(), 
                 StatusCode::FORBIDDEN
             } else {
                 StatusCode::BAD_GATEWAY
+            };
+            if status.is_server_error() {
+                tracing::warn!(
+                    op = %op_kind,
+                    error = %msg,
+                    status = status.as_u16(),
+                    "gateway: meta_op forward failed"
+                );
             }
+            status
         })
 }
 
@@ -2395,7 +2453,7 @@ async fn rebalance_status(
     let s = client
         .rebalance_status()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(bad_gateway("rebalance_status"))?;
     Ok(Json(serde_json::json!({
         "running": s.running,
         "enabled": s.enabled,
@@ -2419,7 +2477,7 @@ async fn cluster_status(
     let s = client
         .cluster_status()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(bad_gateway("cluster_status"))?;
     Ok(Json(serde_json::json!({
         "shard_count": s.shard_count,
         "replication_factor": s.replication_factor,
@@ -2446,7 +2504,7 @@ async fn compact_wal(
     let resp = client
         .compact_wal(body.snapshot_first)
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(bad_gateway("compact_wal"))?;
     Ok(Json(serde_json::json!({
         "entries_before": resp.entries_before,
         "entries_after": resp.entries_after,

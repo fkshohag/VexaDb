@@ -15,11 +15,15 @@ REST endpoint exposed by the `vectordb-gateway` service.
    it elsewhere (`vectordb-gateway --http 0.0.0.0:18080 ...`).
 2. **Import** both JSON files in Postman (`File → Import…`). Pick the
    `VexaDb Local` environment in the top-right selector.
-3. **(Optional)** Open `Auth & RBAC → POST /v1/auth/login` and run it once.
-   A test script writes the returned API token into the `apiToken`
-   collection variable, so every other request inherits Bearer auth
-   automatically. If RBAC is disabled on your gateway you can skip this
-   step and the requests still work.
+3. **Login (when using `scripts/run-single.sh`).** The dev launcher sets
+   `VECTORDB_ROOT_PASSWORD=VexaDb!` by default and bootstraps a `root`
+   user. Run `Auth & RBAC → POST /v1/auth/login` once; the test script
+   stores the returned token in `apiToken` for Bearer auth on later calls.
+   Credentials in the request body: `{"username":"root","password":"VexaDb!"}`.
+   If you see **404** on login, RBAC is disabled — restart the gateway with
+   `VECTORDB_ROOT_PASSWORD` set. If you see **401**, the password does not
+   match the bootstrapped user (try `FRESH=1 ./scripts/run-single.sh --clean`
+   to reset local data).
 
 ## How auth works
 

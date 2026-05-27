@@ -18,8 +18,8 @@
 #   GATEWAY_PORT      vectordb-gateway HTTP port (default: 8080)
 #   METRICS_PORT      Prometheus port            (default: 9090; set "" to disable)
 #   NODE_ID           cluster node identifier    (default: single-1)
-#   API_KEY           legacy superuser API key   (default: empty; RBAC stays open)
-#   ROOT_PASSWORD     bootstrap RBAC root user   (default: empty; only used when set)
+#   API_KEY           legacy superuser API key   (default: empty)
+#   ROOT_PASSWORD     bootstrap RBAC root user   (default: VexaDb! for local dev)
 #   RUST_LOG          tracing filter             (default: info,vectordb=debug)
 #   SKIP_BUILD=1      use existing binaries (skip cargo build)
 #   FRESH=1           same as --clean
@@ -62,7 +62,8 @@ GATEWAY_PORT="${GATEWAY_PORT:-8080}"
 METRICS_PORT="${METRICS_PORT:-9090}"
 NODE_ID="${NODE_ID:-single-1}"
 API_KEY="${API_KEY:-}"
-ROOT_PASSWORD="${ROOT_PASSWORD:-}"
+# Default dev credentials match the Postman collection login example.
+ROOT_PASSWORD="${ROOT_PASSWORD:-VexaDb!}"
 RUST_LOG="${RUST_LOG:-info,vectordb=debug}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
@@ -175,7 +176,9 @@ else
   METRICS_DISPLAY="(disabled)"
 fi
 if [[ -n "$API_KEY" ]]; then
-  AUTH_DISPLAY='api-key (send header: x-api-key: $API_KEY)'
+  AUTH_DISPLAY="api-key (header x-api-key)"
+elif [[ -n "$ROOT_PASSWORD" ]]; then
+  AUTH_DISPLAY='RBAC (POST /v1/auth/login user=root)'
 else
   AUTH_DISPLAY="(open)"
 fi
@@ -264,7 +267,7 @@ GW_ENV=(
   "VECTORDB_HTTP=0.0.0.0:${GATEWAY_PORT}"
 )
 [[ -n "$API_KEY"       ]] && GW_ENV+=("VECTORDB_API_KEYS=$API_KEY")
-[[ -n "$ROOT_PASSWORD" ]] && GW_ENV+=("VECTORDB_ROOT_PASSWORD=$ROOT_PASSWORD")
+GW_ENV+=("VECTORDB_ROOT_PASSWORD=$ROOT_PASSWORD")
 
 env "${GW_ENV[@]}" "$GATEWAY_BIN" \
     > >(prefix "gateway" "$C_GW" "$LOG_DIR/gateway.log") \
@@ -295,7 +298,10 @@ ${C_INFO}
 Ready. Try:
   curl http://127.0.0.1:${GATEWAY_PORT}/health
   curl http://127.0.0.1:${GATEWAY_PORT}/v1/version
-  curl http://127.0.0.1:${GATEWAY_PORT}/v1/collections${C_OFF}
+  curl http://127.0.0.1:${GATEWAY_PORT}/v1/collections
+  curl -X POST http://127.0.0.1:${GATEWAY_PORT}/v1/auth/login \\
+    -H 'Content-Type: application/json' \\
+    -d '{"username":"root","password":"'"${ROOT_PASSWORD}"'"}'${C_OFF}
 
 TRY
 

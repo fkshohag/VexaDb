@@ -1896,6 +1896,31 @@ fn map_engine_err(e: EngineError) -> Status {
         }
         EngineError::InvalidMeta(m) => Status::invalid_argument(m),
         EngineError::Core(c) => Status::invalid_argument(c.to_string()),
+        EngineError::Rbac(e) => map_rbac_err(e),
         other => Status::internal(other.to_string()),
+    }
+}
+
+fn map_rbac_err(e: vectordb_rbac::RbacError) -> Status {
+    use vectordb_rbac::RbacError;
+    match e {
+        RbacError::UserExists(s) => Status::already_exists(format!("user already exists: {s}")),
+        RbacError::UserNotFound(s) => Status::not_found(format!("user not found: {s}")),
+        RbacError::RoleExists(s) => Status::already_exists(format!("role already exists: {s}")),
+        RbacError::RoleNotFound(s) => Status::not_found(format!("role not found: {s}")),
+        RbacError::TokenExists(s) => Status::already_exists(format!("token already exists: {s}")),
+        RbacError::TokenNotFound(s) => Status::not_found(format!("token not found: {s}")),
+        RbacError::GroupExists(s) => {
+            Status::already_exists(format!("privilege group already exists: {s}"))
+        }
+        RbacError::GroupNotFound(s) => {
+            Status::not_found(format!("privilege group not found: {s}"))
+        }
+        RbacError::BuiltinRole(s) => {
+            Status::failed_precondition(format!("cannot drop built-in role: {s}"))
+        }
+        RbacError::LastAdmin => {
+            Status::failed_precondition("cannot drop last admin user")
+        }
     }
 }
